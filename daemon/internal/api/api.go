@@ -372,6 +372,62 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 			return nil, e("REORDER", err.Error())
 		}
 		return map[string]any{"ok": true}, nil
+	// ---- pause (§5.3) ----
+	case "pauseQueue":
+		var in struct {
+			Scope      string `json:"scope"`
+			DurationMs int64  `json:"durationMs"`
+			ResumeAt   string `json:"resumeAt"`
+			Reason     string `json:"reason"`
+		}
+		if err := json.Unmarshal(params, &in); err != nil {
+			return nil, e("BAD_PARAMS", err.Error())
+		}
+		req := scheduler.PauseRequest{
+			Scope:      scheduler.PauseScope(in.Scope),
+			DurationMs: in.DurationMs,
+			Reason:     in.Reason,
+			Source:     scheduler.PauseSourceUser,
+		}
+		if in.ResumeAt != "" {
+			t, err := time.Parse(time.RFC3339, in.ResumeAt)
+			if err != nil {
+				return nil, e("BAD_PARAMS", "resumeAt must be RFC3339: "+err.Error())
+			}
+			req.ResumeAt = &t
+		}
+		st, err := s.conductor.PauseQueue(req)
+		if err != nil {
+			return nil, e("PAUSE", err.Error())
+		}
+		return st, nil
+	case "resumeQueue":
+		st, err := s.conductor.ResumeQueue()
+		if err != nil {
+			return nil, e("RESUME", err.Error())
+		}
+		return st, nil
+	case "extendPause":
+		var in struct {
+			DeltaMs int64 `json:"deltaMs"`
+		}
+		if err := json.Unmarshal(params, &in); err != nil {
+			return nil, e("BAD_PARAMS", err.Error())
+		}
+		st, err := s.conductor.ExtendPause(in.DeltaMs)
+		if err != nil {
+			return nil, e("PAUSE", err.Error())
+		}
+		return st, nil
+	case "clearPauseTimer":
+		st, err := s.conductor.ClearPauseTimer()
+		if err != nil {
+			return nil, e("PAUSE", err.Error())
+		}
+		return st, nil
+	case "getPauseState":
+		return s.conductor.PauseState(), nil
+	// Thin aliases so a mid-migration extension build keeps working.
 	case "pauseScheduler":
 		if err := s.conductor.PauseScheduler(); err != nil {
 			return nil, e("PAUSE", err.Error())
@@ -421,10 +477,12 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		return map[string]any{"ok": true}, nil
 	case "updateRun":
 		var in struct {
-			RunID string                    `json:"runId"`
-			Run   scheduler.EnqueueRunInput `json:"run"`
+			RunID string                   `json:"runId"`
+			Run   scheduler.UpdateRunInput `json:"run"`
 		}
-		json.Unmarshal(params, &in)
+		if err := json.Unmarshal(params, &in); err != nil {
+			return nil, e("BAD_PARAMS", err.Error())
+		}
 		if err := s.conductor.UpdateRun(in.RunID, in.Run); err != nil {
 			return nil, e("UPDATE", err.Error())
 		}
@@ -450,6 +508,14 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 			return nil, e("SETTINGS", err.Error())
 		}
 		return map[string]any{"ok": true}, nil
+	case "patchSettings":
+		// Partial update applied server-side under the settings lock, so two
+		// concurrent edits cannot lose one another.
+		st, err := s.conductor.PatchSettings(params)
+		if err != nil {
+			return nil, e("SETTINGS", err.Error())
+		}
+		return st, nil
 	case "getSettings":
 		return s.conductor.Settings(), nil
 	case "updateSecretBlock":
@@ -501,7 +567,7 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		if err != nil {
 			return nil, e("PROMPT", err.Error())
 		}
-		return map[string]any{"text": text, "containsSecrets": strings.Contains(text, "SHARED TESTING / SUDO BLOCK")}, nil
+		return map[string]any{"text": text, "containsSecrets": s.conductor.RunAttachesSecrets(in.RunID)}, nil
 	case "getProviderCapabilities":
 		return s.capabilities(), nil
 	case "getQuotaState":
@@ -573,6 +639,12 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		s.hookBus.Publish(p)
 		return map[string]any{"ok": true}, nil
+	case "compact":
+		n, err := s.store.Compact(db.DefaultRetention(), time.Now().UTC())
+		if err != nil {
+			return nil, e("COMPACT", err.Error())
+		}
+		return map[string]any{"prunedEvents": n}, nil
 	case "diagnostics":
 		return s.diagnostics(), nil
 	case "daemonHealth":
@@ -589,23 +661,31 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 }
 
 // snapshot builds the full UI state.
+//
+// Three queries regardless of batch count. It used to issue ListRunsByBatch +
+// ListRows per batch — about 200 SQLite round-trips per snapshot, on a path
+// the webview hit on every daemon event, every window focus and every 15s.
 func (s *Server) snapshot() map[string]any {
 	batches, _ := s.store.ListBatches(100)
+	ids := make([]string, 0, len(batches))
+	for _, b := range batches {
+		ids = append(ids, b.ID)
+	}
+	runsByBatch, _ := s.store.ListRunsForBatches(ids)
+	rows, _ := s.store.ListRowsForBatches(ids)
 	var runs []*model.Run
 	for _, b := range batches {
-		brs, _ := s.store.ListRunsByBatch(b.ID)
-		runs = append(runs, brs...)
-	}
-	rows := map[string][]*model.Row{}
-	for _, b := range batches {
-		rs, _ := s.store.ListRows(b.ID)
-		rows[b.ID] = rs
+		runs = append(runs, runsByBatch[b.ID]...)
+		if rows[b.ID] == nil {
+			rows[b.ID] = []*model.Row{}
+		}
 	}
 	ext := map[string][]*model.ProviderSession{}
 	for _, p := range []string{model.ProviderClaude, model.ProviderCodex} {
 		sessions, _ := s.store.ListProviderSessions(p)
 		ext[p] = sessions
 	}
+	pause := s.conductor.PauseState()
 	return map[string]any{
 		"daemon":    map[string]any{"version": s.version, "pid": os.Getpid(), "protocol": ProtocolVersion, "uptime": time.Since(s.startedAt).String()},
 		"batches":   batches,
@@ -615,8 +695,13 @@ func (s *Server) snapshot() map[string]any {
 		"quota":     s.quotaState(),
 		"providers": s.capabilities(),
 		"settings":  s.conductor.Settings(),
-		"paused":    s.conductor.Settings().Paused,
-		"host":      hostInfo(),
+		"pause":     pause,
+		// Legacy mirror for anything still reading the flat flag.
+		"paused": pause.Paused,
+		// Existence only. The composer used to call revealSecretBlock on every
+		// mount just to answer this, decrypting the secret to compute a bool.
+		"hasSecretBlock": s.conductor.HasSecretBlock(),
+		"host":           hostInfo(),
 	}
 }
 

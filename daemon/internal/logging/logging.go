@@ -54,7 +54,8 @@ func (r *Redactor) AddMany(secrets []string) {
 	}
 }
 
-// Clear removes all registered secrets (used by tests).
+// Clear removes all registered secrets. Called when the shared secret block
+// is deleted, so a value that no longer exists is no longer tracked.
 func (r *Redactor) Clear() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -88,11 +89,12 @@ var patternPairs = [][2]string{
 	{`ghp_`, `[REDACTED-TOKEN-PREFIX]`},
 }
 
+// redactPatterns replaces EVERY occurrence of each pattern. It used to use
+// strings.Index and therefore redacted only the first hit per line, leaving
+// later tokens on the same line in the clear.
 func redactPatterns(s string) string {
 	for _, p := range patternPairs {
-		if i := strings.Index(s, p[0]); i >= 0 {
-			s = s[:i] + p[1] + s[i+len(p[0]):]
-		}
+		s = strings.ReplaceAll(s, p[0], p[1])
 	}
 	return s
 }

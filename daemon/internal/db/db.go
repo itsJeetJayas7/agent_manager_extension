@@ -197,6 +197,26 @@ var migrations = []string{
 	);`,
 	// 2: implicit queue batches
 	`ALTER TABLE batches ADD COLUMN implicit INTEGER NOT NULL DEFAULT 0;`,
+	// 3: integer ordering keys.
+	//
+	// created_at is RFC3339Nano text and RFC3339Nano strips trailing zeros, so
+	// "…:00.5Z" sorts after "…:00.45Z" lexicographically but before it
+	// chronologically — ORDER BY on the string was simply wrong. batch_number
+	// replaces a hash of the batch id into 1..89, whose collisions drove git
+	// branch names and destroyed previous batches' work.
+	`ALTER TABLE batches ADD COLUMN created_ns INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE batches ADD COLUMN batch_number INTEGER NOT NULL DEFAULT 0;
+	UPDATE batches SET created_ns = CAST(strftime('%s', created_at) AS INTEGER) * 1000000000
+		WHERE created_ns = 0 AND created_at != '';
+	UPDATE batches SET batch_number = (
+		SELECT COUNT(*) FROM batches b2 WHERE b2.created_ns < batches.created_ns OR
+			(b2.created_ns = batches.created_ns AND b2.id <= batches.id)
+	) WHERE batch_number = 0;
+	CREATE INDEX idx_batches_created_ns ON batches(created_ns DESC);
+	CREATE INDEX idx_events_run_id ON run_events(run_id, id DESC);`,
+	// 4: when cancellation was requested, so the watchdog can force a stuck
+	// CANCEL_REQUESTED run to CANCELLED instead of leaking its slot forever.
+	`ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT NOT NULL DEFAULT '';`,
 }
 
 func (s *Store) migrate() error {
@@ -257,19 +277,19 @@ const runCols = `id,batch_id,row_id,card_index,title,provider,model,effort,permi
 prompt_cipher,prompt_hash,prompt_preview,secret_version_id,worktree_path,branch,provider_session_id,provider_turn_id,
 provider_sub_session,provider_title,continuation_count,audit_cycles,verify_cycles,error_code,error_msg,final_outcome,
 meaningful_progress,created_at,queued_at,started_at,finished_at,next_eligible_at,queue_wait_ns,active_ns,quota_wait_ns,
-dispatch_uuid,attempt,sort_key,cwd`
+dispatch_uuid,attempt,sort_key,cwd,cancel_requested_at`
 
 func scanRun(sc interface{ Scan(...any) error }) (*model.Run, error) {
 	r := &model.Run{}
 	var staged, attach, progress int
-	var createdAt, queuedAt, startedAt, finishedAt, nextElig string
+	var createdAt, queuedAt, startedAt, finishedAt, nextElig, cancelReq string
 	err := sc.Scan(&r.ID, &r.BatchID, &r.RowID, &r.CardIndex, &r.Title, &r.Provider, &r.Model, &r.Effort, &r.Permission,
 		&staged, &attach, &r.State, &r.Stage,
 		&r.PromptCipherStore, &r.PromptHash, &r.PromptPreview, &r.SecretVersionID, &r.WorktreePath, &r.Branch,
 		&r.ProviderSessionID, &r.ProviderTurnID, &r.ProviderSubSession, &r.ProviderTitle,
 		&r.ContinuationCount, &r.AuditCycles, &r.VerifyCycles, &r.ErrorCode, &r.ErrorMsg, &r.FinalOutcome,
 		&progress, &createdAt, &queuedAt, &startedAt, &finishedAt, &nextElig,
-		&r.QueueWaitNS, &r.ActiveNS, &r.QuotaWaitNS, &r.DispatchUUID, &r.Attempt, &r.SortKey, &r.Cwd)
+		&r.QueueWaitNS, &r.ActiveNS, &r.QuotaWaitNS, &r.DispatchUUID, &r.Attempt, &r.SortKey, &r.Cwd, &cancelReq)
 	if err != nil {
 		return nil, err
 	}
@@ -280,6 +300,7 @@ func scanRun(sc interface{ Scan(...any) error }) (*model.Run, error) {
 	r.QueuedAt = parseTime(queuedAt)
 	r.StartedAt = parseTime(startedAt)
 	r.FinishedAt = parseTime(finishedAt)
+	r.CancelRequestedAt = parseTime(cancelReq)
 	if nextElig != "" {
 		t := parseTime(nextElig)
 		r.NextEligibleAt = &t
@@ -288,29 +309,52 @@ func scanRun(sc interface{ Scan(...any) error }) (*model.Run, error) {
 }
 
 // CreateRun inserts a new run.
-func (s *Store) CreateRun(r *model.Run) error {
-	_, err := s.db.Exec(`INSERT INTO runs(`+runCols+`) VALUES(`+strings.Repeat("?,", 41)+`?)`,
+// runPlaceholders is derived from runCols so adding a column cannot silently
+// desynchronise the INSERT (it used to be a hand-counted strings.Repeat).
+var runPlaceholders = placeholdersFor(runCols)
+
+func placeholdersFor(cols string) string {
+	n := len(strings.Split(strings.ReplaceAll(cols, "\n", ""), ","))
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func runInsertArgs(r *model.Run) []any {
+	return []any{
 		r.ID, r.BatchID, r.RowID, r.CardIndex, r.Title, r.Provider, r.Model, r.Effort, r.Permission,
 		b2i(r.Staged), b2i(r.AttachSecrets), string(r.State), string(r.Stage),
 		r.PromptCipherStore, r.PromptHash, r.PromptPreview, r.SecretVersionID, r.WorktreePath, r.Branch,
 		r.ProviderSessionID, r.ProviderTurnID, r.ProviderSubSession, r.ProviderTitle,
 		r.ContinuationCount, r.AuditCycles, r.VerifyCycles, r.ErrorCode, r.ErrorMsg, r.FinalOutcome,
 		b2i(r.MeaningfulProgress), fmtTime(r.CreatedAt), fmtTime(r.QueuedAt), fmtTime(r.StartedAt), fmtTime(r.FinishedAt), fmtTimeP(r.NextEligibleAt),
-		r.QueueWaitNS, r.ActiveNS, r.QuotaWaitNS, r.DispatchUUID, r.Attempt, r.SortKey, r.Cwd)
+		r.QueueWaitNS, r.ActiveNS, r.QuotaWaitNS, r.DispatchUUID, r.Attempt, r.SortKey, r.Cwd,
+		fmtTime(r.CancelRequestedAt),
+	}
+}
+
+func (s *Store) CreateRun(r *model.Run) error {
+	_, err := s.db.Exec(`INSERT INTO runs(`+runCols+`) VALUES(`+runPlaceholders+`)`, runInsertArgs(r)...)
 	return err
 }
 
-// UpdateRun persists the mutable scheduling fields of a run.
+// UpdateRun persists the mutable fields of a run.
+//
+// provider/model/effort/permission/staged/attach_secrets and sort_key were
+// missing from this statement, so UpdateRun (queue edits) and ReorderQueue
+// (drag to reorder, move to end) silently wrote nothing at all.
 func (s *Store) UpdateRun(r *model.Run) error {
-	_, err := s.db.Exec(`UPDATE runs SET state=?, stage=?, title=?, worktree_path=?, branch=?, provider_session_id=?,
+	_, err := s.db.Exec(`UPDATE runs SET state=?, stage=?, title=?, provider=?, model=?, effort=?, permission=?,
+		staged=?, attach_secrets=?, sort_key=?, worktree_path=?, branch=?, provider_session_id=?,
 		provider_turn_id=?, provider_sub_session=?, provider_title=?, continuation_count=?, audit_cycles=?, verify_cycles=?,
 		error_code=?, error_msg=?, final_outcome=?, meaningful_progress=?, queued_at=?, started_at=?, finished_at=?,
-		next_eligible_at=?, queue_wait_ns=?, active_ns=?, quota_wait_ns=?, dispatch_uuid=?, attempt=?, prompt_cipher=?, secret_version_id=?, cwd=?
+		next_eligible_at=?, queue_wait_ns=?, active_ns=?, quota_wait_ns=?, dispatch_uuid=?, attempt=?,
+		prompt_cipher=?, prompt_hash=?, prompt_preview=?, secret_version_id=?, cwd=?, cancel_requested_at=?
 		WHERE id=?`,
-		string(r.State), string(r.Stage), r.Title, r.WorktreePath, r.Branch, r.ProviderSessionID,
+		string(r.State), string(r.Stage), r.Title, r.Provider, r.Model, r.Effort, r.Permission,
+		b2i(r.Staged), b2i(r.AttachSecrets), r.SortKey, r.WorktreePath, r.Branch, r.ProviderSessionID,
 		r.ProviderTurnID, r.ProviderSubSession, r.ProviderTitle, r.ContinuationCount, r.AuditCycles, r.VerifyCycles,
 		r.ErrorCode, r.ErrorMsg, r.FinalOutcome, b2i(r.MeaningfulProgress), fmtTime(r.QueuedAt), fmtTime(r.StartedAt), fmtTime(r.FinishedAt),
-		fmtTimeP(r.NextEligibleAt), r.QueueWaitNS, r.ActiveNS, r.QuotaWaitNS, r.DispatchUUID, r.Attempt, r.PromptCipherStore, r.SecretVersionID, r.Cwd,
+		fmtTimeP(r.NextEligibleAt), r.QueueWaitNS, r.ActiveNS, r.QuotaWaitNS, r.DispatchUUID, r.Attempt,
+		r.PromptCipherStore, r.PromptHash, r.PromptPreview, r.SecretVersionID, r.Cwd, fmtTime(r.CancelRequestedAt),
 		r.ID)
 	return err
 }
@@ -390,6 +434,9 @@ func (s *Store) TransitionRun(runID string, to model.RunState, evt *model.RunEve
 	defer tx.Rollback()
 	row := tx.QueryRow(`SELECT `+runCols+` FROM runs WHERE id=?`, runID)
 	r, err := scanRun(row)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("run %s not found", runID)
+	}
 	if err != nil {
 		return err
 	}
@@ -403,10 +450,10 @@ func (s *Store) TransitionRun(runID string, to model.RunState, evt *model.RunEve
 	}
 	if _, err := tx.Exec(`UPDATE runs SET state=?, started_at=?, finished_at=?, queued_at=?, next_eligible_at=?, worktree_path=?, branch=?,
 		provider_session_id=?, provider_turn_id=?, provider_title=?, continuation_count=?, error_code=?, error_msg=?, final_outcome=?,
-		meaningful_progress=?, stage=?, active_ns=?, quota_wait_ns=?, queue_wait_ns=?, dispatch_uuid=?, attempt=? WHERE id=?`,
+		meaningful_progress=?, stage=?, active_ns=?, quota_wait_ns=?, queue_wait_ns=?, dispatch_uuid=?, attempt=?, cancel_requested_at=? WHERE id=?`,
 		string(r.State), fmtTime(r.StartedAt), fmtTime(r.FinishedAt), fmtTime(r.QueuedAt), fmtTimeP(r.NextEligibleAt), r.WorktreePath, r.Branch,
 		r.ProviderSessionID, r.ProviderTurnID, r.ProviderTitle, r.ContinuationCount, r.ErrorCode, r.ErrorMsg, r.FinalOutcome,
-		b2i(r.MeaningfulProgress), string(r.Stage), r.ActiveNS, r.QuotaWaitNS, r.QueueWaitNS, r.DispatchUUID, r.Attempt, runID); err != nil {
+		b2i(r.MeaningfulProgress), string(r.Stage), r.ActiveNS, r.QuotaWaitNS, r.QueueWaitNS, r.DispatchUUID, r.Attempt, fmtTime(r.CancelRequestedAt), runID); err != nil {
 		return err
 	}
 	if evt != nil {
@@ -431,7 +478,10 @@ func (s *Store) AddRunEvent(runID string, typ model.RunEventType, data string) e
 
 // ListRunEvents returns the timeline for a run.
 func (s *Store) ListRunEvents(runID string, limit int) ([]*model.RunEvent, error) {
-	rows, err := s.db.Query(`SELECT id, run_id, ts, type, data FROM run_events WHERE run_id=? ORDER BY id LIMIT ?`, runID, limit)
+	// The timeline wants the NEWEST `limit` events; `ORDER BY id LIMIT ?`
+	// returned the oldest ones, so a long run's timeline froze at its start.
+	// Fetched newest-first, then reversed so callers still read chronologically.
+	rows, err := s.db.Query(`SELECT id, run_id, ts, type, data FROM run_events WHERE run_id=? ORDER BY id DESC LIMIT ?`, runID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -446,16 +496,143 @@ func (s *Store) ListRunEvents(runID string, limit int) ([]*model.RunEvent, error
 		e.Timestamp = parseTime(ts)
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
 }
 
-// NextSortKey allocates a monotonically increasing queue position.
+// SortKeyGap is the spacing between adjacent queue positions. Sparse keys mean
+// a run can be inserted between two neighbours without rewriting the queue.
+const SortKeyGap int64 = 1024
+
+// queueOrderStates are the states whose runs are still waiting to dispatch and
+// therefore participate in queue ordering.
+var queueOrderStates = []model.RunState{
+	model.StateQueued, model.StateWaitingForSlot,
+	model.StateWaitingForExternal, model.StateWaitingForQuota,
+}
+
+func stateArgs(states []model.RunState) (string, []any) {
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(states)), ",")
+	args := make([]any, 0, len(states))
+	for _, st := range states {
+		args = append(args, string(st))
+	}
+	return ph, args
+}
+
+// NextSortKey allocates a position at the BACK of the queue.
 func (s *Store) NextSortKey() (int64, error) {
-	var k int64
-	if err := s.db.QueryRow(`SELECT COALESCE(MAX(sort_key),0)+1 FROM runs`).Scan(&k); err != nil {
+	var k sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(sort_key) FROM runs`).Scan(&k); err != nil {
 		return 0, err
 	}
-	return k, nil
+	if !k.Valid {
+		return SortKeyGap, nil
+	}
+	return k.Int64 + SortKeyGap, nil
+}
+
+// FrontSortKey returns a key that sorts ahead of every run still waiting to
+// dispatch — what "Run Next" actually means. The previous implementation used
+// time.Now().UnixNano(), which is astronomically larger than the small
+// sequential keys and therefore sent the run to the BACK of the queue.
+func (s *Store) FrontSortKey() (int64, error) {
+	ph, args := stateArgs(queueOrderStates)
+	var k sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MIN(sort_key) FROM runs WHERE state IN (`+ph+`)`, args...).Scan(&k); err != nil {
+		return 0, err
+	}
+	if !k.Valid {
+		return s.NextSortKey()
+	}
+	return k.Int64 - SortKeyGap, nil
+}
+
+// SortKeyBefore returns a key placing a run immediately before target, first
+// renormalising the queue if the neighbouring keys have no gap left.
+func (s *Store) SortKeyBefore(targetRunID string) (int64, error) {
+	key, err := s.sortKeyBefore(targetRunID)
+	if err == nil && key != 0 {
+		return key, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	// No gap: respace the queue and try once more.
+	if err := s.RenumberQueue(); err != nil {
+		return 0, err
+	}
+	key, err = s.sortKeyBefore(targetRunID)
+	if err != nil {
+		return 0, err
+	}
+	if key == 0 {
+		return 0, fmt.Errorf("cannot allocate a queue position before %s", targetRunID)
+	}
+	return key, nil
+}
+
+// sortKeyBefore returns 0 (no error) when the neighbours are adjacent.
+func (s *Store) sortKeyBefore(targetRunID string) (int64, error) {
+	var target int64
+	if err := s.db.QueryRow(`SELECT sort_key FROM runs WHERE id=?`, targetRunID).Scan(&target); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, fmt.Errorf("run %s not found", targetRunID)
+		}
+		return 0, err
+	}
+	ph, args := stateArgs(queueOrderStates)
+	args = append(args, target)
+	var prev sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(sort_key) FROM runs WHERE state IN (`+ph+`) AND sort_key < ?`, args...).Scan(&prev); err != nil {
+		return 0, err
+	}
+	if !prev.Valid {
+		return target - SortKeyGap, nil
+	}
+	if target-prev.Int64 < 2 {
+		return 0, nil // exhausted
+	}
+	return prev.Int64 + (target-prev.Int64)/2, nil
+}
+
+// RenumberQueue respaces every waiting run onto fresh SortKeyGap boundaries,
+// preserving the current order.
+func (s *Store) RenumberQueue() error {
+	ph, args := stateArgs(queueOrderStates)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id FROM runs WHERE state IN (`+ph+`) ORDER BY sort_key, created_at, id`, args...)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i, id := range ids {
+		if _, err := tx.Exec(`UPDATE runs SET sort_key=? WHERE id=?`, int64(i+1)*SortKeyGap, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ---- Attempts ----
@@ -486,12 +663,68 @@ func (s *Store) GetAttempt(runID string, attemptNo int) (dispatchUUID, session s
 
 // ---- Batches / Rows ----
 
-// CreateBatch inserts a batch.
+// CreateBatch inserts a batch, assigning its monotonic number.
 func (s *Store) CreateBatch(b *model.Batch) error {
-	_, err := s.db.Exec(`INSERT INTO batches(id,title,status,base_cwd,base_branch,base_commit,integration_branch,integration_wt_path,created_at,applied,implicit)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		b.ID, b.Title, string(b.Status), b.BaseCwd, b.BaseBranch, b.BaseCommit, b.IntegrationBranch, b.IntegrationWTPath, fmtTime(b.CreatedAt), b2i(b.Applied), b2i(b.Implicit))
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := insertBatchTx(tx, b); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func insertBatchTx(tx execer, b *model.Batch) error {
+	if b.Number == 0 {
+		if err := tx.QueryRow(`SELECT COALESCE(MAX(batch_number),0)+1 FROM batches`).Scan(&b.Number); err != nil {
+			return err
+		}
+	}
+	_, err := tx.Exec(`INSERT INTO batches(id,title,status,base_cwd,base_branch,base_commit,integration_branch,integration_wt_path,created_at,created_ns,applied,implicit,batch_number)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		b.ID, b.Title, string(b.Status), b.BaseCwd, b.BaseBranch, b.BaseCommit, b.IntegrationBranch, b.IntegrationWTPath,
+		fmtTime(b.CreatedAt), b.CreatedAt.UTC().UnixNano(), b2i(b.Applied), b2i(b.Implicit), b.Number)
 	return err
+}
+
+// CreateBatchAtomic inserts a batch with all of its rows and runs in a single
+// transaction. ApplyBatch used to insert them one at a time, so any failure
+// part-way left a half-created batch behind.
+func (s *Store) CreateBatchAtomic(b *model.Batch, rows []*model.Row, runs []*model.Run, event func(runID string) (model.RunEventType, string)) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := insertBatchTx(tx, b); err != nil {
+		return err
+	}
+	for _, r := range rows {
+		if _, err := tx.Exec(`INSERT INTO batch_rows(id,batch_id,position,mode,status) VALUES(?,?,?,?,?)`,
+			r.ID, r.BatchID, r.Position, string(r.Mode), string(r.Status)); err != nil {
+			return err
+		}
+	}
+	for _, r := range runs {
+		if _, err := tx.Exec(`INSERT INTO runs(`+runCols+`) VALUES(`+runPlaceholders+`)`, runInsertArgs(r)...); err != nil {
+			return err
+		}
+		if event != nil {
+			typ, data := event(r.ID)
+			if _, err := tx.Exec(`INSERT INTO run_events(run_id, ts, type, data) VALUES(?,?,?,?)`,
+				r.ID, now(), string(typ), data); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 // UpdateBatch persists mutable batch fields.
@@ -507,8 +740,8 @@ func (s *Store) GetBatch(id string) (*model.Batch, error) {
 	var status string
 	var created, started, finished string
 	var applied, implicit int
-	err := s.db.QueryRow(`SELECT id,title,status,base_cwd,base_branch,base_commit,integration_branch,integration_wt_path,created_at,started_at,finished_at,applied,implicit FROM batches WHERE id=?`, id).
-		Scan(&b.ID, &b.Title, &status, &b.BaseCwd, &b.BaseBranch, &b.BaseCommit, &b.IntegrationBranch, &b.IntegrationWTPath, &created, &started, &finished, &applied, &implicit)
+	err := s.db.QueryRow(`SELECT `+batchCols+` FROM batches WHERE id=?`, id).
+		Scan(&b.ID, &b.Title, &status, &b.BaseCwd, &b.BaseBranch, &b.BaseCommit, &b.IntegrationBranch, &b.IntegrationWTPath, &created, &started, &finished, &applied, &implicit, &b.Number)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -526,17 +759,25 @@ func (s *Store) GetBatch(id string) (*model.Batch, error) {
 
 // ListBatches returns batches newest first, optionally filtered by status.
 func (s *Store) ListBatches(limit int) ([]*model.Batch, error) {
-	rows, err := s.db.Query(`SELECT id,title,status,base_cwd,base_branch,base_commit,integration_branch,integration_wt_path,created_at,started_at,finished_at,applied,implicit FROM batches ORDER BY created_at DESC LIMIT ?`, limit)
+	// Ordered by an integer epoch column: created_at is RFC3339Nano text whose
+	// trailing zeros are stripped, so lexicographic order is not chronological.
+	rows, err := s.db.Query(`SELECT `+batchCols+` FROM batches ORDER BY created_ns DESC, batch_number DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanBatches(rows)
+}
+
+const batchCols = `id,title,status,base_cwd,base_branch,base_commit,integration_branch,integration_wt_path,created_at,started_at,finished_at,applied,implicit,batch_number`
+
+func scanBatches(rows *sql.Rows) ([]*model.Batch, error) {
 	var out []*model.Batch
 	for rows.Next() {
 		var b model.Batch
 		var status, created, started, finished string
 		var applied, implicit int
-		if err := rows.Scan(&b.ID, &b.Title, &status, &b.BaseCwd, &b.BaseBranch, &b.BaseCommit, &b.IntegrationBranch, &b.IntegrationWTPath, &created, &started, &finished, &applied, &implicit); err != nil {
+		if err := rows.Scan(&b.ID, &b.Title, &status, &b.BaseCwd, &b.BaseBranch, &b.BaseCommit, &b.IntegrationBranch, &b.IntegrationWTPath, &created, &started, &finished, &applied, &implicit, &b.Number); err != nil {
 			return nil, err
 		}
 		b.Status = model.BatchStatus(status)
@@ -548,6 +789,36 @@ func (s *Store) ListBatches(limit int) ([]*model.Batch, error) {
 		out = append(out, &b)
 	}
 	return out, rows.Err()
+}
+
+// ListActiveBatches returns QUEUED and RUNNING batches in dispatch order.
+//
+// Order is the batch's lowest run sort key, so the queue order the user sees
+// (and edits with Run Next / drag-to-reorder) is the order the scheduler
+// actually dispatches in. Ordering by creation time instead would make sort
+// keys meaningless for the normal queue, where every run is its own implicit
+// batch. The scheduler must not reuse ListBatches, which is newest-first for
+// the UI; that it ever worked depended on identical created_at values tying
+// and falling back to insertion order.
+func (s *Store) ListActiveBatches() ([]*model.Batch, error) {
+	rows, err := s.db.Query(`SELECT ` + prefixed(batchCols, "b") + ` FROM batches b
+		LEFT JOIN (SELECT batch_id, MIN(sort_key) AS min_sort FROM runs GROUP BY batch_id) r ON r.batch_id = b.id
+		WHERE b.status IN ('QUEUED','RUNNING')
+		ORDER BY COALESCE(r.min_sort, 9223372036854775807) ASC, b.batch_number ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanBatches(rows)
+}
+
+// prefixed qualifies a comma-separated column list with a table alias.
+func prefixed(cols, alias string) string {
+	parts := strings.Split(cols, ",")
+	for i, c := range parts {
+		parts[i] = alias + "." + strings.TrimSpace(c)
+	}
+	return strings.Join(parts, ",")
 }
 
 // CreateRow inserts a batch row.
@@ -898,4 +1169,166 @@ func fmtTimeP(t *time.Time) string {
 		return ""
 	}
 	return fmtTime(*t)
+}
+
+// ---- Bulk reads (snapshot path) ----
+
+// ListRunsForBatches returns every run for the given batches in one query,
+// bucketed by batch id. The snapshot handler used to issue one query per
+// batch, i.e. ~200 SQLite round-trips for a 100-batch snapshot on a 1 Hz path.
+func (s *Store) ListRunsForBatches(batchIDs []string) (map[string][]*model.Run, error) {
+	out := map[string][]*model.Run{}
+	if len(batchIDs) == 0 {
+		return out, nil
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(batchIDs)), ",")
+	args := make([]any, 0, len(batchIDs))
+	for _, id := range batchIDs {
+		args = append(args, id)
+	}
+	rows, err := s.db.Query(`SELECT `+runCols+` FROM runs WHERE batch_id IN (`+ph+`) ORDER BY sort_key, card_index`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[r.BatchID] = append(out[r.BatchID], r)
+	}
+	return out, rows.Err()
+}
+
+// ListRowsForBatches returns every row for the given batches in one query.
+func (s *Store) ListRowsForBatches(batchIDs []string) (map[string][]*model.Row, error) {
+	out := map[string][]*model.Row{}
+	if len(batchIDs) == 0 {
+		return out, nil
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(batchIDs)), ",")
+	args := make([]any, 0, len(batchIDs))
+	for _, id := range batchIDs {
+		args = append(args, id)
+	}
+	rows, err := s.db.Query(`SELECT id,batch_id,position,mode,status FROM batch_rows WHERE batch_id IN (`+ph+`) ORDER BY batch_id, position`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r model.Row
+		var mode, status string
+		if err := rows.Scan(&r.ID, &r.BatchID, &r.Position, &mode, &status); err != nil {
+			return nil, err
+		}
+		r.Mode = model.RowMode(mode)
+		r.Status = model.RowStatus(status)
+		out[r.BatchID] = append(out[r.BatchID], &r)
+	}
+	return out, rows.Err()
+}
+
+// ---- Secrets ----
+
+// DeleteAllSecretVersions permanently removes every stored secret block.
+//
+// "Delete Shared Testing & Sudo Block" used to set an unread `deleted` flag
+// while the ciphertext stayed in the table and kept being attached to runs.
+// This actually deletes it.
+func (s *Store) DeleteAllSecretVersions() (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	// Overwrite the ciphertext before dropping the rows so the bytes are not
+	// left behind in a free page for a casual file inspection to recover.
+	if _, err := tx.Exec(`UPDATE secret_versions SET cipher='', hash='', preview=''`); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`DELETE FROM secret_versions`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	// Runs must stop referencing a version that no longer exists.
+	if _, err := tx.Exec(`UPDATE runs SET secret_version_id='', attach_secrets=0 WHERE secret_version_id != ''`); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	// VACUUM cannot run inside a transaction; it reclaims the pages that held
+	// the ciphertext.
+	_, _ = s.db.Exec(`VACUUM`)
+	return n, nil
+}
+
+// HasSecretBlock reports whether a block exists, without decrypting it.
+// The composer used to call revealSecretBlock on every mount purely to answer
+// this boolean, decrypting the secret and shipping it over the socket.
+func (s *Store) HasSecretBlock() (bool, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM secret_versions`).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ---- Retention ----
+
+// RetentionPolicy bounds unbounded growth of the event log.
+type RetentionPolicy struct {
+	// KeepEventsPerRun caps the timeline of any single run.
+	KeepEventsPerRun int
+	// DropTerminalAfter drops events for runs that finished long ago.
+	DropTerminalAfter time.Duration
+}
+
+// DefaultRetention keeps timelines useful without letting run_events grow
+// forever.
+func DefaultRetention() RetentionPolicy {
+	return RetentionPolicy{KeepEventsPerRun: 500, DropTerminalAfter: 30 * 24 * time.Hour}
+}
+
+// Prune applies the retention policy and reports how many event rows went.
+func (s *Store) Prune(p RetentionPolicy, now time.Time) (int64, error) {
+	var total int64
+	if p.DropTerminalAfter > 0 {
+		cutoff := fmtTime(now.Add(-p.DropTerminalAfter))
+		res, err := s.db.Exec(`DELETE FROM run_events WHERE run_id IN (
+			SELECT id FROM runs WHERE finished_at != '' AND finished_at < ?)`, cutoff)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	if p.KeepEventsPerRun > 0 {
+		res, err := s.db.Exec(`DELETE FROM run_events WHERE id IN (
+			SELECT id FROM (
+				SELECT id, ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY id DESC) AS rn
+				FROM run_events
+			) WHERE rn > ?)`, p.KeepEventsPerRun)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
+}
+
+// Compact prunes and then reclaims disk space. Exposed as a maintenance RPC.
+func (s *Store) Compact(p RetentionPolicy, now time.Time) (int64, error) {
+	n, err := s.Prune(p, now)
+	if err != nil {
+		return n, err
+	}
+	if _, err := s.db.Exec(`VACUUM`); err != nil {
+		return n, err
+	}
+	return n, nil
 }

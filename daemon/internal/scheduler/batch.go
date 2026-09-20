@@ -29,6 +29,16 @@ func (c *Conductor) advanceBatch(ctx context.Context, b *model.Batch, st *slotSt
 	firstStarted := false
 	for _, row := range rows {
 		rowRuns := runsByRow[row.ID]
+		if len(rowRuns) == 0 {
+			// Neither rowDone nor rowAllStarted can ever be true for an empty
+			// slice, so such a row stalled its batch forever. Creation rejects
+			// them now; this skips any that predate that check.
+			if row.Status != model.RowDone {
+				c.store.UpdateRowStatus(row.ID, model.RowDone)
+				c.log.Errorf("batch %s row %d has no runs; skipping", b.ID, row.Position+1)
+			}
+			continue
+		}
 		if row.Status == model.RowPending || row.Status == model.RowRunning {
 			// preconditions for starting this row
 			if row.Status == model.RowPending && row.Mode == model.RowParallel {
@@ -158,16 +168,16 @@ func (c *Conductor) markWaitingExternal(rowRuns []*model.Run, st *slotState) {
 		if ok {
 			// back to plain QUEUED if previously marked waiting
 			if r.State != model.StateQueued && model.CanTransition(r.State, model.StateQueued) {
-				c.store.TransitionRun(r.ID, model.StateQueued, nil, nil)
+				c.transition(r.ID, model.StateQueued, nil, nil)
 			}
 			continue
 		}
 		if len(st.busyExt) > 0 {
 			if model.CanTransition(r.State, model.StateWaitingForExternal) {
-				c.store.TransitionRun(r.ID, model.StateWaitingForExternal, nil, nil)
+				c.transition(r.ID, model.StateWaitingForExternal, nil, nil)
 			}
 		} else if model.CanTransition(r.State, model.StateWaitingForSlot) {
-			c.store.TransitionRun(r.ID, model.StateWaitingForSlot, nil, nil)
+			c.transition(r.ID, model.StateWaitingForSlot, nil, nil)
 		}
 	}
 }
@@ -215,7 +225,7 @@ func (c *Conductor) failBatch(b *model.Batch, why string) error {
 	runs, _ := c.store.ListRunsByBatch(b.ID)
 	for _, r := range runs {
 		if r.State == model.StateQueued {
-			c.store.TransitionRun(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
+			c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 				x.ErrorCode = "WORKSPACE"
 				x.ErrorMsg = why
 			})
@@ -232,8 +242,7 @@ func (c *Conductor) prepareParallelBase(b *model.Batch) error {
 	if err := c.wt.Precheck(b.BaseCwd); err != nil {
 		return err
 	}
-	batchNum := batchNumber(b.ID)
-	layout := c.wt.Layout(batchNum, b.ID, b.BaseCwd)
+	layout := c.wt.Layout(batchNumberOf(b), b.ID, b.BaseCwd)
 	if err := c.wt.CreateIntegration(b.BaseCwd, layout.IntegrationBranch, layout.IntegrationDir, b.BaseCommit); err != nil {
 		return err
 	}
@@ -247,19 +256,20 @@ func (c *Conductor) prepareParallelBase(b *model.Batch) error {
 
 // prepareCardWorktrees creates isolated worktrees for each parallel card.
 func (c *Conductor) prepareCardWorktrees(b *model.Batch, row *model.Row, rowRuns []*model.Run) error {
-	batchNum := batchNumber(b.ID)
-	layout := c.wt.Layout(batchNum, b.ID, b.BaseCwd)
+	layout := c.wt.Layout(batchNumberOf(b), b.ID, b.BaseCwd)
 	for i, r := range rowRuns {
 		if r.WorktreePath != "" {
 			continue
 		}
-		branch := fmt.Sprintf("%s/r%02dc%02d", layout.CardBranchPrefix, row.Position+1, i)
-		dir := filepath.Join(filepath.Dir(layout.IntegrationDir), fmt.Sprintf("card-r%02dc%02d", row.Position+1, i))
+		// Both indices are 1-based; they used to mix 1-indexed rows with
+		// 0-indexed cards.
+		branch := fmt.Sprintf("%s/r%02dc%02d", layout.CardBranchPrefix, row.Position+1, i+1)
+		dir := filepath.Join(filepath.Dir(layout.IntegrationDir), fmt.Sprintf("card-r%02dc%02d", row.Position+1, i+1))
 		if err := c.wt.CardWorktree(b.BaseCwd, branch, dir, b.IntegrationBranch); err != nil {
 			return err
 		}
 		c.store.AddWorktree(&db.WorktreeRecord{BatchID: b.ID, RunID: r.ID, Path: dir, Branch: branch, Kind: "card", Status: "ACTIVE"})
-		c.store.TransitionRun(r.ID, r.State, nil, func(x *model.Run) {
+		c.transition(r.ID, r.State, nil, func(x *model.Run) {
 			x.WorktreePath = dir
 			x.Branch = branch
 		})
@@ -272,7 +282,7 @@ func (c *Conductor) prepareCardWorktrees(b *model.Batch, row *model.Row, rowRuns
 // integrateRow commits card work and merges into the integration branch.
 // Conflict => AWAITING_INTEGRATION with worktrees preserved.
 func (c *Conductor) integrateRow(b *model.Batch, row *model.Row, rowRuns []*model.Run) error {
-	batchNum := batchNumber(b.ID)
+	batchNum := batchNumberOf(b)
 	layout := c.wt.Layout(batchNum, b.ID, b.BaseCwd)
 	// deterministic order: card index
 	for _, r := range rowRuns {
@@ -292,10 +302,6 @@ func (c *Conductor) integrateRow(b *model.Batch, row *model.Row, rowRuns []*mode
 		}
 		c.store.AddRunEvent(r.ID, model.EventIntegrationStarted, quoteJSON("merged "+r.Branch))
 	}
-	// later rows run inside the integration worktree
-	for _, r2 := range rowRuns {
-		_ = r2
-	}
 	return nil
 }
 
@@ -310,7 +316,7 @@ func (c *Conductor) awaitIntegration(b *model.Batch, why string) error {
 	runs, _ := c.store.ListRunsByBatch(b.ID)
 	for _, r := range runs {
 		if r.State == model.StateQueued || r.State == model.StateRunning || r.State == model.StateIntegrating {
-			c.store.TransitionRun(r.ID, model.StateAwaitingIntegration, nil, func(x *model.Run) {
+			c.transition(r.ID, model.StateAwaitingIntegration, nil, func(x *model.Run) {
 				x.ErrorMsg = why
 			})
 			c.store.AddRunEvent(r.ID, model.EventIntegrationConflict, quoteJSON(why))
@@ -321,11 +327,13 @@ func (c *Conductor) awaitIntegration(b *model.Batch, why string) error {
 	return fmt.Errorf("integration stopped: %s", why)
 }
 
-// batchNumber derives the short batch number from its UUID tail for naming.
-func batchNumber(id string) int {
-	n := 0
-	for i := 0; i < len(id); i++ {
-		n = (n*31 + int(id[i])) % 997
-	}
-	return n%89 + 1
+// batchNumberOf returns the batch's persisted monotonic number.
+//
+// This used to hash the batch id into 1..89. Those numbers drive git branch
+// names, so collisions were near-certain and `git branch -f` then silently
+// destroyed a previous batch's integration branch along with its work.
+// Batches created before the batch_number column exists fall back to 0, which
+// the worktree layout disambiguates with the batch id.
+func batchNumberOf(b *model.Batch) int {
+	return int(b.Number)
 }

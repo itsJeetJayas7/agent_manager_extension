@@ -43,6 +43,9 @@ const (
 	StateSkipped             RunState = "SKIPPED"
 	StateIntegrating         RunState = "INTEGRATING"
 	StateAwaitingIntegration RunState = "AWAITING_INTEGRATION"
+	// StatePaused: stopped at a safe point by an INCLUDE_ACTIVE queue pause,
+	// native session intact, waiting to be continued when the queue resumes.
+	StatePaused RunState = "PAUSED"
 )
 
 // Terminal reports whether the state is terminal for scheduling purposes.
@@ -71,21 +74,27 @@ var transitions = map[RunState][]RunState{
 	StateQueued:              {StateWaitingForSlot, StateWaitingForExternal, StatePreparing, StateCancelRequested, StateCancelled, StateSkipped, StateFailed, StateNeedsAttention},
 	StateWaitingForSlot:      {StatePreparing, StateWaitingForExternal, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
 	StateWaitingForExternal:  {StatePreparing, StateWaitingForSlot, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
-	StatePreparing:           {StateStarting, StateFailed, StateNeedsAttention, StateCancelRequested, StateBlocked},
-	StateStarting:            {StateRunning, StateFailed, StateNeedsAttention, StateCancelRequested, StateWaitingForQuota},
-	StateRunning:             {StateWaitingForQuota, StateVerifying, StateCompleted, StateBlocked, StateNeedsAttention, StateFailed, StateCancelRequested, StateWaitingForProvider, StateIntegrating, StateOrphaned},
-	StateWaitingForProvider:  {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StateOrphaned},
+	StatePreparing:           {StateStarting, StateFailed, StateNeedsAttention, StateCancelRequested, StateBlocked, StatePaused},
+	StateStarting:            {StateRunning, StateFailed, StateNeedsAttention, StateCancelRequested, StateWaitingForQuota, StatePaused},
+	StateRunning:             {StateWaitingForQuota, StateVerifying, StateCompleted, StateBlocked, StateNeedsAttention, StateFailed, StateCancelRequested, StateWaitingForProvider, StateIntegrating, StateOrphaned, StatePaused},
+	StateWaitingForProvider:  {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StateOrphaned, StatePaused},
 	StateWaitingForQuota:     {StateAutoResuming, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
-	StateAutoResuming:        {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested},
+	StateAutoResuming:        {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StatePaused},
 	StateVerifying:           {StateCompleted, StateRunning, StateNeedsAttention, StateFailed, StateCancelRequested, StateBlocked},
 	StateIntegrating:         {StateCompleted, StateAwaitingIntegration, StateNeedsAttention, StateFailed, StateCancelRequested},
 	StateAwaitingIntegration: {StateIntegrating, StateCompleted, StateNeedsAttention, StateFailed, StateCancelled},
 	StateCancelRequested:     {StateCancelled, StateFailed, StateCompleted},
-	StateCompleted:           {StateRunning}, // completed run may be continued manually
-	StateBlocked:             {StateRunning, StateSkipped, StateCancelled, StateFailed, StateQueued},
-	StateNeedsAttention:      {StateRunning, StateQueued, StateAutoResuming, StateSkipped, StateCancelled, StateFailed, StatePreparing},
-	StateFailed:              {StateQueued, StateSkipped, StateCancelled, StatePreparing},
-	StateOrphaned:            {StateAutoResuming, StateNeedsAttention, StateSkipped, StateCancelled, StateFailed},
+	// A run parked by an INCLUDE_ACTIVE pause: stopped at a safe point, its
+	// native session intact, waiting to be continued when the queue resumes.
+	StatePaused: {StateRunning, StateAutoResuming, StateQueued, StateCancelRequested,
+		StateCancelled, StateFailed, StateNeedsAttention, StateSkipped},
+	// A completed run may be continued manually, and re-integrated after a
+	// manual fix — the latter edge was missing, which blocked recovery.
+	StateCompleted:      {StateRunning, StateIntegrating},
+	StateBlocked:        {StateRunning, StateSkipped, StateCancelled, StateFailed, StateQueued},
+	StateNeedsAttention: {StateRunning, StateQueued, StateAutoResuming, StateSkipped, StateCancelled, StateFailed, StatePreparing},
+	StateFailed:         {StateQueued, StateSkipped, StateCancelled, StatePreparing},
+	StateOrphaned:       {StateAutoResuming, StateNeedsAttention, StateSkipped, StateCancelled, StateFailed},
 }
 
 // CanTransition validates a state change.
@@ -126,6 +135,8 @@ const (
 	EventVerificationFinished   RunEventType = "VERIFICATION_FINISHED"
 	EventContinuationSent       RunEventType = "CONTINUATION_SENT"
 	EventCancelRequested        RunEventType = "CANCEL_REQUESTED"
+	EventPausedAtSafePoint      RunEventType = "PAUSED_AT_SAFE_POINT"
+	EventResumedAfterPause      RunEventType = "RESUMED_AFTER_PAUSE"
 	EventRunCancelled           RunEventType = "RUN_CANCELLED"
 	EventExternalWait           RunEventType = "EXTERNAL_AGENT_WAIT"
 	EventOrphaned               RunEventType = "RUN_ORPHANED"
@@ -217,6 +228,7 @@ type Run struct {
 	QueuedAt           time.Time  `json:"queuedAt"`
 	StartedAt          time.Time  `json:"startedAt"`
 	FinishedAt         time.Time  `json:"finishedAt"`
+	CancelRequestedAt  time.Time  `json:"cancelRequestedAt"`
 	NextEligibleAt     *time.Time `json:"nextEligibleAt,omitempty"`
 	QueueWaitNS        int64      `json:"queueWaitNs"`
 	ActiveNS           int64      `json:"activeNs"`
@@ -242,6 +254,10 @@ type Batch struct {
 	FinishedAt        time.Time   `json:"finishedAt"`
 	Applied           bool        `json:"applied"`
 	Implicit          bool        `json:"implicit"`
+	// Number is a real monotonic counter assigned at creation. It drives git
+	// branch names, so it must never collide; the previous implementation
+	// hashed the batch id into 1..89.
+	Number int64 `json:"number"`
 }
 
 // Row is one LINEAR or PARALLEL row inside a batch.
@@ -344,6 +360,13 @@ End with the standard Agent Conductor result marker: <AC_RESULT>COMPLETE</AC_RES
 
 // ContinueAfterQuota is the fixed continuation message after a quota reset.
 const ContinueAfterQuota = `Continue from exactly where you stopped. Complete the existing task. Do not restart work that is already finished. Re-inspect the current repository state and continue through implementation and verification until the original request is complete.
+
+Remember to end your final response with the required Agent Conductor result marker.`
+
+// ContinueAfterPause is the continuation message used when the user's queue
+// pause is lifted. Deliberately distinct from ContinueAfterQuota so the agent
+// is told plainly that nothing failed.
+const ContinueAfterPause = `The queue was paused and has now resumed. Continue from exactly where you stopped. Nothing failed; no work was lost. Re-inspect the current repository state and continue through implementation and verification until the original request is complete.
 
 Remember to end your final response with the required Agent Conductor result marker.`
 

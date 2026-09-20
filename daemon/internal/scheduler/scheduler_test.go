@@ -29,6 +29,9 @@ type harness struct {
 	fakeCodex  *providers.Fake
 	guardian   *quota.Guardian
 	repo       string
+	vault      *vault.Vault
+	registry   *providers.Registry
+	wt         *worktrees.Manager
 
 	mu     sync.Mutex
 	vnow   time.Time
@@ -56,6 +59,7 @@ func newHarness(t *testing.T) *harness {
 	h.guardian = quota.New()
 	hookBus := providers.NewHookBus()
 	wt := worktrees.NewManager(filepath.Join(dir, "wts"))
+	h.vault, h.registry, h.wt = vv, reg, wt
 	h.conductor = New(store, vv, reg, h.guardian, wt, hookBus, logging.NewNop(), ShellVerifier{})
 	h.conductor.SetClock(func() time.Time {
 		h.mu.Lock()
@@ -68,6 +72,23 @@ func newHarness(t *testing.T) *harness {
 	h.conductor.Start(ctx)
 	t.Cleanup(func() { h.stopFn(); h.conductor.Stop() })
 	return h
+}
+
+// restart simulates a daemon restart: the old conductor stops and a fresh one
+// is constructed over the same store, exactly as `agent-conductor serve` does.
+func (h *harness) restart() {
+	h.stopFn()
+	h.conductor.Stop()
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	h.stopFn = cancel
+	h.conductor = New(h.store, h.vault, h.registry, h.guardian, h.wt, providers.NewHookBus(), logging.NewNop(), ShellVerifier{})
+	h.conductor.SetClock(func() time.Time {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.vnow
+	})
+	h.conductor.Start(ctx)
 }
 
 func (h *harness) advance(d time.Duration) {

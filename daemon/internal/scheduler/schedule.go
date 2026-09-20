@@ -15,25 +15,37 @@ import (
 // anchors only when truly idle.
 func (c *Conductor) schedule(ctx context.Context) error {
 	s := c.Settings()
-	if s.Paused {
-		return nil
-	}
 	now := c.Now()
 
+	// Everything below the dispatch guard still runs while paused: a pause
+	// must not freeze the daemon, only the queue. The old code returned
+	// immediately when paused, which also skipped quota resolution and left
+	// the pause timer unevaluated.
+	c.evaluatePauseTimer(now)
 	if err := c.resumeQuotaReady(now); err != nil {
 		return err
 	}
+	c.reapStuckCancels(now)
 
-	batches, err := c.store.ListBatches(500)
+	// FIFO: oldest active batch first. ListBatches is newest-first for the UI.
+	batches, err := c.store.ListActiveBatches()
 	if err != nil {
 		return err
 	}
 	busyExt := c.externalBusy()
+	// Keep the single "why is nothing running?" record honest, then decide
+	// whether dispatch is actually held.
+	c.updateSystemHolds(s, now, busyExt)
+	if c.PauseState().GatesDispatch() {
+		return nil // hold dispatch only; everything above still ran
+	}
+	// One lookup for the whole pass instead of a GetBatch per active run.
+	implicitBatch := map[string]bool{}
+	for _, b := range batches {
+		implicitBatch[b.ID] = b.Implicit
+	}
 
 	for _, b := range batches {
-		if b.Status != model.BatchQueued && b.Status != model.BatchRunning {
-			continue
-		}
 		// Recompute slot usage before each batch: dispatches mutate state.
 		active, err := c.store.ListRunsByStates(activeStates()...)
 		if err != nil {
@@ -45,7 +57,15 @@ func (c *Conductor) schedule(ctx context.Context) error {
 		for _, r := range active {
 			counts[r.Provider]++
 			total++
-			if rb, _ := c.store.GetBatch(r.BatchID); rb != nil && rb.Implicit {
+			implicit, known := implicitBatch[r.BatchID]
+			if !known {
+				// Active run whose batch is no longer QUEUED/RUNNING.
+				if rb, _ := c.store.GetBatch(r.BatchID); rb != nil {
+					implicit = rb.Implicit
+					implicitBatch[r.BatchID] = implicit
+				}
+			}
+			if implicit {
 				queueActive++
 			}
 		}
@@ -159,6 +179,55 @@ func (c *Conductor) resumeQuotaReady(now time.Time) error {
 	return nil
 }
 
+// cancelWatchdog is how long a run may sit in CANCEL_REQUESTED with no live
+// execution before it is forced to CANCELLED.
+const cancelWatchdog = 60 * time.Second
+
+// reapStuckCancels frees slots held by cancellations that will never complete.
+//
+// CANCEL_REQUESTED counts as an active state, so a run that no adapter is
+// executing held a slot indefinitely: nothing would ever emit TurnInterrupted
+// for it. Two such runs with the default MaxTotal of 2 killed the queue until
+// the daemon restarted.
+func (c *Conductor) reapStuckCancels(now time.Time) {
+	stuck, err := c.store.ListRunsByStates(model.StateCancelRequested)
+	if err != nil {
+		return
+	}
+	for _, r := range stuck {
+		c.mu.Lock()
+		_, live := c.cancels[r.ID]
+		c.mu.Unlock()
+		if live {
+			continue
+		}
+		since := r.CancelRequestedAt
+		if since.IsZero() {
+			since = r.FinishedAt
+		}
+		if since.IsZero() {
+			// Pre-watchdog rows carry no timestamp; adopt one and reap on the
+			// next pass rather than cancelling something mid-flight.
+			r.CancelRequestedAt = now
+			c.store.UpdateRun(r)
+			continue
+		}
+		if now.Sub(since) < cancelWatchdog {
+			continue
+		}
+		reason := "cancellation had no live execution after 60s"
+		c.store.AddRunEvent(r.ID, model.EventRunCancelled, quoteJSON(reason))
+		if c.transition(r.ID, model.StateCancelled, nil, func(x *model.Run) {
+			x.FinalOutcome = "CANCELLED"
+			x.FinishedAt = now
+		}) {
+			c.log.Infof("run %s forced to CANCELLED: %s", r.ID, reason)
+			c.reviveBatch(r.BatchID)
+			c.emitRun(r.ID)
+		}
+	}
+}
+
 // nextEligible computes provider next eligibility, falling back to the
 // user-configured Claude weekly reset when provider data lacks timestamps.
 func (c *Conductor) nextEligible(provider string, now time.Time) (time.Time, bool, bool) {
@@ -218,7 +287,7 @@ func (c *Conductor) recoverOnStartup() {
 	for _, r := range runs {
 		reason := "daemon restarted while run was active"
 		c.store.AddRunEvent(r.ID, model.EventOrphaned, quoteJSON(reason))
-		c.store.TransitionRun(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
+		c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 			x.ErrorCode = "RESTART"
 			x.ErrorMsg = reason
 			x.FinishedAt = c.Now()
@@ -230,7 +299,7 @@ func (c *Conductor) recoverOnStartup() {
 	for _, r := range qw {
 		if r.ProviderSessionID == "" {
 			// No session yet: never dispatched — safe to requeue from scratch.
-			c.store.TransitionRun(r.ID, model.StateQueued, nil, nil)
+			c.transition(r.ID, model.StateQueued, nil, nil)
 		}
 		c.emitRun(r.ID)
 	}
@@ -282,6 +351,7 @@ func allStatesList() []model.RunState {
 		model.StateWaitingForQuota, model.StateAutoResuming, model.StateVerifying, model.StateCompleted,
 		model.StateBlocked, model.StateNeedsAttention, model.StateFailed, model.StateCancelRequested,
 		model.StateCancelled, model.StateOrphaned, model.StateSkipped, model.StateIntegrating, model.StateAwaitingIntegration,
+		model.StatePaused,
 	}
 }
 

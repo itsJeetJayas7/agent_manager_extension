@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"crypto/rand"
+	"encoding/base32"
 	"fmt"
 	"strings"
 	"time"
@@ -69,13 +71,17 @@ func (c *Conductor) EnqueueRun(in EnqueueRunInput) (batchID, runID string, err e
 		PromptPreview: model.PreviewRedacted(in.Prompt, 120),
 		CreatedAt:     c.Now(), QueuedAt: c.Now(), Cwd: in.Cwd,
 	}
-	sortKey, err := c.store.NextSortKey()
+	// Run Next means "ahead of everything still waiting". It used to assign
+	// time.Now().UnixNano(), which dwarfs the small sequential keys and
+	// therefore sent the run to the BACK of the queue.
+	var sortKey int64
+	if in.RunNext {
+		sortKey, err = c.store.FrontSortKey()
+	} else {
+		sortKey, err = c.store.NextSortKey()
+	}
 	if err != nil {
 		return "", "", err
-	}
-	if in.RunNext {
-		// insert immediately after active runs: lowest sort key among queued.
-		sortKey = time.Now().UnixNano() // still after active; scheduler dispatches FIFO
 	}
 	run.SortKey = sortKey
 	if err := c.store.CreateBatch(batch); err != nil {
@@ -175,19 +181,24 @@ func (c *Conductor) ApplyBatch(spec BatchSpecInput) (batchID string, err error) 
 		BaseCwd: spec.Cwd, BaseBranch: branch, BaseCommit: commit,
 		CreatedAt: c.Now(),
 	}
-	if err := c.store.CreateBatch(batch); err != nil {
+	sortKey, err := c.store.NextSortKey()
+	if err != nil {
 		return "", err
 	}
-	sortKey, _ := c.store.NextSortKey()
+	var rows []*model.Row
+	var runs []*model.Run
 	for i, rs := range spec.Rows {
+		if len(rs.Runs) == 0 {
+			// A row with no runs can never satisfy rowDone/rowAllStarted, so it
+			// would stall the batch forever.
+			return "", fmt.Errorf("row %d has no runs", i+1)
+		}
 		mode := model.RowLinear
 		if strings.ToUpper(rs.Mode) == "PARALLEL" {
 			mode = model.RowParallel
 		}
 		row := &model.Row{ID: newID("row"), BatchID: batch.ID, Position: i, Mode: mode, Status: model.RowPending}
-		if err := c.store.CreateRow(row); err != nil {
-			return "", err
-		}
+		rows = append(rows, row)
 		for ci, rr := range rs.Runs {
 			cipher, err := c.vault.Seal(rr.Prompt)
 			if err != nil {
@@ -197,7 +208,7 @@ func (c *Conductor) ApplyBatch(spec BatchSpecInput) (batchID string, err error) 
 			if permission == "" {
 				permission = "bypass"
 			}
-			run := &model.Run{
+			runs = append(runs, &model.Run{
 				ID: newID("run"), BatchID: batch.ID, RowID: row.ID, CardIndex: ci,
 				Title: rr.Title, Provider: rr.Provider, Model: rr.Model, Effort: rr.Effort,
 				Permission: permission, AttachSecrets: rr.AttachSecrets, Staged: rr.Staged,
@@ -205,13 +216,15 @@ func (c *Conductor) ApplyBatch(spec BatchSpecInput) (batchID string, err error) 
 				PromptCipherStore: cipher, PromptHash: model.HashPrompt(rr.Prompt),
 				PromptPreview: model.PreviewRedacted(rr.Prompt, 120),
 				CreatedAt:     c.Now(), QueuedAt: c.Now(), SortKey: sortKey, Cwd: spec.Cwd,
-			}
-			sortKey++
-			if err := c.store.CreateRun(run); err != nil {
-				return "", err
-			}
-			c.store.AddRunEvent(run.ID, model.EventQueued, quoteJSON("batch applied"))
+			})
+			sortKey += db.SortKeyGap
 		}
+	}
+	// One transaction: a failure part-way used to leave a half-created batch.
+	if err := c.store.CreateBatchAtomic(batch, rows, runs, func(string) (model.RunEventType, string) {
+		return model.EventQueued, quoteJSON("batch applied")
+	}); err != nil {
+		return "", err
 	}
 	c.emit("batchUpdated", batch.ID)
 	c.Poke()
@@ -231,16 +244,49 @@ func (c *Conductor) CancelRun(runID string) error {
 	c.mu.Lock()
 	cancel := c.cancels[runID]
 	c.mu.Unlock()
+
+	// A run that was never dispatched has no provider turn in flight, so
+	// nothing would ever emit TurnInterrupted to move it out of
+	// CANCEL_REQUESTED — it sat there forever holding a slot, and two cancels
+	// with the default MaxTotal of 2 killed the queue until a daemon restart.
+	if cancel == nil && r.ProviderSessionID == "" && !dispatched(r.State) {
+		if err := c.store.TransitionRun(runID, model.StateCancelled, nil, func(x *model.Run) {
+			x.FinalOutcome = "CANCELLED"
+			x.FinishedAt = c.Now()
+		}); err != nil {
+			return err
+		}
+		c.reviveBatch(r.BatchID)
+		c.emitRun(runID)
+		c.Poke()
+		return nil
+	}
+
 	if adapter, ok := c.registry.Get(r.Provider); ok {
 		adapter.Cancel(runID)
 	}
 	if cancel != nil {
 		cancel()
 	}
-	c.store.TransitionRun(runID, model.StateCancelRequested, nil, nil)
+	if err := c.store.TransitionRun(runID, model.StateCancelRequested, nil, func(x *model.Run) {
+		x.CancelRequestedAt = c.Now()
+	}); err != nil {
+		return err
+	}
 	c.emitRun(runID)
 	c.Poke()
 	return nil
+}
+
+// dispatched reports whether a run has an execution in flight with the
+// provider. Waiting states have not reached an adapter yet.
+func dispatched(st model.RunState) bool {
+	switch st {
+	case model.StateQueued, model.StateWaitingForSlot, model.StateWaitingForExternal,
+		model.StateWaitingForQuota, model.StateDraft:
+		return false
+	}
+	return true
 }
 
 // RetryRun requeues a failed/attention run from its original prompt.
@@ -249,7 +295,7 @@ func (c *Conductor) RetryRun(runID string) error {
 	if err != nil || r == nil {
 		return fmt.Errorf("run not found")
 	}
-	c.store.TransitionRun(runID, model.StateQueued, &model.RunEvent{Type: model.EventQueued, Timestamp: c.Now()}, func(x *model.Run) {
+	c.transition(runID, model.StateQueued, &model.RunEvent{Type: model.EventQueued, Timestamp: c.Now()}, func(x *model.Run) {
 		x.Stage = stageFor(r.Staged)
 		x.ErrorCode, x.ErrorMsg = "", ""
 		x.ProviderSessionID = "" // fresh native session on retry
@@ -289,8 +335,23 @@ func (c *Conductor) ContinueRun(runID string, message string) error {
 	if msg == "" {
 		msg = model.ContinueAfterQuota
 	}
-	c.store.TransitionRun(runID, model.StateAutoResuming, &model.RunEvent{Type: model.EventAutoResumeStarted, Timestamp: c.Now()}, nil)
-	c.launchExecution(r, msg, true)
+	// From COMPLETED the only legal transition is -> RUNNING; asking for
+	// AUTO_RESUMING failed silently and then dispatched anyway against a run
+	// whose persisted state did not match.
+	target := model.StateAutoResuming
+	if !model.CanTransition(r.State, target) {
+		target = model.StateRunning
+	}
+	if err := c.store.TransitionRun(runID, target, &model.RunEvent{Type: model.EventAutoResumeStarted, Timestamp: c.Now()}, nil); err != nil {
+		return fmt.Errorf("continue %s: %w", runID, err)
+	}
+	// Re-read: launchExecution derives the active state from the run it is
+	// handed, so it must not see pre-transition state.
+	fresh, err := c.store.GetRun(runID)
+	if err != nil || fresh == nil {
+		return fmt.Errorf("run vanished during continue")
+	}
+	c.launchExecution(fresh, msg, true)
 	c.emitRun(runID)
 	return nil
 }
@@ -312,9 +373,23 @@ func (c *Conductor) SkipRun(runID string) error {
 	return nil
 }
 
+// UpdateRunInput is a true patch: an omitted field is left alone. The previous
+// shape reused EnqueueRunInput and unconditionally assigned Model/Effort/
+// Permission, so a partial update that omitted `model` blanked it.
+type UpdateRunInput struct {
+	Prompt        *string `json:"prompt"`
+	Provider      *string `json:"provider"`
+	Model         *string `json:"model"`
+	Effort        *string `json:"effort"`
+	Permission    *string `json:"permission"`
+	AttachSecrets *bool   `json:"attachSecrets"`
+	Staged        *bool   `json:"staged"`
+	Title         *string `json:"title"`
+}
+
 // UpdateRun edits a queued (not yet started) run's scheduling fields.
 // Prompt edits are rejected after dispatch: original prompts are immutable.
-func (c *Conductor) UpdateRun(runID string, in EnqueueRunInput) error {
+func (c *Conductor) UpdateRun(runID string, in UpdateRunInput) error {
 	r, err := c.store.GetRun(runID)
 	if err != nil || r == nil {
 		return fmt.Errorf("run not found")
@@ -322,26 +397,44 @@ func (c *Conductor) UpdateRun(runID string, in EnqueueRunInput) error {
 	if r.State != model.StateQueued && r.State != model.StateWaitingForSlot && r.State != model.StateWaitingForExternal {
 		return fmt.Errorf("only queued, not-yet-started runs can be edited (state %s); use Continue or Cancel+Retry", r.State)
 	}
-	if in.Prompt != "" {
-		cipher, err := c.vault.Seal(in.Prompt)
+	if in.Prompt != nil && strings.TrimSpace(*in.Prompt) != "" {
+		cipher, err := c.vault.Seal(*in.Prompt)
 		if err != nil {
 			return err
 		}
 		r.PromptCipherStore = cipher
-		r.PromptHash = model.HashPrompt(in.Prompt)
-		r.PromptPreview = model.PreviewRedacted(in.Prompt, 120)
+		r.PromptHash = model.HashPrompt(*in.Prompt)
+		r.PromptPreview = model.PreviewRedacted(*in.Prompt, 120)
 	}
-	if in.Provider != "" {
-		r.Provider = in.Provider
+	if in.Provider != nil && *in.Provider != "" {
+		if _, ok := c.registry.Get(*in.Provider); !ok {
+			return fmt.Errorf("unknown provider %q", *in.Provider)
+		}
+		r.Provider = *in.Provider
 	}
-	r.Model, r.Effort, r.Permission = in.Model, in.Effort, in.Permission
-	if in.Permission != "" {
-		r.Permission = in.Permission
+	if in.Model != nil {
+		r.Model = *in.Model
 	}
-	r.AttachSecrets = in.AttachSecrets
-	r.Staged = in.Staged
+	if in.Effort != nil {
+		r.Effort = *in.Effort
+	}
+	if in.Permission != nil && *in.Permission != "" {
+		r.Permission = *in.Permission
+	}
+	if in.Title != nil {
+		r.Title = *in.Title
+	}
+	if in.AttachSecrets != nil {
+		r.AttachSecrets = *in.AttachSecrets
+	}
+	if in.Staged != nil {
+		r.Staged = *in.Staged
+	}
 	if r.Staged && r.Stage == model.StageNone {
 		r.Stage = model.StagePlan
+	}
+	if !r.Staged {
+		r.Stage = model.StageNone
 	}
 	return c.store.UpdateRun(r)
 }
@@ -374,9 +467,22 @@ func (c *Conductor) ReorderQueue(runID string, beforeRunID string) error {
 				return fmt.Errorf("cannot move a run ahead of its batch row dependency")
 			}
 		}
-		r.SortKey = target.SortKey - 1
+		// Sparse keys: pick a value strictly between target and its
+		// predecessor, renormalising the queue if the gap is exhausted.
+		key, err := c.store.SortKeyBefore(beforeRunID)
+		if err != nil {
+			return err
+		}
+		r.SortKey = key
 	} else {
-		r.SortKey = time.Now().UnixNano()
+		// Move to the end. This used to assign UnixNano, which happens to
+		// work only because every other key is tiny — the same inversion that
+		// broke Run Next.
+		key, err := c.store.NextSortKey()
+		if err != nil {
+			return err
+		}
+		r.SortKey = key
 	}
 	if err := c.store.UpdateRun(r); err != nil {
 		return err
@@ -385,17 +491,17 @@ func (c *Conductor) ReorderQueue(runID string, beforeRunID string) error {
 	return nil
 }
 
-// PauseScheduler / ResumeScheduler toggle queue processing.
+// PauseScheduler / ResumeScheduler are thin aliases kept so an older
+// extension build keeps working against a newer daemon. New callers use
+// PauseQueue/ResumeQueue, which carry scope, timer and reason.
 func (c *Conductor) PauseScheduler() error {
-	s := c.Settings()
-	s.Paused = true
-	return c.UpdateSettings(s)
+	_, err := c.PauseQueue(PauseRequest{Scope: PauseQueueOnly, Source: PauseSourceUser})
+	return err
 }
 
 func (c *Conductor) ResumeScheduler() error {
-	s := c.Settings()
-	s.Paused = false
-	return c.UpdateSettings(s)
+	_, err := c.ResumeQueue()
+	return err
 }
 
 // UpdateSecretBlock stores a new encrypted version of the shared testing &
@@ -431,10 +537,41 @@ func (c *Conductor) RevealSecretBlock() (string, int64, error) {
 	return plain, v.ID, err
 }
 
-// DeleteSecretBlock removes the stored block (queued runs attach nothing).
+// DeleteSecretBlock permanently removes the stored block.
+//
+// This used to set an unread `secretBlock.deleted` flag: the plaintext stayed
+// in the database, RevealSecretBlock still revealed it, and queued runs still
+// shipped it to the provider. Pressing Delete on a sudo password did nothing.
 func (c *Conductor) DeleteSecretBlock() error {
-	// keep table but mark deleted via setting flag
-	return c.store.SetSetting("secretBlock.deleted", true)
+	n, err := c.store.DeleteAllSecretVersions()
+	if err != nil {
+		return err
+	}
+	// Stop redacting a value that no longer exists, and clear the stale flag
+	// from installations that ran the old implementation.
+	c.log.Redactor().Clear()
+	_ = c.store.SetSetting("secretBlock.deleted", false)
+	c.log.Infof("secret block deleted (%d version(s) removed)", n)
+	c.emit("settingsUpdated", nil)
+	return nil
+}
+
+// RunAttachesSecrets reports whether a run's effective prompt carries the
+// shared block. Previously the API substring-matched the rendered prompt for
+// a literal header, which is both fragile and a weaker guarantee.
+func (c *Conductor) RunAttachesSecrets(runID string) bool {
+	r, err := c.store.GetRun(runID)
+	if err != nil || r == nil || !r.AttachSecrets {
+		return false
+	}
+	block, _ := c.latestSecretBlock()
+	return block != ""
+}
+
+// HasSecretBlock reports existence without decrypting anything.
+func (c *Conductor) HasSecretBlock() bool {
+	ok, err := c.store.HasSecretBlock()
+	return err == nil && ok
 }
 
 // ClearStaleExternalSession removes one external busy observation.
@@ -514,7 +651,7 @@ func (c *Conductor) CopyBatchReport(batchID string) (string, error) {
 	n := 1
 	for _, row := range rows {
 		for _, r := range byRow[row.ID] {
-			fmt.Fprintf(&sb, "## Run %d — %s\n", n, strings.ToUpper(r.Provider[:1])+r.Provider[1:])
+			fmt.Fprintf(&sb, "## Run %d — %s\n", n, titleCase(r.Provider))
 			fmt.Fprintf(&sb, "- Model: %s (effort %s)\n", r.Model, r.Effort)
 			fmt.Fprintf(&sb, "- Outcome: %s\n", outcomeLabel(r))
 			if !r.StartedAt.IsZero() && !r.FinishedAt.IsZero() {
@@ -538,6 +675,15 @@ func (c *Conductor) CopyBatchReport(batchID string) (string, error) {
 	}
 	fmt.Fprintf(&sb, "## Changes\n\n- Base: %s @ %s\n- Integration branch: %s\n", b.BaseBranch, b.BaseCommit[:min(8, len(b.BaseCommit))], b.IntegrationBranch)
 	return sb.String(), nil
+}
+
+// titleCase upper-cases the first letter. r.Provider[:1] panicked on an empty
+// provider string.
+func titleCase(s string) string {
+	if s == "" {
+		return "Unknown"
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func outcomeLabel(r *model.Run) string {
@@ -572,6 +718,20 @@ func (c *Conductor) EffectivePromptForRun(runID string) (string, error) {
 	return model.EffectivePrompt(userPrompt, r.AttachSecrets, block, r.Staged && r.Stage == model.StagePlan), nil
 }
 
+var idEncoding = base32.NewEncoding("0123456789abcdefghjkmnpqrstvwxyz").WithPadding(base32.NoPadding)
+
+// newID returns a collision-free identifier.
+//
+// The previous implementation concatenated two clock readings, so two calls in
+// the same tick produced identical ids — and ApplyBatch creates rows and runs
+// in a tight loop, violating the PRIMARY KEY and aborting batch creation
+// half-way. The time prefix is kept only so ids sort roughly by creation.
 func newID(prefix string) string {
-	return fmt.Sprintf("%s_%s", prefix, fmt.Sprintf("%d%d", time.Now().UnixNano(), time.Now().Unix()%1000))
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail in practice; if it ever does, a
+		// time-based id is still better than a duplicate.
+		return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%s_%s", prefix, idEncoding.EncodeToString(b[:]))
 }

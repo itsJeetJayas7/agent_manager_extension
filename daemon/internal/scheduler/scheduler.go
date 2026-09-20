@@ -6,6 +6,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -95,6 +96,9 @@ type Conductor struct {
 	subsMu  sync.Mutex
 	subs    []chan OutEvent
 	cancels map[string]context.CancelFunc
+	// pauseHeld marks runs interrupted by an INCLUDE_ACTIVE pause, so the
+	// resulting TurnInterrupted is parked rather than treated as a failure.
+	pauseHeld map[string]bool
 
 	// clock is swapped by tests (virtual clock) while the scheduling loop and
 	// every provider callback read it, so it cannot be a plain field.
@@ -104,6 +108,11 @@ type Conductor struct {
 
 	settingsMu sync.Mutex
 	settings   Settings
+
+	// Pause lives under its own settings key so an unrelated settings write
+	// cannot clobber it.
+	pauseMu sync.Mutex
+	pause   PauseState
 }
 
 // New wires the conductor.
@@ -112,13 +121,16 @@ func New(store *db.Store, vv *vault.Vault, reg *providers.Registry, g *quota.Gua
 		store: store, vault: vv, registry: reg, guardian: g, wt: wt,
 		hookBus: hookBus, log: log, verifier: verifier,
 		wake: make(chan struct{}, 1), stopCh: make(chan struct{}),
-		cancels: map[string]context.CancelFunc{},
+		cancels:   map[string]context.CancelFunc{},
+		pauseHeld: map[string]bool{},
 	}
 	c.SetClock(time.Now)
 	c.settings = DefaultSettings()
 	if s := c.loadSettings(); s != nil {
 		c.settings = *s
 	}
+	c.pause = PauseState{Scope: PauseQueueOnly}
+	c.loadPause()
 	return c
 }
 
@@ -150,6 +162,9 @@ func (c *Conductor) Poke() {
 // Start launches the loop and recovery.
 func (c *Conductor) Start(ctx context.Context) {
 	c.recoverOnStartup()
+	// A pause whose deadline passed while the daemon was down must not
+	// silently outlive it.
+	c.honourElapsedPause()
 	go c.hookEventLoop()
 	go c.loop(ctx)
 }
@@ -212,14 +227,43 @@ func (c *Conductor) UpdateSettings(s Settings) error {
 	if err := c.store.SetSetting("conductor.settings", s); err != nil {
 		return err
 	}
+	c.applySettings(s)
+	c.emit("settingsUpdated", s)
+	c.Poke()
+	return nil
+}
+
+// PatchSettings applies a partial settings object server-side.
+//
+// Every webview mutation used to read the whole settings object, change one
+// field and write it all back, so two concurrent edits silently lost one — and
+// a stale snapshot could resurrect old values. A patch touches only the keys
+// it names.
+func (c *Conductor) PatchSettings(patch json.RawMessage) (Settings, error) {
+	c.settingsMu.Lock()
+	next := c.settings
+	// Unmarshalling onto a populated struct leaves absent keys untouched.
+	if err := json.Unmarshal(patch, &next); err != nil {
+		c.settingsMu.Unlock()
+		return c.settings, err
+	}
+	c.settings = next
+	c.settingsMu.Unlock()
+	if err := c.store.SetSetting("conductor.settings", next); err != nil {
+		return next, err
+	}
+	c.applySettings(next)
+	c.emit("settingsUpdated", next)
+	c.Poke()
+	return next, nil
+}
+
+func (c *Conductor) applySettings(s Settings) {
 	if claude, ok := c.registry.Get(model.ProviderClaude); ok {
 		if cl, ok := claude.(*providers.Claude); ok {
 			cl.SetAPIMode(s.ClaudeAPIMode)
 		}
 	}
-	c.emit("settingsUpdated", s)
-	c.Poke()
-	return nil
 }
 
 func (c *Conductor) loadSettings() *Settings {
@@ -273,9 +317,15 @@ func (c *Conductor) externalBusy() map[string]*model.ProviderSession {
 
 // ---- main loop ----
 
+// schedulerSafetyNet is the longest the loop sleeps with nothing pending. Work
+// is event-driven through Poke(); this only catches anything that forgets to
+// poke. It used to run every second regardless, which drove a full scheduling
+// pass (and its queries) 86,400 times a day on an idle machine.
+const schedulerSafetyNet = 10 * time.Second
+
 func (c *Conductor) loop(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -283,10 +333,55 @@ func (c *Conductor) loop(ctx context.Context) {
 		case <-c.stopCh:
 			return
 		case <-c.wake:
-		case <-ticker.C:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
 		}
 		if err := c.schedule(ctx); err != nil {
 			c.log.Errorf("schedule: %v", err)
 		}
+		timer.Reset(c.nextWakeDelay())
 	}
+}
+
+// nextWakeDelay returns when the loop must next run even if nothing pokes it,
+// so a pause timer or quota reset fires on time instead of up to a tick late.
+func (c *Conductor) nextWakeDelay() time.Duration {
+	now := c.Now()
+	delay := schedulerSafetyNet
+	consider := func(deadline time.Time) {
+		if deadline.IsZero() {
+			return
+		}
+		if d := deadline.Sub(now); d > 0 && d < delay {
+			delay = d
+		} else if d <= 0 {
+			delay = 0
+		}
+	}
+	if p := c.PauseState(); p.Paused && p.ResumeAt != nil {
+		consider(*p.ResumeAt)
+	}
+	if waiting, err := c.store.ListRunsByStates(model.StateWaitingForQuota); err == nil {
+		for _, r := range waiting {
+			if r.NextEligibleAt != nil {
+				consider(*r.NextEligibleAt)
+			}
+		}
+	}
+	if stuck, err := c.store.ListRunsByStates(model.StateCancelRequested); err == nil && len(stuck) > 0 {
+		if delay > cancelWatchdog/4 {
+			delay = cancelWatchdog / 4
+		}
+	}
+	// Never busy-loop: a deadline already in the past still fires on the next
+	// pass, and the pass itself takes longer than this floor.
+	if delay < 50*time.Millisecond {
+		delay = 50 * time.Millisecond
+	}
+	return delay
 }

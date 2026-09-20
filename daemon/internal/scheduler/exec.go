@@ -129,12 +129,18 @@ func (c *Conductor) launchExecution(r *model.Run, promptOverride string, isConti
 	}
 
 	dispatchUUID := newDispatchUUID(r.ID, r.Attempt+1)
-	c.store.TransitionRun(r.ID, pickActiveState(r), &model.RunEvent{Type: model.EventTurnStarted, Timestamp: c.Now()}, func(x *model.Run) {
+	if err := c.store.TransitionRun(r.ID, pickActiveState(r), &model.RunEvent{Type: model.EventTurnStarted, Timestamp: c.Now()}, func(x *model.Run) {
 		x.DispatchUUID = dispatchUUID
 		x.Attempt = r.Attempt + 1
 		x.StartedAt = c.Now()
 		x.MeaningfulProgress = false
-	})
+	}); err != nil {
+		// Dispatching against a run whose persisted state does not match is how
+		// runs ended up wedged; refuse instead.
+		c.log.Errorf("dispatch %s: %v", r.ID, err)
+		c.finishFailure(r, "DISPATCH", err.Error())
+		return
+	}
 	c.store.RecordAttemptStart(r.ID, r.Attempt+1, dispatchUUID)
 	runID := r.ID
 	spec := providers.ExecSpec{
@@ -172,10 +178,27 @@ func (c *Conductor) launchExecution(r *model.Run, promptOverride string, isConti
 	}()
 }
 
-func pickActiveState(r *model.Run) model.RunState {
-	if r.State == model.StateAutoResuming {
-		return model.StateAutoResuming
+// pickActiveState is the state a run enters when its turn is dispatched.
+//
+// AUTO_RESUMING is a transient pre-dispatch marker, never a dispatched state:
+// it has no legal edge to COMPLETED, so returning it here left resumed runs
+// stuck forever. This only ever worked because callers passed a stale,
+// pre-transition copy of the run.
+// transition applies a state change and never swallows a refusal.
+//
+// Roughly two dozen call sites discarded TransitionRun's error, so a run could
+// silently stay in a state its caller had already moved past. Failures are now
+// logged and written to the run's timeline where the user can see them.
+func (c *Conductor) transition(runID string, to model.RunState, evt *model.RunEvent, mut func(*model.Run)) bool {
+	if err := c.store.TransitionRun(runID, to, evt, mut); err != nil {
+		c.log.Errorf("transition %s -> %s: %v", runID, to, err)
+		c.store.AddRunEvent(runID, model.EventStateChanged, quoteJSON("refused: "+err.Error()))
+		return false
 	}
+	return true
+}
+
+func pickActiveState(r *model.Run) model.RunState {
 	if r.ProviderSessionID != "" {
 		return model.StateRunning
 	}
@@ -191,19 +214,19 @@ func (c *Conductor) onProviderEvent(runID string, ev providers.Event) {
 	switch ev.Kind {
 	case providers.EvSessionStarted:
 		if r.ProviderSessionID == "" && ev.SessionID != "" {
-			c.store.TransitionRun(r.ID, model.StateRunning, &model.RunEvent{Type: model.EventProviderSessionCreated, Timestamp: ev.At}, func(x *model.Run) {
+			c.transition(r.ID, model.StateRunning, &model.RunEvent{Type: model.EventProviderSessionCreated, Timestamp: ev.At}, func(x *model.Run) {
 				x.ProviderSessionID = ev.SessionID
 				x.ProviderSubSession = ev.SubSession
 			})
 			c.store.AddRunEvent(r.ID, model.EventProviderSessionCreated, quoteJSON(ev.SessionID))
 		} else if ev.SessionID != "" && ev.SessionID != r.ProviderSessionID {
-			c.store.TransitionRun(r.ID, r.State, nil, func(x *model.Run) {
+			c.transition(r.ID, r.State, nil, func(x *model.Run) {
 				x.ProviderSessionID = ev.SessionID
 			})
 		}
 	case providers.EvTurnStarted:
 		if ev.TurnID != "" {
-			c.store.TransitionRun(r.ID, r.State, nil, func(x *model.Run) {
+			c.transition(r.ID, r.State, nil, func(x *model.Run) {
 				x.ProviderTurnID = ev.TurnID
 			})
 		}
@@ -212,7 +235,7 @@ func (c *Conductor) onProviderEvent(runID string, ev providers.Event) {
 		c.markWindowAnchoredByWork(r.Provider)
 	case providers.EvMessageDelta:
 		if ev.Progress && !r.MeaningfulProgress {
-			c.store.TransitionRun(r.ID, r.State, nil, func(x *model.Run) {
+			c.transition(r.ID, r.State, nil, func(x *model.Run) {
 				x.MeaningfulProgress = true
 			})
 		}
@@ -221,7 +244,7 @@ func (c *Conductor) onProviderEvent(runID string, ev providers.Event) {
 	case providers.EvProcessExited:
 		// mid-turn crash with progress: continuation preferred
 		if r.MeaningfulProgress && r.ProviderSessionID != "" {
-			c.store.TransitionRun(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
+			c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 				x.ErrorCode = string(model.ErrProcessCrash)
 				x.ErrorMsg = "provider process exited mid-turn; same-session continue available"
 			})
@@ -239,11 +262,20 @@ func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 	c.store.FinishAttempt(r.ID, attempt, ev.SessionID, ev.TurnID, string(ev.Status), ev.Progress)
 	switch ev.Status {
 	case providers.TurnInterrupted:
-		if r.State == model.StateCancelRequested {
-			c.store.TransitionRun(r.ID, model.StateCancelled, &model.RunEvent{Type: model.EventRunCancelled, Timestamp: c.Now()}, func(x *model.Run) {
+		switch {
+		case r.State == model.StateCancelRequested:
+			c.transition(r.ID, model.StateCancelled, &model.RunEvent{Type: model.EventRunCancelled, Timestamp: c.Now()}, func(x *model.Run) {
 				x.FinishedAt = c.Now()
 			})
-		} else {
+		case c.wasPauseHeld(r.ID):
+			// Stopped by an INCLUDE_ACTIVE pause, not by a failure. The native
+			// session is intact and the run is continued when the queue
+			// resumes.
+			c.transition(r.ID, model.StatePaused, &model.RunEvent{Type: model.EventPausedAtSafePoint, Timestamp: c.Now()}, func(x *model.Run) {
+				x.ErrorCode = ""
+				x.ErrorMsg = ""
+			})
+		default:
 			c.finishFailure(r, string(model.ErrUserInterrupt), "run interrupted")
 		}
 		return
@@ -272,7 +304,7 @@ func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 			c.beginVerification(r)
 		case "BLOCKED":
 			c.store.AddRunEvent(r.ID, model.EventCompletionMarkerFound, quoteJSON("BLOCKED"))
-			c.store.TransitionRun(r.ID, model.StateBlocked, nil, func(x *model.Run) {
+			c.transition(r.ID, model.StateBlocked, nil, func(x *model.Run) {
 				x.FinalOutcome = "BLOCKED: " + reason
 				x.FinishedAt = c.Now()
 			})
@@ -281,7 +313,7 @@ func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 		default:
 			// Agent stopped without the required marker after the completion
 			// gate already gave one continuation: needs human attention.
-			c.store.TransitionRun(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
+			c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 				x.ErrorCode = "NO_RESULT_MARKER"
 				x.ErrorMsg = "agent stopped without <AC_RESULT> marker"
 				x.FinishedAt = c.Now()
@@ -295,7 +327,7 @@ func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 // same native session.
 func (c *Conductor) onPlanComplete(r *model.Run, planMsg string) {
 	if !model.HasStageMarker(planMsg) {
-		c.store.TransitionRun(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
+		c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 			x.ErrorCode = "NO_PLAN_MARKER"
 			x.ErrorMsg = "plan phase ended without <AC_STAGE>PLAN_READY</AC_STAGE> marker"
 			x.FinishedAt = c.Now()
@@ -303,7 +335,7 @@ func (c *Conductor) onPlanComplete(r *model.Run, planMsg string) {
 		c.Poke()
 		return
 	}
-	c.store.TransitionRun(r.ID, model.StateRunning, &model.RunEvent{Type: model.EventStageChanged, Timestamp: c.Now()}, func(x *model.Run) {
+	c.transition(r.ID, model.StateRunning, &model.RunEvent{Type: model.EventStageChanged, Timestamp: c.Now()}, func(x *model.Run) {
 		x.Stage = model.StageBuild
 	})
 	c.launchExecution(r, model.BuildStageContinuation, true)
@@ -327,7 +359,7 @@ func (c *Conductor) handleRateLimit(r *model.Run, ev providers.Event) {
 	c.store.AddRunEvent(r.ID, model.EventRateLimitDetected, quoteJSON("provider rate limited"))
 	if !hasTime || missing {
 		// Claude weekly with unknown reset: surface honestly, wait for user override or provider event.
-		c.store.TransitionRun(r.ID, model.StateWaitingForQuota, nil, func(x *model.Run) {
+		c.transition(r.ID, model.StateWaitingForQuota, nil, func(x *model.Run) {
 			x.NextEligibleAt = nil
 			x.ErrorMsg = "quota exhausted; reset time unknown — configure weekly reset override or wait for provider data"
 		})
@@ -335,7 +367,7 @@ func (c *Conductor) handleRateLimit(r *model.Run, ev providers.Event) {
 		c.Poke()
 		return
 	}
-	c.store.TransitionRun(r.ID, model.StateWaitingForQuota, &model.RunEvent{Type: model.EventWaitScheduled, Timestamp: now}, func(x *model.Run) {
+	c.transition(r.ID, model.StateWaitingForQuota, &model.RunEvent{Type: model.EventWaitScheduled, Timestamp: now}, func(x *model.Run) {
 		t := ne
 		x.NextEligibleAt = &t
 	})
@@ -364,7 +396,7 @@ func (c *Conductor) beginVerification(r *model.Run) {
 		c.completeRun(r)
 		return
 	}
-	c.store.TransitionRun(r.ID, model.StateVerifying, &model.RunEvent{Type: model.EventVerificationStarted, Timestamp: c.Now()}, nil)
+	c.transition(r.ID, model.StateVerifying, &model.RunEvent{Type: model.EventVerificationStarted, Timestamp: c.Now()}, nil)
 	go func() {
 		cwd := r.Cwd
 		if r.WorktreePath != "" {
@@ -389,7 +421,7 @@ func (c *Conductor) beginVerification(r *model.Run) {
 				"\n\nEnd with the standard Agent Conductor result marker."
 			c.launchExecution(r2, fix, true)
 		} else {
-			c.store.TransitionRun(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
+			c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 				x.ErrorCode = "VERIFICATION_FAILED"
 				x.ErrorMsg = truncate(redactLines(summary), 500)
 				x.FinishedAt = c.Now()
@@ -403,7 +435,7 @@ func (c *Conductor) beginVerification(r *model.Run) {
 func (c *Conductor) completeRun(r *model.Run) {
 	s := c.Settings()
 	if r.Staged && s.AuditEnabled && r.Stage != model.StageAudit && r.AuditCycles < s.MaxAuditCycles {
-		c.store.TransitionRun(r.ID, model.StateRunning, &model.RunEvent{Type: model.EventStageChanged, Timestamp: c.Now()}, func(x *model.Run) {
+		c.transition(r.ID, model.StateRunning, &model.RunEvent{Type: model.EventStageChanged, Timestamp: c.Now()}, func(x *model.Run) {
 			x.Stage = model.StageAudit
 			x.AuditCycles++
 		})
@@ -413,7 +445,7 @@ If you find a real issue, reply with exactly: <AC_RESULT>BLOCKED: precise descri
 		c.launchExecution(r, audit, true)
 		return
 	}
-	c.store.TransitionRun(r.ID, model.StateCompleted, &model.RunEvent{Type: model.EventRunCompleted, Timestamp: c.Now()}, func(x *model.Run) {
+	c.transition(r.ID, model.StateCompleted, &model.RunEvent{Type: model.EventRunCompleted, Timestamp: c.Now()}, func(x *model.Run) {
 		x.FinalOutcome = "COMPLETE"
 		x.FinishedAt = c.Now()
 		x.ErrorMsg = ""
@@ -424,7 +456,7 @@ If you find a real issue, reply with exactly: <AC_RESULT>BLOCKED: precise descri
 
 // finishFailure marks a run failed with a redacted message.
 func (c *Conductor) finishFailure(r *model.Run, code, msg string) {
-	c.store.TransitionRun(r.ID, model.StateFailed, &model.RunEvent{Type: model.EventRunFailed, Timestamp: c.Now()}, func(x *model.Run) {
+	c.transition(r.ID, model.StateFailed, &model.RunEvent{Type: model.EventRunFailed, Timestamp: c.Now()}, func(x *model.Run) {
 		x.ErrorCode = code
 		x.ErrorMsg = truncate(msg, 500)
 		x.FinishedAt = c.Now()
