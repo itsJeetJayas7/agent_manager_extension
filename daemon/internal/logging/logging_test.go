@@ -62,3 +62,42 @@ func TestLoggerRedactsBeforeWrite(t *testing.T) {
 		t.Fatalf("expected 2 lines, got %d", lines)
 	}
 }
+
+// §7.9 — logging.New opened one append-only file forever; the comment claimed
+// the service rotated it and nothing did.
+func TestLogRotationBySize(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.jsonl")
+	l, err := New(path, Debug, NewRedactor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	l.SetRotation(2048, 3)
+
+	for i := 0; i < 400; i++ {
+		l.Infof("line %d %s", i, strings.Repeat("x", 100))
+	}
+	for _, suffix := range []string{"", ".1", ".2"} {
+		if _, err := os.Stat(path + suffix); err != nil {
+			t.Fatalf("expected rotated file %q: %v", path+suffix, err)
+		}
+	}
+	// The retention limit must actually bound the set.
+	if _, err := os.Stat(path + ".4"); err == nil {
+		t.Fatal("rotation kept more files than configured")
+	}
+	if st, err := os.Stat(path); err != nil || st.Size() > 4096 {
+		t.Fatalf("active log was not rotated: %v", err)
+	}
+}
+
+// §7.9 — redactPatterns used strings.Index and redacted only the first
+// occurrence of each pattern per line.
+func TestRedactsEveryOccurrenceOnALine(t *testing.T) {
+	r := NewRedactor()
+	got := r.Redact("first ghp_aaaa then ghp_bbbb and ghp_cccc")
+	if strings.Count(got, "ghp_") != 0 {
+		t.Fatalf("later occurrences left in the clear: %q", got)
+	}
+}

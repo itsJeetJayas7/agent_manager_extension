@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 func testManager(t *testing.T) *Manager {
@@ -150,5 +153,108 @@ func TestBackupsCreated(t *testing.T) {
 	b, _ := os.ReadFile(r.Backup)
 	if string(b) != `{"a":1}` {
 		t.Fatal("backup content wrong")
+	}
+}
+
+// §4.3 — InstallCodex used to decode config.toml into a map and re-encode it,
+// destroying every comment and all formatting. Everything outside the managed
+// block must now survive byte for byte.
+func TestCodexInstallPreservesCommentsAndFormatting(t *testing.T) {
+	m := testManager(t)
+	path := m.codexConfigPath()
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	original := `# My Codex configuration.
+# Please keep these comments.
+
+model    = "gpt-5.1-codex"   # trailing comment
+approval_policy = "on-request"
+
+[history]
+# how much to keep
+persistence = "save-all"
+`
+	os.WriteFile(path, []byte(original), 0o600)
+
+	if _, err := m.InstallCodex(); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(path)
+	if !strings.HasPrefix(string(after), original) {
+		t.Fatalf("the original bytes were not preserved:\n%s", after)
+	}
+	for _, want := range []string{
+		"# My Codex configuration.",
+		"# Please keep these comments.",
+		`model    = "gpt-5.1-codex"   # trailing comment`,
+		"# how much to keep",
+	} {
+		if !strings.Contains(string(after), want) {
+			t.Fatalf("lost %q from the user's config", want)
+		}
+	}
+
+	// And uninstall restores the file exactly.
+	if _, err := m.UninstallCodex(); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := os.ReadFile(path)
+	if string(restored) != original {
+		t.Fatalf("uninstall did not restore the original bytes:\ngot:\n%q\nwant:\n%q", restored, original)
+	}
+}
+
+// A TOML datetime used to come back through fmt.Sprintf("%v") as an unquoted,
+// syntactically invalid token.
+func TestCodexInstallSurvivesExoticValues(t *testing.T) {
+	m := testManager(t)
+	path := m.codexConfigPath()
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	original := "created = 1979-05-27T07:32:00Z\nratio = 0.75\ntags = [\"a\", \"b\"]\n"
+	os.WriteFile(path, []byte(original), 0o600)
+	if _, err := m.InstallCodex(); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(path)
+	if !strings.Contains(string(after), "created = 1979-05-27T07:32:00Z") {
+		t.Fatalf("datetime mangled:\n%s", after)
+	}
+	var doc map[string]any
+	if _, err := toml.Decode(string(after), &doc); err != nil {
+		t.Fatalf("wrote invalid TOML: %v\n%s", err, after)
+	}
+}
+
+func TestCodexInstallRefusesInvalidToml(t *testing.T) {
+	m := testManager(t)
+	path := m.codexConfigPath()
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	os.WriteFile(path, []byte("this is not [ valid toml\n"), 0o600)
+	if _, err := m.InstallCodex(); err == nil {
+		t.Fatal("must refuse a config it cannot parse")
+	}
+	raw, _ := os.ReadFile(path)
+	if string(raw) != "this is not [ valid toml\n" {
+		t.Fatal("the unparseable config was modified anyway")
+	}
+}
+
+// Backups used to accumulate forever, one per install/uninstall.
+func TestBackupsArePruned(t *testing.T) {
+	m := testManager(t)
+	path := m.claudeSettingsPath()
+	os.MkdirAll(filepath.Dir(path), 0o700)
+	for i := 0; i < 9; i++ {
+		os.WriteFile(path, []byte(`{"a":1}`), 0o600)
+		// Distinct timestamps so the names differ.
+		bak := path + "." + time.Now().UTC().Add(time.Duration(i)*time.Second).Format("20060102T150405Z") + backupExt
+		os.WriteFile(bak, []byte("old"), 0o600)
+	}
+	os.WriteFile(path, []byte(`{"a":2}`), 0o600)
+	if _, err := m.InstallClaude(); err != nil {
+		t.Fatal(err)
+	}
+	matches, _ := filepath.Glob(path + ".*" + backupExt)
+	if len(matches) > 5 {
+		t.Fatalf("backups not pruned: %d remain", len(matches))
 	}
 }

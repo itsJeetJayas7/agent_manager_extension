@@ -38,6 +38,12 @@ func (m *Manager) codexConfigPath() string {
 	return filepath.Join(m.Home, ".codex", "config.toml")
 }
 
+// hookCommand builds the global (awareness-only) hook command.
+//
+// The completion gate is NOT installed globally. The Claude adapter passes its
+// own hooks with --gate via --settings for managed runs; installing the gate
+// here too made Claude Code merge both and fire the bridge twice for every
+// event - two block decisions and a duplicated timeline.
 func hookCommand(selfBin, provider string) string {
 	return fmt.Sprintf("%s hook %s", shellQuote(selfBin), provider)
 }
@@ -79,10 +85,8 @@ func (m *Manager) InstallClaude() (InstallResult, error) {
 		return res, err
 	}
 
-	if !changed(doc) {
-		if doc["hooks"] == nil {
-			doc["hooks"] = map[string]any{}
-		}
+	if doc["hooks"] == nil {
+		doc["hooks"] = map[string]any{}
 	}
 	hooksDoc, ok := doc["hooks"].(map[string]any)
 	if !ok {
@@ -131,8 +135,6 @@ func (m *Manager) InstallClaude() (InstallResult, error) {
 	res.Changed = true
 	return res, nil
 }
-
-func changed(map[string]any) bool { return false }
 
 // hasNamespacedClaudeEntry detects our entry in a Claude hooks event list.
 // Claude matcher groups carry {matcher?, hooks:[...]}. We tag ours with the
@@ -225,11 +227,27 @@ func (m *Manager) UninstallClaude() (InstallResult, error) {
 
 // ---- Codex (config.toml) ----
 
-// codexHookConfig is the TOML shape merged into [hooks.*] tables.
-type codexHookConfig map[string]map[string]any
+// Codex hook entries are written as a single delimited block appended to
+// config.toml. Everything outside the block is preserved byte for byte.
+//
+// The previous implementation decoded the whole file into map[string]any and
+// re-encoded it with a hand-rolled writer. That destroyed every comment and
+// all formatting, and its fallback branch emitted fmt.Sprintf("%v") - so a
+// TOML datetime came back as an unquoted, syntactically invalid token. The
+// function was documented as NON-destructive; it was the opposite.
+const (
+	codexBlockStart = "# >>> agent-conductor (managed) >>>"
+	codexBlockEnd   = "# <<< agent-conductor (managed) <<<"
+)
 
-// InstallCodex merges awareness hooks into ~/.codex/config.toml.
-// Entries are marked with agent_conductor = true for surgical removal.
+// codexHookEvents are the events we ask Codex to notify us about.
+var codexHookEvents = []string{"SessionStart", "UserPromptSubmit", "Stop", "Interrupt", "SessionEnd"}
+
+// InstallCodex appends Agent Conductor's awareness hooks to ~/.codex/config.toml.
+//
+// NOTE: the [hooks.*] surface has not been verified against an installed
+// Codex build (see docs/provider-capabilities.md). The block is delimited and
+// removable precisely so that writing it is harmless if Codex ignores it.
 func (m *Manager) InstallCodex() (InstallResult, error) {
 	path := m.codexConfigPath()
 	res := InstallResult{Provider: "codex", Path: path}
@@ -242,68 +260,57 @@ func (m *Manager) InstallCodex() (InstallResult, error) {
 	} else if err != nil {
 		return res, err
 	}
+	original := string(raw)
 
-	var doc map[string]any
-	if len(raw) > 0 {
-		if _, err := toml.Decode(string(raw), &doc); err != nil {
-			return res, fmt.Errorf("existing %s is not valid TOML; refusing to touch it: %w", path, err)
-		}
-	}
-	// deep-copy check: build with our table
-	cmd := hookCommand(m.SelfBin, "codex")
-	hooksTbl, _ := doc["hooks"].(map[string]any)
-	if hooksTbl == nil {
-		hooksTbl = map[string]any{}
-		doc["hooks"] = hooksTbl
-	}
-	changedFlag := false
-	for _, ev := range []string{"SessionStart", "UserPromptSubmit", "Stop", "Interrupt", "SessionEnd"} {
-		var list []map[string]any
-		switch v := hooksTbl[ev].(type) {
-		case []map[string]any:
-			list = v
-		case []any:
-			for _, item := range v {
-				if mm, ok := item.(map[string]any); ok {
-					list = append(list, mm)
-				}
-			}
-		case map[string]any:
-			// Existing table form ([hooks.Stop] command = "..."): never
-			// touch it; appending an array-of-tables would be invalid TOML.
-			res.Note = "existing [hooks." + ev + "] table left untouched; add awareness entries manually if desired"
-			continue
-		case nil:
-		default:
-			res.Note = "unsupported [hooks." + ev + "] shape left untouched"
-			continue
-		}
-		already := false
-		for _, e := range list {
-			if t, _ := e["type"].(string); t == "command" {
-				if c, _ := e["command"].(string); strings.Contains(c, "hook codex") {
-					if mk, _ := e["agent_conductor"].(bool); mk {
-						already = true
-					}
-				}
-			}
-		}
-		if already {
-			continue
-		}
-		list = append(list, map[string]any{
-			"agent_conductor": true,
-			"type":            "command",
-			"command":         cmd,
-			"timeout":         10,
-		})
-		hooksTbl[ev] = list
-		changedFlag = true
-	}
-	if !changedFlag {
+	if strings.Contains(original, codexBlockStart) {
 		res.Note = "already installed"
 		return res, nil
 	}
+	// Read-only parse: we never write this structure back, we only use it to
+	// find events we cannot extend without producing invalid TOML.
+	events := append([]string(nil), codexHookEvents...)
+	if len(raw) > 0 {
+		var doc map[string]any
+		if _, err := toml.Decode(original, &doc); err != nil {
+			return res, fmt.Errorf("existing %s is not valid TOML; refusing to touch it: %w", path, err)
+		}
+		if hooksTbl, ok := doc["hooks"].(map[string]any); ok {
+			var usable []string
+			var skipped []string
+			for _, ev := range events {
+				switch hooksTbl[ev].(type) {
+				case nil, []map[string]any, []any:
+					usable = append(usable, ev) // array of tables: extendable
+				default:
+					// The user defined [hooks.X] as a plain table. Appending
+					// [[hooks.X]] would be invalid TOML, so leave theirs alone.
+					skipped = append(skipped, ev)
+				}
+			}
+			events = usable
+			if len(skipped) > 0 {
+				res.Note = "left your existing [hooks." + strings.Join(skipped, "], [hooks.") + "] untouched"
+			}
+		}
+	}
+	if len(events) == 0 {
+		res.Note = "every hook event is already defined by you; nothing added"
+		return res, nil
+	}
+
+	block := m.codexBlock(events)
+	next := original
+	if next != "" && !strings.HasSuffix(next, "\n") {
+		next += "\n"
+	}
+	next += block
+
+	// Refuse to write anything that would not parse.
+	var check map[string]any
+	if _, err := toml.Decode(next, &check); err != nil {
+		return res, fmt.Errorf("refusing to write %s: the result would not be valid TOML (%w)", path, err)
+	}
+
 	if len(raw) > 0 {
 		backup, err := m.backup(path, raw)
 		if err != nil {
@@ -311,18 +318,60 @@ func (m *Manager) InstallCodex() (InstallResult, error) {
 		}
 		res.Backup = backup
 	}
-	var sb strings.Builder
-	if err := encodeTOML(&sb, doc); err != nil {
-		return res, err
-	}
-	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(next), 0o600); err != nil {
 		return res, err
 	}
 	res.Changed = true
 	return res, nil
 }
 
-// UninstallCodex removes only Agent Conductor [hooks.*] entries.
+func (m *Manager) codexBlock(events []string) string {
+	cmd := hookCommand(m.SelfBin, "codex")
+	var b strings.Builder
+	b.WriteString("\n" + codexBlockStart + "\n")
+	b.WriteString("# Awareness hooks for Agent Conductor. Safe to delete by hand;\n")
+	b.WriteString("# `agent-conductor uninstall-service` removes exactly this block.\n")
+	for _, ev := range events {
+		fmt.Fprintf(&b, "[[hooks.%s]]\n", ev)
+		b.WriteString("agent_conductor = true\n")
+		b.WriteString("type = \"command\"\n")
+		fmt.Fprintf(&b, "command = %s\n", tomlString(cmd))
+		b.WriteString("timeout = 10\n")
+	}
+	b.WriteString(codexBlockEnd + "\n")
+	return b.String()
+}
+
+// tomlString renders a TOML basic string with the escapes TOML requires.
+func tomlString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\u%04X`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// UninstallCodex removes exactly the delimited block, leaving the rest of the
+// file byte-identical.
 func (m *Manager) UninstallCodex() (InstallResult, error) {
 	path := m.codexConfigPath()
 	res := InstallResult{Provider: "codex", Path: path}
@@ -334,65 +383,52 @@ func (m *Manager) UninstallCodex() (InstallResult, error) {
 	if err != nil {
 		return res, err
 	}
-	var doc map[string]any
-	if _, err := toml.Decode(string(raw), &doc); err != nil {
-		return res, err
-	}
-	hooksTbl, ok := doc["hooks"].(map[string]any)
-	if !ok {
-		res.Note = "no hooks section"
-		return res, nil
-	}
-	removed := false
-	for ev, v := range hooksTbl {
-		var list []map[string]any
-		switch t := v.(type) {
-		case []map[string]any:
-			list = t
-		case []any:
-			for _, item := range t {
-				if mm, ok := item.(map[string]any); ok {
-					list = append(list, mm)
-				}
-			}
-		default:
-			continue
-		}
-		kept := []map[string]any{}
-		for _, e := range list {
-			if mk, _ := e["agent_conductor"].(bool); mk {
-				removed = true
-				continue
-			}
-			kept = append(kept, e)
-		}
-		if len(kept) == 0 {
-			delete(hooksTbl, ev)
-		} else {
-			hooksTbl[ev] = kept
-		}
-	}
+	original := string(raw)
+	next, removed := stripCodexBlock(original)
 	if !removed {
 		res.Note = "nothing to remove"
 		return res, nil
+	}
+	var check map[string]any
+	if _, err := toml.Decode(next, &check); err != nil {
+		return res, fmt.Errorf("refusing to write %s: removing the block would leave invalid TOML (%w)", path, err)
 	}
 	backup, err := m.backup(path, raw)
 	if err != nil {
 		return res, err
 	}
 	res.Backup = backup
-	if len(hooksTbl) == 0 {
-		delete(doc, "hooks")
-	}
-	var sb strings.Builder
-	if err := encodeTOML(&sb, doc); err != nil {
-		return res, err
-	}
-	if err := os.WriteFile(path, []byte(sb.String()), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(next), 0o600); err != nil {
 		return res, err
 	}
 	res.Changed = true
 	return res, nil
+}
+
+// stripCodexBlock removes every managed block, preserving all other bytes.
+func stripCodexBlock(content string) (string, bool) {
+	removed := false
+	for {
+		i := strings.Index(content, codexBlockStart)
+		if i < 0 {
+			break
+		}
+		j := strings.Index(content[i:], codexBlockEnd)
+		if j < 0 {
+			break // unterminated: leave it alone rather than guess
+		}
+		end := i + j + len(codexBlockEnd)
+		if end < len(content) && content[end] == '\n' {
+			end++
+		}
+		// Drop the blank line we added before the block.
+		for i > 0 && content[i-1] == '\n' && (i < 2 || content[i-2] == '\n') {
+			i--
+		}
+		content = content[:i] + content[end:]
+		removed = true
+	}
+	return content, removed
 }
 
 // backup writes path.bak with timestamp suffix and returns the backup path.
@@ -401,111 +437,19 @@ func (m *Manager) backup(path string, data []byte) (string, error) {
 	if err := os.WriteFile(bak, data, 0o600); err != nil {
 		return "", err
 	}
+	pruneBackups(path, 5)
 	return bak, nil
 }
 
-// encodeTOML writes a deterministic TOML document with fully-qualified
-// nested table headers ([hooks.Stop] etc.).
-func encodeTOML(sb *strings.Builder, doc map[string]any) error {
-	encodeTablePath(sb, "", doc)
-	return nil
-}
-
-func encodeTablePath(sb *strings.Builder, path string, tbl map[string]any) {
-	keys := sortedKeys(tbl)
-	// simple values first
-	for _, k := range keys {
-		if isTable(tbl[k]) {
-			continue
-		}
-		sb.WriteString(quoteKey(k) + " = " + encodeValue(tbl[k]) + "\n")
+// pruneBackups keeps only the newest keep backups. They used to accumulate
+// forever, one per install/uninstall.
+func pruneBackups(path string, keep int) {
+	matches, err := filepath.Glob(path + ".*" + backupExt)
+	if err != nil || len(matches) <= keep {
+		return
 	}
-	// sub-tables with full paths
-	for _, k := range keys {
-		v := tbl[k]
-		if sub, ok := v.(map[string]any); ok {
-			full := k
-			if path != "" {
-				full = path + "." + k
-			}
-			if len(sub) > 0 {
-				sb.WriteString("\n[" + full + "]\n")
-			}
-			encodeTablePath(sb, full, sub)
-		}
+	sort.Strings(matches) // timestamped names sort chronologically
+	for _, old := range matches[:len(matches)-keep] {
+		os.Remove(old)
 	}
-}
-
-func isTable(v any) bool {
-	_, ok := v.(map[string]any)
-	return ok
-}
-
-func sortedKeys(m map[string]any) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func quoteKey(k string) string {
-	if k == "" {
-		return `""`
-	}
-	for _, r := range k {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
-			return fmt.Sprintf("%q", k)
-		}
-	}
-	return k
-}
-
-func encodeValue(v any) string {
-	switch t := v.(type) {
-	case string:
-		return fmt.Sprintf("%q", t)
-	case bool:
-		if t {
-			return "true"
-		}
-		return "false"
-	case int64:
-		return fmt.Sprintf("%d", t)
-	case int:
-		return fmt.Sprintf("%d", t)
-	case float64:
-		return fmt.Sprintf("%g", t)
-	case []map[string]any:
-		parts := make([]string, len(t))
-		for i, e := range t {
-			inner := encodeInlineTable(e)
-			parts[i] = inner
-		}
-		return "[" + strings.Join(parts, ", ") + "]"
-	case []any:
-		parts := make([]string, len(t))
-		for i, e := range t {
-			parts[i] = encodeValue(e)
-		}
-		return "[" + strings.Join(parts, ", ") + "]"
-	case map[string]any:
-		return encodeInlineTable(t)
-	default:
-		return fmt.Sprintf("%v", t)
-	}
-}
-
-func encodeInlineTable(m map[string]any) string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, len(keys))
-	for i, k := range keys {
-		parts[i] = quoteKey(k) + " = " + encodeValue(m[k])
-	}
-	return "{ " + strings.Join(parts, ", ") + " }"
 }

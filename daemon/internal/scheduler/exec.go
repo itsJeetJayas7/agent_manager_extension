@@ -106,9 +106,9 @@ func (c *Conductor) launchExecution(r *model.Run, promptOverride string, isConti
 	switch {
 	case promptOverride != "":
 		effective = promptOverride
-	case isContinue:
-		effective = promptOverride
 	default:
+		// A continuation always carries an override, so there is no separate
+		// isContinue branch; the old one was unreachable.
 		var secretBlock string
 		if attachSecrets {
 			block, _ := c.latestSecretBlock()
@@ -234,11 +234,15 @@ func (c *Conductor) onProviderEvent(runID string, ev providers.Event) {
 		// anchor slot so the synthetic anchor never double-spends it.
 		c.markWindowAnchoredByWork(r.Provider)
 	case providers.EvMessageDelta:
+		// Persist only the first meaningful delta. Writing on every delta meant
+		// a DB round-trip plus a UI fan-out per streamed token.
 		if ev.Progress && !r.MeaningfulProgress {
 			c.transition(r.ID, r.State, nil, func(x *model.Run) {
 				x.MeaningfulProgress = true
 			})
+			break
 		}
+		return // nothing changed: no emitRun, no query next time
 	case providers.EvQuotaUpdate:
 		c.observeQuota(r.Provider, ev.Quota)
 	case providers.EvProcessExited:
@@ -389,6 +393,10 @@ func (c *Conductor) observeQuota(provider string, ws []providers.QuotaWindow) {
 	c.emit("quotaUpdated", provider)
 }
 
+// defaultVerificationTimeout bounds a verification pass when no setting is
+// configured. It used to be 30 minutes, hard-coded and unconfigurable.
+const defaultVerificationTimeout = 30 * time.Minute
+
 // beginVerification runs the optional configured verification commands.
 func (c *Conductor) beginVerification(r *model.Run) {
 	s := c.Settings()
@@ -402,9 +410,18 @@ func (c *Conductor) beginVerification(r *model.Run) {
 		if r.WorktreePath != "" {
 			cwd = r.WorktreePath
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		timeout := time.Duration(s.VerificationTimeoutSec) * time.Second
+		if timeout <= 0 {
+			timeout = defaultVerificationTimeout
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
+		c.store.AddRunEvent(r.ID, model.EventVerificationStarted,
+			quoteJSON(fmt.Sprintf("%d command(s), timeout %s", len(s.VerificationCommands), timeout)))
 		ok, summary := c.verifier.Verify(ctx, cwd, s.VerificationCommands)
+		// Verification output can echo anything the commands printed, so it is
+		// redacted before it is persisted or shown.
+		summary = c.log.Redactor().Redact(summary)
 		r2, _ := c.store.GetRun(r.ID)
 		if r2 == nil {
 			return
@@ -471,11 +488,32 @@ func newDispatchUUID(runID string, attempt int) string {
 	return fmt.Sprintf("%s-%d-%d", runID, attempt, time.Now().UnixNano())
 }
 
+// truncate shortens to n runes. Byte slicing split UTF-8 sequences and
+// produced mojibake in the UI.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(r[:n]) + "…"
+}
+
+// sensitiveWords marks a whole output line for removal. Three keywords caught
+// almost nothing.
+var sensitiveWords = []string{
+	"password", "passwd", "authorization:", "api_key", "apikey", "api-key",
+	"secret", "token", "credential", "private key", "-----begin",
+	"sk-ant-", "sk-proj-", "ghp_", "bearer ", "aws_secret", "client_secret",
+	"passphrase", "sudo",
+}
+
+func containsSensitiveWord(lower string) bool {
+	for _, w := range sensitiveWords {
+		if strings.Contains(lower, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // redactLines strips obviously sensitive lines from verification output
@@ -484,7 +522,7 @@ func redactLines(s string) string {
 	keep := []string{}
 	for _, l := range strings.Split(s, "\n") {
 		low := strings.ToLower(l)
-		if strings.Contains(low, "password") || strings.Contains(low, "authorization:") || strings.Contains(low, "api_key") {
+		if containsSensitiveWord(low) {
 			keep = append(keep, "[line redacted]")
 			continue
 		}

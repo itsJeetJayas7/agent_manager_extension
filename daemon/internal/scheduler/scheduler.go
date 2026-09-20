@@ -46,9 +46,12 @@ type Settings struct {
 	MaxAuditCycles       int      `json:"maxAuditCycles"`
 	MaxVerifyFixCycles   int      `json:"maxVerifyFixCycles"`
 	VerificationCommands []string `json:"verificationCommands"`
-	ClaudeAPIMode        bool     `json:"claudeApiMode"`
-	FIFOBlockOnExternal  bool     `json:"fifoBlockOnExternal"`
-	Paused               bool     `json:"paused"`
+	// VerificationTimeoutSec bounds one verification pass. The 30-minute
+	// timeout used to be hard-coded with no way to change it.
+	VerificationTimeoutSec int  `json:"verificationTimeoutSec"`
+	ClaudeAPIMode          bool `json:"claudeApiMode"`
+	FIFOBlockOnExternal    bool `json:"fifoBlockOnExternal"`
+	Paused                 bool `json:"paused"`
 }
 
 // DefaultSettings returns production defaults.
@@ -63,7 +66,8 @@ func DefaultSettings() Settings {
 		CodexBuildModel: "", CodexBuildEffort: "medium",
 		CodexAuditModel: "", CodexAuditEffort: "high",
 		MaxAuditCycles: 1, MaxVerifyFixCycles: 2,
-		FIFOBlockOnExternal: true,
+		VerificationTimeoutSec: int(defaultVerificationTimeout / time.Second),
+		FIFOBlockOnExternal:    true,
 	}
 }
 

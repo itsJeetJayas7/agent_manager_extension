@@ -43,15 +43,15 @@ func main() {
 		err = serve(os.Getenv("AC_MOCK") == "1")
 	case "hook":
 		if len(args) < 2 {
-			die("usage: agent-conductor hook <claude|codex>")
+			die("usage: agent-conductor hook <claude|codex> [--gate]")
 		}
-		os.Exit(hooksbridge.Run(args[1]))
+		os.Exit(hooksbridge.Run(args[1], args[2:]...))
 	case "completion-gate":
-		// alias of hook for explicit invocation; same semantics
+		// Explicit alias that always enables the managed completion gate.
 		if len(args) < 2 {
 			die("usage: agent-conductor completion-gate <claude|codex>")
 		}
-		os.Exit(hooksbridge.Run(args[1]))
+		os.Exit(hooksbridge.Run(args[1], append(args[2:], "--gate")...))
 	case "install-service":
 		err = installService()
 	case "uninstall-service":

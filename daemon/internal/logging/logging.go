@@ -99,17 +99,27 @@ func redactPatterns(s string) string {
 	return s
 }
 
+// Rotation defaults: the comment used to claim rotation was "handled by the
+// service"; nothing rotated anything and the file grew without bound.
+const (
+	DefaultMaxLogBytes = 10 * 1024 * 1024
+	DefaultMaxLogFiles = 3
+)
+
 // Logger writes JSON lines.
 type Logger struct {
 	mu       sync.Mutex
 	out      io.Writer
 	file     *os.File
+	path     string
+	size     int64
+	maxBytes int64
+	maxFiles int
 	min      Level
 	redactor *Redactor
 }
 
-// New creates a logger writing to path (rolling by size is handled by the
-// service; here we keep one file plus stderr passthrough at info+).
+// New creates a logger writing to path, rotating by size (10MB x 3).
 func New(path string, min Level, redactor *Redactor) (*Logger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -118,7 +128,49 @@ func New(path string, min Level, redactor *Redactor) (*Logger, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Logger{out: io.MultiWriter(f, os.Stderr), file: f, min: min, redactor: redactor}, nil
+	var size int64
+	if st, err := f.Stat(); err == nil {
+		size = st.Size()
+	}
+	return &Logger{
+		out: io.MultiWriter(f, os.Stderr), file: f, path: path, size: size,
+		maxBytes: DefaultMaxLogBytes, maxFiles: DefaultMaxLogFiles,
+		min: min, redactor: redactor,
+	}, nil
+}
+
+// SetRotation configures size-based rotation (0 keeps the defaults).
+func (l *Logger) SetRotation(maxBytes int64, maxFiles int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if maxBytes > 0 {
+		l.maxBytes = maxBytes
+	}
+	if maxFiles > 0 {
+		l.maxFiles = maxFiles
+	}
+}
+
+// rotateLocked renames daemon.jsonl -> .1 -> .2 ... and reopens. Caller holds
+// l.mu.
+func (l *Logger) rotateLocked() {
+	if l.file == nil || l.path == "" {
+		return
+	}
+	l.file.Close()
+	// Drop the oldest, shift the rest up.
+	os.Remove(fmt.Sprintf("%s.%d", l.path, l.maxFiles))
+	for i := l.maxFiles - 1; i >= 1; i-- {
+		os.Rename(fmt.Sprintf("%s.%d", l.path, i), fmt.Sprintf("%s.%d", l.path, i+1))
+	}
+	os.Rename(l.path, l.path+".1")
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		// Keep logging to stderr rather than losing the logger entirely.
+		l.file, l.out, l.size = nil, os.Stderr, 0
+		return
+	}
+	l.file, l.out, l.size = f, io.MultiWriter(f, os.Stderr), 0
 }
 
 // NewNop returns a logger that discards everything (tests).
@@ -151,9 +203,14 @@ func (l *Logger) Log(level Level, msg string, fields map[string]any) {
 	if err != nil {
 		return
 	}
+	line := append(b, '\n')
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.out.Write(append(b, '\n'))
+	if l.file != nil && l.maxBytes > 0 && l.size+int64(len(line)) > l.maxBytes {
+		l.rotateLocked()
+	}
+	n, _ := l.out.Write(line)
+	l.size += int64(n)
 }
 
 // Debugf/Infof/Warnf/Errorf are convenience wrappers.

@@ -6,6 +6,8 @@ package hooksbridge
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -19,7 +21,18 @@ import (
 )
 
 // Run executes the hook bridge for one provider event.
-func Run(provider string) int {
+//
+// args are the flags after the provider name. `--gate` enables the managed
+// completion gate; without it the bridge is awareness-only. The gate is
+// installed solely via the adapter's --settings for managed runs, so the
+// global ~/.claude/settings.json entry never blocks anything.
+func Run(provider string, args ...string) int {
+	gate := false
+	for _, a := range args {
+		if a == "--gate" || a == "-gate" {
+			gate = true
+		}
+	}
 	data, err := readAllStdin()
 	if err != nil {
 		return 0
@@ -30,22 +43,83 @@ func Run(provider string) int {
 	runID := os.Getenv("AGENT_CONDUCTOR_RUN_ID")
 	payload.RunID = runID
 
+	// Claude Code merges global settings with --settings, so the same event can
+	// reach the bridge twice. Forwarding both would duplicate every timeline
+	// entry and fire two block decisions.
+	duplicate := alreadySeen(payload)
+
+	// Forward FIRST. The gate used to `return 0` before forwarding, so the
+	// daemon never learned that the agent had tried to stop: the adapter's
+	// stopped flag and the timeline both missed it.
+	if !duplicate {
+		// Never stall the provider: a missing daemon is not an error here.
+		_ = forward(payload)
+	}
+
 	// Completion gate: managed runs only, Stop event, no result marker,
 	// not already continuing from a stop hook.
-	if provider == model.ProviderClaude && payload.Event == "Stop" && runID != "" && !payload.StopHookActive {
+	if gate && provider == model.ProviderClaude && payload.Event == "Stop" && runID != "" && !payload.StopHookActive {
 		if outcome, _ := model.ParseResultMarker(payload.LastAssistantMessage); outcome == "" {
 			if !model.HasStageMarker(payload.LastAssistantMessage) {
 				emitBlockDecision()
-				return 0
 			}
 		}
 	}
-
-	if err := forward(payload); err != nil {
-		// awareness-only: silently succeed to never stall the provider
-		return 0
-	}
 	return 0
+}
+
+// dedupWindow is how long an identical (provider, event, session, turn,
+// message) tuple is treated as the same delivery.
+const dedupWindow = 10 * time.Second
+
+// alreadySeen records this delivery and reports whether an identical one
+// arrived moments ago. The marker file is created with O_EXCL, so of two
+// concurrent bridge processes exactly one wins.
+func alreadySeen(p providers.HookPayload) bool {
+	key := sha256.Sum256([]byte(strings.Join([]string{
+		p.Provider, p.Event, p.SessionID, p.ThreadID, p.TurnID, p.RunID,
+		fmt.Sprintf("%t", p.StopHookActive), p.LastAssistantMessage,
+	}, "\x00")))
+	name := hex.EncodeToString(key[:12])
+
+	sock, _ := resolveDaemonPaths()
+	dir := filepath.Join(filepath.Dir(sock), "hookdedup")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false // cannot dedup: better a duplicate than a lost event
+	}
+	pruneDedup(dir)
+	marker := filepath.Join(dir, name)
+	f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		f.Close()
+		return false
+	}
+	if !os.IsExist(err) {
+		return false
+	}
+	st, statErr := os.Stat(marker)
+	if statErr != nil || time.Since(st.ModTime()) > dedupWindow {
+		// Stale marker from an earlier, genuinely different delivery.
+		os.Chtimes(marker, time.Now(), time.Now())
+		return false
+	}
+	return true
+}
+
+func pruneDedup(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if time.Since(info.ModTime()) > 5*time.Minute {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 func emitBlockDecision() {

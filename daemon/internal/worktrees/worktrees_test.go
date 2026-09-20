@@ -1,6 +1,7 @@
 package worktrees
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,19 +35,107 @@ func wt(t *testing.T) *Manager {
 	return m
 }
 
-func TestPrecheckCleanVsDirty(t *testing.T) {
+func TestPrecheckBlocksModifiedTrackedFiles(t *testing.T) {
 	repo := initRepo(t)
 	m := wt(t)
 	if err := m.Precheck(repo); err != nil {
 		t.Fatalf("clean repo should pass: %v", err)
 	}
-	os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("x"), 0o644)
+	// A modified tracked file genuinely makes parallel work unsafe.
+	os.WriteFile(filepath.Join(repo, "base.txt"), []byte("changed\n"), 0o644)
 	err := m.Precheck(repo)
 	if err == nil {
-		t.Fatal("dirty repo must be blocked")
+		t.Fatal("uncommitted tracked changes must be blocked")
 	}
 	if !strings.Contains(err.Error(), "clean Git worktree") {
 		t.Fatalf("wrong message: %v", err)
+	}
+}
+
+// §4.4 — untracked build output or a local .env used to block every parallel
+// batch with a misleading "commit or stash your changes".
+func TestPrecheckWarnsButDoesNotBlockOnUntrackedFiles(t *testing.T) {
+	repo := initRepo(t)
+	m := wt(t)
+	os.WriteFile(filepath.Join(repo, ".env"), []byte("SECRET=1\n"), 0o644)
+	os.WriteFile(filepath.Join(repo, "build.out"), []byte("x"), 0o644)
+	warnings, err := m.PrecheckWithWarnings(repo)
+	if err != nil {
+		t.Fatalf("untracked files must not block parallel execution: %v", err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("untracked files should be surfaced as a warning")
+	}
+	if !strings.Contains(warnings[0], "untracked") {
+		t.Fatalf("unhelpful warning: %q", warnings[0])
+	}
+}
+
+// §4.4 / §10.10 — `git branch -f` force-MOVES an existing branch, so a name
+// collision silently destroyed the previous batch's integration branch.
+func TestCreateIntegrationRefusesToOverwriteAnExistingBranch(t *testing.T) {
+	repo := initRepo(t)
+	m := wt(t)
+	base, _ := m.Commit(repo)
+	layout := m.Layout(1, "batch-one", repo)
+
+	if err := m.CreateIntegration(repo, layout.IntegrationBranch, layout.IntegrationDir, base); err != nil {
+		t.Fatal(err)
+	}
+	// Someone's work lands on that branch.
+	if _, err := git(layout.IntegrationDir, "commit", "--allow-empty", "-m", "precious work"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := git(repo, "rev-parse", layout.IntegrationBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = m.CreateIntegration(repo, layout.IntegrationBranch, filepath.Join(t.TempDir(), "again"), base)
+	if err == nil {
+		t.Fatal("creating a branch that already exists must fail loudly")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("unclear error: %v", err)
+	}
+	after, _ := git(repo, "rev-parse", layout.IntegrationBranch)
+	if after != before {
+		t.Fatal("the existing branch was moved; the previous batch's work is gone")
+	}
+}
+
+// Distinct batches must never collide on a branch name.
+func TestLayoutBranchNamesAreCollisionFree(t *testing.T) {
+	m := wt(t)
+	seen := map[string]string{}
+	for i := 1; i <= 300; i++ {
+		id := fmt.Sprintf("b_%d_%d", i, i*7919)
+		l := m.Layout(i, id, "/tmp/repo")
+		if prev, dup := seen[l.IntegrationBranch]; dup {
+			t.Fatalf("branch %s reused by %s and %s", l.IntegrationBranch, prev, id)
+		}
+		seen[l.IntegrationBranch] = id
+	}
+}
+
+// Cleanup must not destroy unmerged commits.
+func TestCleanupKeepsUnmergedBranches(t *testing.T) {
+	repo := initRepo(t)
+	m := wt(t)
+	base, _ := m.Commit(repo)
+	layout := m.Layout(2, "batch-two", repo)
+	if err := m.CreateIntegration(repo, layout.IntegrationBranch, layout.IntegrationDir, base); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git(layout.IntegrationDir, "commit", "--allow-empty", "-m", "unmerged work"); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Cleanup(repo, []string{layout.IntegrationDir}, []string{layout.IntegrationBranch})
+	if err == nil {
+		t.Fatal("cleanup should report that it kept a branch with unmerged commits")
+	}
+	if _, verr := git(repo, "rev-parse", "--verify", layout.IntegrationBranch); verr != nil {
+		t.Fatal("cleanup force-deleted a branch holding unmerged work")
 	}
 }
 

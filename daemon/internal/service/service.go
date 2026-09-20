@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -53,14 +54,32 @@ func (i *Installer) Install() (*InstallResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read binary: %w", err)
 		}
-		if err := os.WriteFile(target, data, 0o755); err != nil {
+		// Write to a temp path and rename: overwriting a RUNNING binary fails
+		// with ETXTBSY on Linux, and rename is atomic for readers.
+		tmp := target + ".new"
+		if err := os.WriteFile(tmp, data, 0o755); err != nil {
 			return nil, err
+		}
+		if err := os.Chmod(tmp, 0o755); err != nil {
+			os.Remove(tmp)
+			return nil, err
+		}
+		if err := os.Rename(tmp, target); err != nil {
+			os.Remove(tmp)
+			return nil, fmt.Errorf("install binary: %w", err)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(i.StablePath()), 0o755); err != nil {
 		return nil, err
 	}
-	_ = os.Symlink(target, i.StablePath())
+	// Remove then link: os.Symlink fails with EEXIST when the link is already
+	// there, which silently left upgrades pointing at the OLD binary.
+	if err := os.Remove(i.StablePath()); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("replace launcher %s: %w", i.StablePath(), err)
+	}
+	if err := os.Symlink(target, i.StablePath()); err != nil {
+		return nil, fmt.Errorf("link launcher %s: %w", i.StablePath(), err)
+	}
 
 	switch runtime.GOOS {
 	case "linux":
@@ -84,6 +103,7 @@ After=network.target
 
 [Service]
 ExecStart={{.Bin}} serve
+Environment=PATH={{.Path}}
 Restart=always
 RestartSec=3
 
@@ -95,7 +115,7 @@ WantedBy=default.target
 		return nil, err
 	}
 	defer f.Close()
-	if err := tpl.Execute(f, map[string]string{"Bin": bin}); err != nil {
+	if err := tpl.Execute(f, map[string]string{"Bin": bin, "Path": i.servicePATH()}); err != nil {
 		return nil, err
 	}
 	res := &InstallResult{Mode: "systemd", UnitPath: unit, BinPath: bin,
@@ -111,16 +131,70 @@ WantedBy=default.target
 	return res, nil
 }
 
+// lingerEnabled reports whether the user's systemd session lingers.
+//
+// This used to pass the literal string "$USER" to loginctl, which never
+// expands outside a shell, so the check always failed and fell through to a
+// shell fallback.
 func lingerEnabled() bool {
-	out, err := exec.Command("loginctl", "show-user", "$USER").Output()
+	u, err := user.Current()
+	if err != nil || u.Username == "" {
+		return false
+	}
+	out, err := exec.Command("loginctl", "show-user", u.Username, "--property=Linger").Output()
 	if err != nil {
-		// $USER won't expand; try actual user
-		out, err = exec.Command("sh", "-c", "loginctl show-user $USER | grep -i linger").Output()
-		if err != nil {
-			return false
-		}
+		return false
 	}
 	return strings.Contains(strings.ToLower(string(out)), "linger=yes")
+}
+
+// servicePATH is an explicit PATH for the service.
+//
+// LaunchAgents and systemd user units inherit a minimal PATH
+// (/usr/bin:/bin:/usr/sbin:/sbin), so findBinary("claude") missed nvm,
+// npm-global, asdf and volta installs - which is most of them. The login
+// shell's PATH is captured at install time and merged in.
+func (i *Installer) servicePATH() string {
+	seen := map[string]bool{}
+	var parts []string
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		parts = append(parts, p)
+	}
+	for _, p := range strings.Split(loginShellPATH(), ":") {
+		add(p)
+	}
+	for _, p := range []string{
+		filepath.Join(i.Home, ".local", "bin"),
+		filepath.Join(i.Home, ".npm-global", "bin"),
+		filepath.Join(i.Home, ".volta", "bin"),
+		filepath.Join(i.Home, ".asdf", "shims"),
+		filepath.Join(i.Home, ".bun", "bin"),
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+		"/usr/bin", "/bin", "/usr/sbin", "/sbin",
+	} {
+		add(p)
+	}
+	return strings.Join(parts, ":")
+}
+
+// loginShellPATH asks the user's login shell for its PATH, so version
+// managers that only configure interactive shells are still found.
+func loginShellPATH() string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		return os.Getenv("PATH")
+	}
+	out, err := exec.Command(shell, "-l", "-c", "printf %s \"$PATH\"").Output()
+	if err != nil || len(out) == 0 {
+		return os.Getenv("PATH")
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func (i *Installer) installLaunchd(bin string) (*InstallResult, error) {
@@ -140,21 +214,38 @@ func (i *Installer) installLaunchd(bin string) (*InstallResult, error) {
     <string>{{.Bin}}</string>
     <string>serve</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{.Path}}</string>
+    <key>HOME</key>
+    <string>{{.Home}}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>{{.LogDir}}/service.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{.LogDir}}/service.err.log</string>
 </dict>
 </plist>
 `))
+	logDir := filepath.Join(i.Home, ".agent-conductor", "logs")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		return nil, err
+	}
 	f, err := os.Create(plist)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	if err := tpl.Execute(f, map[string]string{"Bin": bin}); err != nil {
+	if err := tpl.Execute(f, map[string]string{
+		"Bin": bin, "Path": i.servicePATH(), "Home": i.Home, "LogDir": logDir,
+	}); err != nil {
 		return nil, err
 	}
 	exec.Command("launchctl", "unload", plist).Run()

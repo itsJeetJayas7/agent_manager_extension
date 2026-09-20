@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +31,18 @@ type Claude struct {
 	socketPath string // daemon socket the hook bridge forwards to
 	apiMode    bool   // advanced opt-in to keep ANTHROPIC_API_KEY
 	effortOK   *bool  // capability cache for --effort
+	streamOK   *bool  // capability cache for the headless stream-json protocol
 	running    map[string]*claudeRun
+
+	// deadline bounds one turn. Configurable because "24 hours, hard-coded,
+	// timer never stopped" was neither.
+	deadline time.Duration
+
+	// lastQuota caches the newest rate_limit_event so ProbeQuota can answer
+	// from real structured data between runs.
+	quotaMu   sync.Mutex
+	lastQuota []QuotaWindow
+	quotaAt   time.Time
 }
 
 type claudeRun struct {
@@ -38,13 +50,48 @@ type claudeRun struct {
 	sessionID string
 	cancel    context.CancelFunc
 	ptty      *os.File
+	proc      *os.Process
 	exited    chan struct{}
+	closeOnce sync.Once
 }
 
 // NewClaude creates the adapter. socketPath tells the hook bridge (installed
 // into managed sessions) where to forward lifecycle events.
 func NewClaude(log *logging.Logger, hooks *HookBus, selfBin, socketPath string) *Claude {
-	return &Claude{hooks: hooks, log: log, selfBin: selfBin, socketPath: socketPath, running: map[string]*claudeRun{}}
+	return &Claude{
+		hooks: hooks, log: log, selfBin: selfBin, socketPath: socketPath,
+		running: map[string]*claudeRun{}, deadline: defaultTurnDeadline,
+	}
+}
+
+// defaultTurnDeadline bounds one turn unless configured otherwise.
+const defaultTurnDeadline = 24 * time.Hour
+
+// SetTurnDeadline configures the per-turn deadline (0 restores the default).
+func (c *Claude) SetTurnDeadline(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d <= 0 {
+		d = defaultTurnDeadline
+	}
+	c.deadline = d
+}
+
+func (c *Claude) turnDeadline() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.deadline <= 0 {
+		return defaultTurnDeadline
+	}
+	return c.deadline
+}
+
+// rememberQuota caches structured windows observed during a run.
+func (c *Claude) rememberQuota(q []QuotaWindow) {
+	c.quotaMu.Lock()
+	defer c.quotaMu.Unlock()
+	c.lastQuota = q
+	c.quotaAt = time.Now()
 }
 
 // SetAPIMode enables keeping ANTHROPIC_API_KEY (advanced setting).
@@ -123,29 +170,91 @@ func (c *Claude) Capabilities(ctx context.Context) Caps {
 	} else {
 		caps.AuthState = "ok"
 	}
-	// Editable aliases; dynamic discovery is not exposed structurally today.
-	caps.Models = []ModelInfo{
-		{ID: "opus", Name: "Opus (planning-class)", Efforts: []string{"high", "max"}},
-		{ID: "sonnet", Name: "Sonnet (execution-class)", Efforts: []string{"low", "medium", "high"}},
-		{ID: "haiku", Name: "Haiku (lightweight)", Efforts: []string{"low", "medium"}},
-	}
+	caps.Models = c.probeModels(ctx)
 	caps.Notes = append(caps.Notes, "Model IDs are Claude Code aliases resolved by the runtime at launch.")
+	if c.supportsStreamJSON(ctx) {
+		caps.Notes = append(caps.Notes, "Using the headless stream-json protocol.")
+	} else {
+		caps.Notes = append(caps.Notes, "This build lacks --output-format stream-json; falling back to the interactive PTY path.")
+	}
+	// Quota comes from rate_limit_event frames emitted during runs.
+	c.quotaMu.Lock()
+	caps.RealTimeQuota = len(c.lastQuota) > 0
+	c.quotaMu.Unlock()
 	return caps
 }
+
+// knownClaudeAliases describes the aliases we can label meaningfully.
+var knownClaudeAliases = map[string]ModelInfo{
+	"fable":  {ID: "fable", Name: "Fable (frontier)", Efforts: []string{"medium", "high", "max"}},
+	"opus":   {ID: "opus", Name: "Opus (planning-class)", Efforts: []string{"high", "max"}},
+	"sonnet": {ID: "sonnet", Name: "Sonnet (execution-class)", Efforts: []string{"low", "medium", "high"}},
+	"haiku":  {ID: "haiku", Name: "Haiku (lightweight)", Efforts: []string{"low", "medium"}},
+}
+
+// probeModels reads the alias list out of the installed CLI's help text rather
+// than hardcoding it, falling back to the known set. Cached with capabilities.
+func (c *Claude) probeModels(ctx context.Context) []ModelInfo {
+	order := []string{"fable", "opus", "sonnet", "haiku"}
+	found := map[string]bool{}
+	if bin := c.bin(); bin != "" {
+		ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		out, _ := exec.CommandContext(ctx2, bin, "--help").CombinedOutput()
+		// The --model help line quotes the current aliases.
+		for _, m := range claudeAliasPattern.FindAllStringSubmatch(string(out), -1) {
+			alias := strings.ToLower(m[1])
+			if _, known := knownClaudeAliases[alias]; known {
+				found[alias] = true
+			}
+		}
+	}
+	var models []ModelInfo
+	for _, alias := range order {
+		if len(found) > 0 && !found[alias] {
+			continue
+		}
+		models = append(models, knownClaudeAliases[alias])
+	}
+	if len(models) == 0 {
+		for _, alias := range order {
+			models = append(models, knownClaudeAliases[alias])
+		}
+	}
+	return models
+}
+
+var claudeAliasPattern = regexp.MustCompile(`'([a-z][a-z0-9.-]{2,20})'`)
 
 // managedSettings returns the --settings JSON installing Agent Conductor's
 // namespaced hooks for managed sessions only. The hook bridge learns the
 // daemon socket from the inherited AC_SOCKET environment variable.
 func (c *Claude) managedSettingsJSON() (string, error) {
-	hookCmd := fmt.Sprintf("%s hook claude", shellEscape(c.selfBin))
+	// --gate enables the completion gate for managed runs only. The global
+	// ~/.claude/settings.json entry is awareness-only, so Claude Code merging
+	// both no longer fires two block decisions per stop.
+	gateCmd := fmt.Sprintf("%s hook claude --gate", shellEscape(c.selfBin))
+	plainCmd := fmt.Sprintf("%s hook claude", shellEscape(c.selfBin))
+	entry := func(cmd string, timeout int) []any {
+		return []any{map[string]any{"hooks": []any{map[string]any{
+			"type": "command", "command": cmd, "timeout": timeout,
+		}}}}
+	}
 	settings := map[string]any{
 		"hooks": map[string]any{
-			"SessionStart":     []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}}}},
-			"UserPromptSubmit": []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}}}},
-			"Stop":             []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}}}},
-			"StopFailure":      []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}}}},
-			"Notification":     []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 10}}}},
-			"SessionEnd":       []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": hookCmd, "timeout": 5}}}},
+			"SessionStart":     entry(plainCmd, 10),
+			"UserPromptSubmit": entry(plainCmd, 10),
+			// Only Stop carries the gate.
+			"Stop":         entry(gateCmd, 10),
+			"StopFailure":  entry(plainCmd, 10),
+			"Notification": entry(plainCmd, 10),
+			"SessionEnd":   entry(plainCmd, 5),
+			// Registered so "did the agent actually start work?" is answered
+			// by evidence. The handler already branched on these events, but
+			// nothing ever registered them, so MeaningfulProgress could only
+			// ever come from a non-empty final message.
+			"PreToolUse":  entry(plainCmd, 5),
+			"PostToolUse": entry(plainCmd, 5),
 		},
 	}
 	b, err := json.Marshal(settings)
@@ -251,15 +360,28 @@ func (c *Claude) TrustWorkspace(cwd string) error {
 	return os.WriteFile(path, append(out, '\n'), 0o600)
 }
 
-// Execute launches the managed interactive session in a PTY and blocks until
-// the turn reaches a terminal observation.
+// Execute runs one turn to completion.
+//
+// The headless stream-json protocol is the default; the interactive PTY path
+// survives only as a fallback for builds that lack it.
 func (c *Claude) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
-	bin := c.bin()
-	if bin == "" {
+	if c.bin() == "" {
 		sink(Event{Kind: EvTurnCompleted, RunID: spec.RunID, Status: TurnFailed,
 			Error: &ProviderError{Class: model.ErrProcessCrash, Message: "claude CLI not found"}})
 		return nil
 	}
+	if c.supportsStreamJSON(ctx) {
+		ctx, cancel := context.WithTimeout(ctx, c.turnDeadline())
+		defer cancel()
+		return c.executeHeadless(ctx, spec, sink)
+	}
+	return c.executePTY(ctx, spec, sink)
+}
+
+// executePTY drives the interactive TUI by pasting the prompt into a PTY.
+// Fragile and unobservable; retained only for runtimes without stream-json.
+func (c *Claude) executePTY(ctx context.Context, spec ExecSpec, sink Sink) error {
+	bin := c.bin()
 	settingsJSON, err := c.managedSettingsJSON()
 	if err != nil {
 		return err
@@ -319,7 +441,19 @@ func (c *Claude) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 		return nil
 	}
 	cr.ptty = ptmx
+	cr.proc = cmd.Process
 	defer ptmx.Close()
+	// Reap the child: pty.Start starts the process and nothing waited on it,
+	// so every managed run left a zombie until the daemon exited.
+	waitDone := make(chan struct{})
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			c.log.Infof("claude run %s exited: %v", spec.RunID, err)
+		}
+		close(waitDone)
+	}()
+	defer func() { <-waitDone }()
 	// TUIs refuse to render on 0x0 terminals: give the PTY a sane size.
 	pty.Setsize(ptmx, &pty.Winsize{Rows: 40, Cols: 120})
 	var outTail = struct {
@@ -366,10 +500,9 @@ func (c *Claude) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 			Error: &ProviderError{Class: model.ErrProcessCrash, Message: "claude exited during startup; last output: " + truncateTail(tailText(), 400)}})
 		return nil
 	}
+	// Both branches of the old `if spec.Continue` were identical; a
+	// continuation is the same paste into an already-resumed session.
 	paste := "\x1b[200~" + spec.Prompt + "\x1b[201~\r"
-	if spec.Continue {
-		paste = "\x1b[200~" + spec.Prompt + "\x1b[201~\r"
-	}
 	_, werr := ptmx.Write([]byte(paste))
 	if werr != nil {
 		sink(Event{Kind: EvTurnCompleted, RunID: spec.RunID, SessionID: sessionID, Status: TurnFailed,
@@ -384,8 +517,10 @@ func (c *Claude) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 		stopped      bool
 		nativeResume bool
 	)
-	deadline := time.NewTimer(24 * time.Hour)
+	deadline := time.NewTimer(c.turnDeadline())
+	defer deadline.Stop() // one leaked timer per run otherwise
 	idleOnStop := time.NewTimer(0)
+	defer idleOnStop.Stop()
 	if !idleOnStop.Stop() {
 		<-idleOnStop.C
 	}
@@ -404,7 +539,7 @@ func (c *Claude) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 		case <-deadline.C:
 			cmd.Process.Kill()
 			sink(Event{Kind: EvTurnCompleted, RunID: spec.RunID, SessionID: sessionID, Status: TurnFailed,
-				Error: &ProviderError{Class: model.ErrUnknown, Message: "24h execution deadline exceeded"}})
+				Error: &ProviderError{Class: model.ErrUnknown, Message: "execution deadline exceeded"}})
 			return nil
 		case <-cr.exited:
 			// Process gone. If we never saw a Stop, the run died mid-turn.
@@ -512,14 +647,33 @@ func (c *Claude) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 	}
 }
 
+// billingRedirectVars would send a managed run somewhere other than the user's
+// Claude subscription. Only ANTHROPIC_API_KEY used to be stripped, so an
+// ANTHROPIC_BASE_URL or a Bedrock/Vertex switch silently redirected billing.
+var billingRedirectVars = map[string]bool{
+	"ANTHROPIC_API_KEY":             true,
+	"ANTHROPIC_AUTH_TOKEN":          true,
+	"ANTHROPIC_BASE_URL":            true,
+	"ANTHROPIC_MODEL":               true,
+	"ANTHROPIC_SMALL_FAST_MODEL":    true,
+	"ANTHROPIC_CUSTOM_HEADERS":      true,
+	"CLAUDE_CODE_USE_BEDROCK":       true,
+	"CLAUDE_CODE_USE_VERTEX":        true,
+	"CLAUDE_CODE_SKIP_BEDROCK_AUTH": true,
+	"CLAUDE_CODE_SKIP_VERTEX_AUTH":  true,
+}
+
+// billingRedirectPrefixes covers the cloud credential families.
+var billingRedirectPrefixes = []string{"AWS_", "GOOGLE_", "GCLOUD_", "AZURE_"}
+
 // claudeChildEnv builds the child environment with subscription protection.
 func claudeChildEnv(apiMode bool, extra map[string]string) []string {
 	out := []string{}
 	for _, kv := range os.Environ() {
-		if kv == "ANTHROPIC_API_KEY" || strings.HasPrefix(kv, "ANTHROPIC_API_KEY=") {
-			if apiMode {
-				out = append(out, kv)
-			}
+		// os.Environ() entries always contain '='; the old code also compared
+		// the whole entry against a bare name, which could never match.
+		name, _, _ := strings.Cut(kv, "=")
+		if !apiMode && isBillingRedirect(name) {
 			continue
 		}
 		out = append(out, kv)
@@ -530,6 +684,18 @@ func claudeChildEnv(apiMode bool, extra map[string]string) []string {
 	return out
 }
 
+func isBillingRedirect(name string) bool {
+	if billingRedirectVars[name] {
+		return true
+	}
+	for _, p := range billingRedirectPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // Cancel sends a graceful interrupt to the PTY (Ctrl+C), escalating to SIGINT.
 func (c *Claude) Cancel(runID string) error {
 	c.mu.Lock()
@@ -538,19 +704,32 @@ func (c *Claude) Cancel(runID string) error {
 	if cr == nil {
 		return fmt.Errorf("no active claude run %s", runID)
 	}
+	cr.interrupt()
+	// Escalate against THIS run only. Re-looking-up by id after five seconds
+	// could kill a retry that had since registered under the same id.
+	go func() {
+		time.Sleep(5 * time.Second)
+		cr.closeOnce.Do(func() {
+			if cr.ptty != nil {
+				cr.ptty.Close()
+			}
+			if cr.proc != nil {
+				cr.proc.Kill()
+			}
+		})
+	}()
+	return nil
+}
+
+// interrupt asks the run to stop at a safe point.
+func (cr *claudeRun) interrupt() {
 	cr.cancel()
 	if cr.ptty != nil {
 		cr.ptty.Write([]byte("\x03")) // Ctrl+C in the TUI = interrupt turn
 	}
-	go func() {
-		time.Sleep(5 * time.Second)
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if still := c.running[runID]; still != nil && still.ptty != nil {
-			still.ptty.Close()
-		}
-	}()
-	return nil
+	if cr.proc != nil {
+		cr.proc.Signal(os.Interrupt)
+	}
 }
 
 // ActiveRuns lists run ids currently executing.
@@ -564,10 +743,25 @@ func (c *Claude) ActiveRuns() []string {
 	return out
 }
 
-// ProbeQuota: Claude has no structured quota read surface today; windows are
-// populated from StopFailure/notification events (source provider_event).
+// ProbeQuota returns the newest structured windows observed from a
+// rate_limit_event frame.
+//
+// Claude Code has no standalone quota command, but the stream-json output does
+// carry exact utilisation and reset times per window. The adapter used to
+// report that no structured surface existed at all and inferred windows from
+// notification text.
 func (c *Claude) ProbeQuota(context.Context) ([]QuotaWindow, error) {
-	return nil, fmt.Errorf("claude exposes no structured quota read; quota tracked from lifecycle events")
+	c.quotaMu.Lock()
+	defer c.quotaMu.Unlock()
+	if len(c.lastQuota) == 0 {
+		return nil, fmt.Errorf("no Claude quota observation yet; windows are learned from the first run")
+	}
+	if time.Since(c.quotaAt) > 12*time.Hour {
+		return nil, fmt.Errorf("Claude quota observation is stale (%s old)", time.Since(c.quotaAt).Round(time.Hour))
+	}
+	out := make([]QuotaWindow, len(c.lastQuota))
+	copy(out, c.lastQuota)
+	return out, nil
 }
 
 // Close cancels all runs.
@@ -575,10 +769,7 @@ func (c *Claude) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, cr := range c.running {
-		cr.cancel()
-		if cr.ptty != nil {
-			cr.ptty.Write([]byte("\x03"))
-		}
+		cr.interrupt()
 	}
 	return nil
 }

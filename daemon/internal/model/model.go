@@ -407,8 +407,10 @@ func PreviewRedacted(userPrompt string, max int) string {
 	if i := strings.IndexAny(line, "\r\n"); i >= 0 {
 		line = strings.TrimSpace(line[:i])
 	}
-	if len(line) > max {
-		line = line[:max] + "…"
+	// Truncate by rune: slicing bytes splits multi-byte characters and the UI
+	// renders the result as mojibake.
+	if r := []rune(line); len(r) > max {
+		line = string(r[:max]) + "…"
 	}
 	return line
 }
