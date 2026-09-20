@@ -303,4 +303,32 @@ describe("saved setups", () => {
     fireEvent.click(screen.getByRole("button", { name: /forget the .temp. setup/i }));
     expect(screen.queryByRole("button", { name: "temp" })).toBeNull();
   });
+
+  // The composer reads the selected provider's capability record. A working,
+  // signed-in Codex install used to render "runtime missing" here, because the
+  // daemon could not find a CLI that shipped inside the ChatGPT extension
+  // rather than on PATH.
+  it("shows the selected provider's version, per provider", async () => {
+    render(<QueueView state={makeState(makeSnapshot())} />);
+    expect(screen.getByText("2.1.278")).toBeTruthy();
+    expect(screen.queryByText(/runtime missing/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Codex" }));
+    await waitFor(() => {
+      expect(screen.getByText("1.0")).toBeTruthy();
+      expect(screen.queryByText(/runtime missing/i)).toBeNull();
+    });
+  });
+
+  it("says the runtime is missing only when it really is", async () => {
+    const snap = makeSnapshot();
+    snap.providers.codex = { ...snap.providers.codex, installed: false, version: "", models: [] };
+    render(<QueueView state={makeState(snap)} />);
+
+    // Claude is still installed, so nothing is claimed about it.
+    expect(screen.queryByText(/runtime missing/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Codex" }));
+    await waitFor(() => expect(screen.getByText(/runtime missing/i)).toBeTruthy());
+  });
 });

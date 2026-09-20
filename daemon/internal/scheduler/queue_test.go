@@ -315,3 +315,139 @@ func TestBatchWithEmptyRowIsRejected(t *testing.T) {
 		t.Fatal("a row with no runs must be rejected, not stall the batch forever")
 	}
 }
+
+// markWaitingExternal used to decide from the in-memory slice dispatchRow had
+// already invalidated in the same tick: a run it still saw as WAITING_FOR_SLOT
+// was PREPARING or RUNNING on disk, so the moment a waiting run finally got
+// its slot the scheduler asked the store to send it back to QUEUED. The
+// transition table refused it — no run was corrupted — but every such refusal
+// landed in the daemon log and on the user's run timeline as
+// "refused: illegal transition STARTING -> QUEUED".
+//
+// Found by running two real provider runs through the daemon back to back.
+func TestWaitingRunGetsItsSlotWithoutARefusedTransition(t *testing.T) {
+	h := newHarness(t)
+	cwd := t.TempDir()
+
+	// The first run holds the single slot long enough for the second to be
+	// marked WAITING_FOR_SLOT before the slot frees.
+	h.fakeClaude.SetScripts([]providers.Script{
+		{Match: "holds the slot", Duration: 300 * time.Millisecond, FinalMsg: "done\n" + model.MarkerComplete},
+	})
+
+	_, first, err := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "holds the slot", Provider: model.ProviderClaude, Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "waits for the slot", Provider: model.ProviderClaude, Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !h.tickUntil(3*time.Second, func() bool {
+		return h.run(second).State == model.StateWaitingForSlot
+	}) {
+		t.Fatalf("second run never waited for a slot; state=%s", h.run(second).State)
+	}
+
+	if !h.waitState(second, 10*time.Second, model.StateCompleted) {
+		t.Fatalf("second run did not complete; first=%s second=%s", h.run(first).State, h.run(second).State)
+	}
+
+	events, err := h.store.ListRunEvents(second, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range events {
+		if strings.Contains(e.Data, "refused") {
+			t.Fatalf("scheduler recorded a refused transition on a run it had just dispatched: %s %s", e.Type, e.Data)
+		}
+	}
+}
+
+// The usage counters were persisted, summed by UsageSince and rendered in the
+// Usage panel, but nothing ever incremented them: the only assignment in the
+// codebase was `x.ActiveNS = r.ActiveNS`. Every run therefore reported 0ms
+// active and the panel read as zeros however long the agents actually ran.
+//
+// Found by reading usageSummary after two real provider runs.
+func TestUsageCountersRecordRealTime(t *testing.T) {
+	h := newHarness(t)
+	cwd := t.TempDir()
+
+	h.fakeClaude.SetScripts([]providers.Script{
+		{Match: "measured", Duration: 400 * time.Millisecond, FinalMsg: "done\n" + model.MarkerComplete},
+	})
+
+	_, runID, err := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "measured work", Provider: model.ProviderClaude, Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The harness runs on virtual time, which the provider's real-time sleep
+	// does not move. Advance it while the turn is in flight so there is real
+	// elapsed time for the accounting to record.
+	if !h.tickUntil(5*time.Second, func() bool { return h.run(runID).State == model.StateRunning }) {
+		t.Fatalf("run never started; state=%s", h.run(runID).State)
+	}
+	h.advance(45 * time.Second)
+	if !h.waitState(runID, 10*time.Second, model.StateCompleted) {
+		t.Fatalf("run did not complete; state=%s", h.run(runID).State)
+	}
+
+	r := h.run(runID)
+	if r.ActiveNS <= 0 {
+		t.Fatalf("run completed but recorded %dns of active time", r.ActiveNS)
+	}
+
+	usage, err := h.conductor.UsageSince(24 * time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.ActiveMs <= 0 {
+		t.Fatalf("usage summary reports %dms active for a run that really ran", usage.ActiveMs)
+	}
+	if usage.ByProvider[model.ProviderClaude] <= 0 {
+		t.Fatalf("per-provider active time is %dms", usage.ByProvider[model.ProviderClaude])
+	}
+	if len(usage.ByDay) == 0 {
+		t.Fatal("no per-day usage recorded")
+	}
+}
+
+// Queue wait is measured too, and a run that is requeued does not count its
+// original wait twice.
+func TestQueueWaitIsMeasuredAndNotDoubleCounted(t *testing.T) {
+	h := newHarness(t)
+	mustPause(t, h, PauseRequest{Source: PauseSourceUser})
+	cwd := t.TempDir()
+
+	_, runID, err := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "waits", Provider: model.ProviderClaude, Cwd: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.advance(90 * time.Second) // held by the pause
+	if _, err := h.conductor.ResumeQueue(); err != nil {
+		t.Fatal(err)
+	}
+	if !h.waitState(runID, 10*time.Second, model.StateCompleted) {
+		t.Fatalf("run did not complete; state=%s", h.run(runID).State)
+	}
+
+	first := h.run(runID).QueueWaitNS
+	if first < int64(60*time.Second) {
+		t.Fatalf("queue wait recorded as %v for a run held ~90s", time.Duration(first))
+	}
+
+	// Requeue: the new wait is short, so the total must grow by far less than
+	// another 90s. Before QueuedAt was re-stamped on entry to QUEUED, the
+	// original wait was charged again.
+	if err := h.conductor.RetryRun(runID); err != nil {
+		t.Fatal(err)
+	}
+	if !h.waitState(runID, 10*time.Second, model.StateCompleted) {
+		t.Fatalf("retried run did not complete; state=%s", h.run(runID).State)
+	}
+	if grew := h.run(runID).QueueWaitNS - first; grew > int64(30*time.Second) {
+		t.Fatalf("requeue charged another %v of queue wait", time.Duration(grew))
+	}
+}

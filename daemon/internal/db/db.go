@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -17,6 +18,27 @@ import (
 // Store wraps the SQLite handle.
 type Store struct {
 	db *sql.DB
+	// clock is injectable so run timing accounting follows the same clock the
+	// scheduler uses; tests drive virtual time.
+	clockMu sync.RWMutex
+	clock   func() time.Time
+}
+
+// SetClock overrides the clock used for run timing accounting.
+func (s *Store) SetClock(fn func() time.Time) {
+	s.clockMu.Lock()
+	s.clock = fn
+	s.clockMu.Unlock()
+}
+
+func (s *Store) nowT() time.Time {
+	s.clockMu.RLock()
+	fn := s.clock
+	s.clockMu.RUnlock()
+	if fn == nil {
+		return time.Now().UTC()
+	}
+	return fn().UTC()
 }
 
 // Open opens (creating if needed) the database at path with pragmas.
@@ -444,9 +466,22 @@ func (s *Store) TransitionRun(runID string, to model.RunState, evt *model.RunEve
 	if !model.CanTransition(from, to) {
 		return fmt.Errorf("illegal transition %s -> %s for run %s", from, to, runID)
 	}
+	// Account for the time spent in the state being left. These counters are
+	// persisted, summed by UsageSince and shown in the Usage panel, but nothing
+	// ever incremented them, so every run reported 0ms active and the whole
+	// panel read as zeros no matter how long the agents actually ran.
+	//
+	// This runs before mut, which is where callers stamp the NEW StartedAt /
+	// QueuedAt for the state being entered.
+	s.accountTransition(tx, r, from, to)
 	r.State = to
 	if mut != nil {
 		mut(r)
+	}
+	// A run entering the queue starts a fresh wait; without this a requeued
+	// run would count its original wait a second time.
+	if to == model.StateQueued && from != model.StateQueued {
+		r.QueuedAt = s.nowT()
 	}
 	if _, err := tx.Exec(`UPDATE runs SET state=?, started_at=?, finished_at=?, queued_at=?, next_eligible_at=?, worktree_path=?, branch=?,
 		provider_session_id=?, provider_turn_id=?, provider_title=?, continuation_count=?, error_code=?, error_msg=?, final_outcome=?,
@@ -1331,4 +1366,71 @@ func (s *Store) Compact(p RetentionPolicy, now time.Time) (int64, error) {
 		return n, err
 	}
 	return n, nil
+}
+
+// runActive reports whether a run in this state is occupying an agent turn.
+func runActive(st model.RunState) bool {
+	switch st {
+	case model.StatePreparing, model.StateStarting, model.StateRunning,
+		model.StateWaitingForProvider, model.StateAutoResuming, model.StateVerifying,
+		model.StateIntegrating:
+		return true
+	}
+	return false
+}
+
+// runWaitingInQueue reports whether a run in this state is waiting its turn.
+func runWaitingInQueue(st model.RunState) bool {
+	switch st {
+	case model.StateQueued, model.StateWaitingForSlot, model.StateWaitingForExternal:
+		return true
+	}
+	return false
+}
+
+// accountTransition adds the time spent in the state being left to the run's
+// counters. It mutates r in place; the caller persists it in the same
+// transaction.
+//
+// Active and queue time are anchored on StartedAt and QueuedAt, which callers
+// stamp on dispatch and on enqueue respectively, so a run that takes several
+// turns accumulates each of them. Quota waits have no such field, so their
+// start is read back from the transition that entered the state.
+func (s *Store) accountTransition(tx *sql.Tx, r *model.Run, from, to model.RunState) {
+	if from == to {
+		return // a self-transition only mutates fields; no dwell time elapsed
+	}
+	now := s.nowT()
+	add := func(since time.Time) int64 {
+		if since.IsZero() {
+			return 0
+		}
+		d := now.Sub(since)
+		if d < 0 {
+			return 0 // a clock adjustment must never subtract recorded time
+		}
+		return int64(d)
+	}
+	switch {
+	case runActive(from) && !runActive(to):
+		r.ActiveNS += add(r.StartedAt)
+	case runWaitingInQueue(from) && !runWaitingInQueue(to):
+		r.QueueWaitNS += add(r.QueuedAt)
+	case from == model.StateWaitingForQuota:
+		r.QuotaWaitNS += add(s.enteredStateAt(tx, r.ID, model.StateWaitingForQuota))
+	}
+}
+
+// enteredStateAt returns when the run last transitioned INTO st, read from the
+// timeline TransitionRun writes for every state change.
+func (s *Store) enteredStateAt(tx *sql.Tx, runID string, st model.RunState) time.Time {
+	var ts string
+	err := tx.QueryRow(
+		`SELECT ts FROM run_events WHERE run_id=? AND type=? AND data LIKE ? ORDER BY id DESC LIMIT 1`,
+		runID, string(model.EventStateChanged), `%"to":"`+string(st)+`"%`,
+	).Scan(&ts)
+	if err != nil {
+		return time.Time{}
+	}
+	return parseTime(ts)
 }

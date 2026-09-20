@@ -157,9 +157,18 @@ windows, effective-prompt copy (with secret warning), continue/retry/skip.
 npm run daemon:test     # Go unit + scheduler scenario tests (fake providers)
 npm test                # + extension/webview vitest suites
 npm run lint            # typecheck both TS projects
+npm run test:e2e        # real daemon + real IPC, fake provider (free, in CI)
+npm run test:live       # real Claude + real Codex through the real daemon
 npm run dev             # watch-build the extension; F5 for dev host
 AC_MOCK=1 agent-conductor serve   # daemon with a fake provider (no real spend)
 ```
+
+`test:live` is opt-in: it needs both CLIs installed and signed in, and it
+spends real quota. It queues one Claude run and one Codex run against the same
+file in a throwaway git repo, asserts the two never executed at once, and
+checks that each agent's signed line is present and correctly numbered — a
+lost update or a concurrent dispatch fails the test. The daemon's state goes
+in a scratch `AC_ROOT`, never your real `~/.agent-conductor`.
 
 The build supports `darwin/arm64`, `darwin/amd64`, `linux/amd64`,
 `linux/arm64` (`AC_RELEASE=1 bash scripts/build-daemon.sh`).
@@ -181,13 +190,20 @@ Trust the folder and it activates.
   `rate_limit_event` frames arrive during a run, not from a standalone query.
   Before that first run the Control tab says so rather than guessing. A manual
   weekly-reset override exists and provider data always wins once available.
-- The **Codex** integration has not been verified against an installed
-  `codex` binary. Every JSON-RPC method name comes from upstream
-  documentation; the adapter records which ones actually work and surfaces
-  failures instead of failing silently. Whether Codex reads a `[hooks.*]`
-  table at all is unverified — Agent Conductor appends one clearly delimited,
-  removable block and touches nothing else in your `config.toml`. See
+- The **Codex** integration is now verified against an installed
+  `codex-cli 0.154.0`: the JSON-RPC surface was checked against the binary's
+  own schema (`codex app-server generate-json-schema`) and driven end to end
+  by `npm run test:live`. Whether Codex reads a `[hooks.*]` table at all is
+  still unverified — Agent Conductor appends one clearly delimited, removable
+  block and touches nothing else in your `config.toml`, so it is harmless if
+  ignored. External-Codex awareness degrades to `unknown` in that case. See
   `docs/provider-capabilities.md`.
+- Both CLIs are often installed **only** inside their official VS Code
+  extension and never land on `PATH`. Agent Conductor looks there too (VS
+  Code, Insiders, the remote server, Cursor, Windsurf, VSCodium) after `PATH`
+  and the usual install locations. If your install is somewhere stranger, set
+  `AC_CODEX_BIN` / `AC_CLAUDE_BIN`; `agent-conductor diagnostics` prints the
+  path it resolved.
 - Agent Conductor asks you to approve a folder once before running agents in
   it. Claude Code's headless mode skips its own trust dialog, so this is
   Agent Conductor's own consent gate rather than a provider requirement: an

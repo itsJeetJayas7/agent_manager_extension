@@ -160,6 +160,11 @@ func (c *Conductor) Now() time.Time {
 func (c *Conductor) SetClock(fn func() time.Time) {
 	f := clockFunc(fn)
 	c.clock.Store(&f)
+	// The store times run state dwell for the usage counters; it must not read
+	// wall-clock time while the scheduler runs on a virtual one.
+	if c.store != nil {
+		c.store.SetClock(fn)
+	}
 }
 
 // Poke wakes the scheduling loop.

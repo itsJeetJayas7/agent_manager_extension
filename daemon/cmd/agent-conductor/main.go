@@ -285,24 +285,36 @@ func mustSelf() string {
 	return self
 }
 
+// runtimeLine reports one provider runtime: its version, and where it was
+// found when that is somewhere a user would not think to look.
+func runtimeLine(name, installURL string) string {
+	bin := providers.FindRuntime(name)
+	if bin == "" {
+		return name + ": NOT FOUND (install: " + installURL + ")"
+	}
+	v, err := exec.Command(bin, "--version").CombinedOutput()
+	version := strings.TrimSpace(string(v))
+	if err != nil || version == "" {
+		version = "installed"
+	}
+	line := name + ": " + version
+	if onPath, err := exec.LookPath(name); err != nil || onPath != bin {
+		line += " (" + bin + ")"
+	}
+	return line
+}
+
 func runDiagnostics() error {
 	paths := api.DefaultPaths(root())
 	out := []string{}
 	out = append(out, fmt.Sprintf("agent-conductor %s (%s/%s)", Version, runtime.GOOS, runtime.GOARCH))
 	out = append(out, fmt.Sprintf("root: %s", paths.Root))
 	out = append(out, fmt.Sprintf("service: %s", service.Status()))
-	if _, err := exec.LookPath("claude"); err == nil {
-		v, _ := exec.Command("claude", "--version").CombinedOutput()
-		out = append(out, "claude: "+strings.TrimSpace(string(v)))
-	} else {
-		out = append(out, "claude: NOT FOUND (install: https://claude.com/claude-code)")
-	}
-	if _, err := exec.LookPath("codex"); err == nil {
-		v, _ := exec.Command("codex", "--version").CombinedOutput()
-		out = append(out, "codex: "+strings.TrimSpace(string(v)))
-	} else {
-		out = append(out, "codex: NOT FOUND (install: https://developers.openai.com/codex/)")
-	}
+	// Discovery goes through the provider package so diagnostics and the
+	// sidebar never disagree about whether a runtime is installed; a CLI that
+	// only exists inside an editor extension bundle counts as installed.
+	out = append(out, runtimeLine("claude", "https://claude.com/claude-code"))
+	out = append(out, runtimeLine("codex", "https://developers.openai.com/codex/"))
 	out = append(out, fmt.Sprintf("socket: %s (exists=%v)", paths.Socket, fileExists(paths.Socket)))
 	out = append(out, fmt.Sprintf("database: %s (exists=%v)", paths.DB, fileExists(paths.DB)))
 	out = append(out, fmt.Sprintf("vault key: %s (exists=%v)", paths.Key, fileExists(paths.Key)))

@@ -159,8 +159,21 @@ func (c *Conductor) dispatchRow(ctx context.Context, b *model.Batch, row *model.
 }
 
 // markWaitingExternal records why queued runs cannot start yet.
+//
+// It re-reads each run rather than trusting rowRuns. dispatchRow runs first in
+// the same tick and starts runs through the store, so the in-memory slice is
+// already stale: a run this function still sees as WAITING_FOR_SLOT may be
+// PREPARING or RUNNING on disk. Deciding from the stale copy asked the store
+// to send a just-dispatched run back to QUEUED, which the transition table
+// (correctly) refuses — leaving a spurious "refused: illegal transition
+// STARTING -> QUEUED" in the daemon log and on the user's run timeline every
+// time a waiting run finally got its slot.
 func (c *Conductor) markWaitingExternal(rowRuns []*model.Run, st *slotState) {
-	for _, r := range rowRuns {
+	for _, stale := range rowRuns {
+		r, err := c.store.GetRun(stale.ID)
+		if err != nil || r == nil {
+			continue
+		}
 		if r.State != model.StateQueued && r.State != model.StateWaitingForSlot && r.State != model.StateWaitingForExternal {
 			continue
 		}

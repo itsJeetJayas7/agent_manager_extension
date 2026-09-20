@@ -103,50 +103,83 @@ func (c *Codex) Available(ctx context.Context) bool {
 func (c *Codex) Capabilities(ctx context.Context) Caps {
 	caps := Caps{AuthState: "unknown"}
 	if !c.Available(ctx) {
+		caps.Notes = append(caps.Notes, "codex CLI not found on PATH or in an installed editor extension; set AC_CODEX_BIN to its path.")
 		return caps
+	}
+	// The binary exists, so the runtime IS installed. A failed app-server
+	// handshake is a separate, recoverable condition: reporting it as
+	// "runtime missing" sent users hunting for an install they already had.
+	caps.Installed = true
+	if v, err := c.version(ctx); err == nil {
+		caps.Version = v
 	}
 	if err := c.ensureStarted(ctx); err != nil {
 		caps.Notes = append(caps.Notes, "app-server start failed: "+err.Error())
 		return caps
 	}
-	caps.Installed = true
-	if v, err := c.version(ctx); err == nil {
-		caps.Version = v
-	}
-	// account
+	// Account. GetAccountResponse is {account: {type, planType, email}, ...};
+	// the adapter used to read a flat {authMode, plan} that the app-server has
+	// never sent, so auth always displayed as "unknown".
 	ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	var acc struct {
-		AuthMode string `json:"authMode"`
-		Plan     string `json:"plan"`
-	}
 	if raw, err := c.call(ctx2, "account/read", map[string]any{}); err == nil {
-		json.Unmarshal(raw, &acc)
-		switch strings.ToLower(acc.AuthMode) {
-		case "chatgpt":
-			caps.AuthState = "ok"
-		case "apikey", "api_key":
-			caps.AuthState = "api_key"
-		case "":
-			caps.AuthState = "unknown"
-		default:
-			caps.AuthState = acc.AuthMode
+		var ar struct {
+			Account *struct {
+				Type     string `json:"type"`
+				PlanType string `json:"planType"`
+				Email    string `json:"email"`
+			} `json:"account"`
+			RequiresOpenaiAuth bool `json:"requiresOpenaiAuth"`
 		}
-		caps.PlanLabel = acc.Plan
+		if json.Unmarshal(raw, &ar) == nil {
+			switch {
+			case ar.Account == nil:
+				caps.AuthState = "none"
+				caps.Notes = append(caps.Notes, "no Codex account is signed in; run `codex login`.")
+			case strings.EqualFold(ar.Account.Type, "chatgpt"):
+				caps.AuthState = "ok"
+				caps.PlanLabel = ar.Account.PlanType
+			case strings.EqualFold(ar.Account.Type, "apiKey"):
+				caps.AuthState = "api_key"
+			default:
+				caps.AuthState = ar.Account.Type
+				caps.PlanLabel = ar.Account.PlanType
+			}
+		}
 	}
-	// models
+	// Models. ModelListResponse is {data: [Model], nextCursor}; the adapter
+	// read {models: [...]}, so the picker was always empty. Each Model carries
+	// its own effort ladder in supportedReasoningEfforts.
 	if raw, err := c.call(ctx2, "model/list", map[string]any{}); err == nil {
 		var ml struct {
-			Models []struct {
-				ID              string `json:"id"`
-				DisplayName     string `json:"displayName"`
-				ReasoningEffort string `json:"reasoningEffort"`
-				Hidden          bool   `json:"hidden"`
-			} `json:"models"`
+			Data []struct {
+				ID                     string `json:"id"`
+				DisplayName            string `json:"displayName"`
+				DefaultReasoningEffort string `json:"defaultReasoningEffort"`
+				SupportedEfforts       []struct {
+					Effort string `json:"effort"`
+				} `json:"supportedReasoningEfforts"`
+				Hidden bool `json:"hidden"`
+			} `json:"data"`
 		}
 		if json.Unmarshal(raw, &ml) == nil {
-			for _, m := range ml.Models {
-				caps.Models = append(caps.Models, ModelInfo{ID: m.ID, Name: m.DisplayName, Efforts: parseEfforts(m.ReasoningEffort), Hidden: m.Hidden})
+			for _, m := range ml.Data {
+				var supported []string
+				for _, e := range m.SupportedEfforts {
+					if e.Effort != "" {
+						supported = append(supported, e.Effort)
+					}
+				}
+				name := m.DisplayName
+				if name == "" {
+					name = m.ID
+				}
+				caps.Models = append(caps.Models, ModelInfo{
+					ID:      m.ID,
+					Name:    name,
+					Efforts: orderEfforts(supported, m.DefaultReasoningEffort),
+					Hidden:  m.Hidden,
+				})
 			}
 		}
 	}
@@ -156,9 +189,36 @@ func (c *Codex) Capabilities(ctx context.Context) Caps {
 	return caps
 }
 
-// parseEfforts returns the effort ladder with the model's own default first,
-// so the UI offers the provider's preference rather than an arbitrary order.
-// The parameter used to be ignored entirely.
+// orderEfforts returns the efforts a model actually supports with its own
+// default first, so the UI offers the provider's preference rather than an
+// arbitrary order. It falls back to the generic ladder when the model does not
+// advertise one.
+func orderEfforts(supported []string, defaultEffort string) []string {
+	if len(supported) == 0 {
+		return parseEfforts(defaultEffort)
+	}
+	d := strings.ToLower(strings.TrimSpace(defaultEffort))
+	out := make([]string, 0, len(supported))
+	promoted := ""
+	if d != "" {
+		for _, e := range supported {
+			if strings.EqualFold(e, d) {
+				promoted = e
+				out = append(out, e)
+				break
+			}
+		}
+	}
+	for _, e := range supported {
+		if promoted != "" && strings.EqualFold(e, promoted) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// parseEfforts returns the generic effort ladder with defaultEffort first.
 func parseEfforts(defaultEffort string) []string {
 	all := []string{"low", "medium", "high", "xhigh"}
 	d := strings.ToLower(strings.TrimSpace(defaultEffort))
@@ -478,18 +538,34 @@ func (c *Codex) call(ctx context.Context, method string, params any) (json.RawMe
 
 // ---- Adapter interface ----
 
-// permissionToCodex maps conductor permission to approvalPolicy + sandbox.
-func permissionToCodex(p string) (approval, sandbox string) {
+// permissionToCodex maps a conductor permission onto the two different
+// spellings the app-server protocol uses for the same concept:
+//
+//   - thread/start takes `sandbox`, a SandboxMode STRING, kebab-case
+//     ("read-only" | "workspace-write" | "danger-full-access");
+//   - turn/start takes `sandboxPolicy`, a tagged OBJECT whose `type` is
+//     camelCase ("readOnly" | "workspaceWrite" | "dangerFullAccess").
+//
+// Sending the camelCase tag where a SandboxMode was expected made every real
+// Codex run fail at thread/start with "unknown variant `dangerFullAccess`".
+// Verified against `codex app-server generate-json-schema` from the installed
+// binary; see docs/provider-capabilities.md.
+func permissionToCodex(p string) (approval, sandboxMode, policyType string) {
 	switch p {
 	case "bypass":
-		return "never", "dangerFullAccess"
+		return "never", "danger-full-access", "dangerFullAccess"
 	case "plan":
-		return "never", "readOnly"
+		return "never", "read-only", "readOnly"
 	case "acceptEdits":
-		return "never", "workspaceWrite"
+		return "never", "workspace-write", "workspaceWrite"
 	default:
-		return "on-request", "workspaceWrite"
+		return "on-request", "workspace-write", "workspaceWrite"
 	}
+}
+
+// sandboxPolicyFor builds the tagged SandboxPolicy object turn/start expects.
+func sandboxPolicyFor(policyType string) map[string]any {
+	return map[string]any{"type": policyType}
 }
 
 // Execute runs one turn on a (new or existing) thread.
@@ -497,7 +573,7 @@ func (c *Codex) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 	if err := c.ensureStarted(ctx); err != nil {
 		return err
 	}
-	approval, sandbox := permissionToCodex(spec.Permission)
+	approval, sandboxMode, policyType := permissionToCodex(spec.Permission)
 
 	// Register the execution so Cancel can reach it. Without this the cancels
 	// map stayed empty and cancelling a Codex run did nothing.
@@ -527,7 +603,7 @@ func (c *Codex) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 			"cwd":            spec.Cwd,
 			"serviceName":    "agent_conductor",
 			"approvalPolicy": approval,
-			"sandbox":        sandbox,
+			"sandbox":        sandboxMode,
 		}
 		if spec.Model != "" {
 			params["model"] = spec.Model
@@ -583,7 +659,7 @@ func (c *Codex) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 		"input":          []map[string]any{{"type": "text", "text": spec.Prompt}},
 		"cwd":            spec.Cwd,
 		"approvalPolicy": approval,
-		"sandbox":        sandbox,
+		"sandboxPolicy":  sandboxPolicyFor(policyType),
 	}
 	if spec.Model != "" {
 		turnParams["model"] = spec.Model

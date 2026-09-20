@@ -15,7 +15,7 @@ guarantees.
 | Provider | Installed on the verification machine | Surface verified |
 | --- | --- | --- |
 | Claude Code | **yes** — `claude 2.1.278` | Headless stream-json protocol observed end to end, including the frame shapes below |
-| Codex | **no** — not installed | **Nothing verified.** Every `codex app-server` method name below remains as documented, unconfirmed against a running binary |
+| Codex | **yes** — `codex-cli 0.154.0-alpha.6.2`, bundled inside the `openai.chatgpt` VS Code extension | Verified against the binary's own JSON Schema and by driving two live runs end to end; see "Codex: verified 2026-09-20" |
 
 ### Claude Code: what the installed CLI actually does
 
@@ -70,27 +70,77 @@ decides everything else.
 only ever be set from a non-empty final message. Those hooks are registered
 now as well, for the PTY path.
 
-### Codex: what could NOT be verified
+### Codex: verified 2026-09-20
 
-`codex` is not installed on the verification machine, so **none** of the
-JSON-RPC method names in the Codex table below have been confirmed against a
-running `codex app-server`. They are still as documented upstream.
+`codex` **is** installed on this machine, but not on `PATH`: the OpenAI VS Code
+extension ships it at
 
-Mitigations shipped instead of a verification:
+```
+~/.vscode/extensions/openai.chatgpt-<version>/bin/<platform-triple>/codex
+```
 
-- The adapter records the outcome of every JSON-RPC method it calls
-  (`Codex.MethodSupport()`), so an unsupported method surfaces as a concrete
-  error rather than silently doing nothing.
-- `InstallCodex` no longer rewrites `~/.codex/config.toml`. It appends one
-  delimited block and leaves every other byte alone, and refuses to write
-  anything that would not parse. Whether Codex reads a `[hooks.*]` table at all
-  is **unverified**; the block is delimited and removable precisely so that
-  writing it is harmless if Codex ignores it.
+Claude Code does the same at
+`~/.vscode/extensions/anthropic.claude-code-<version>/resources/native-binary/claude`.
+`findBinary` therefore searches the extension directories of VS Code, VS Code
+Insiders, the remote server, Cursor, Windsurf and VSCodium after PATH and the
+usual install locations, preferring the most recently modified copy.
+`AC_CODEX_BIN` / `AC_CLAUDE_BIN` override everything. Before this, a fully
+working, signed-in Codex install reported **"runtime missing"** in the sidebar.
 
-**If you have Codex installed, verify before trusting the Codex column**:
-`account/read`, `model/list`, `thread/start`, `thread/resume`, `turn/start`,
-`turn/interrupt`, `account/rateLimits/read`, and the notification names
-`item/agentMessage/delta`, `turn/completed`, `account/rateLimits/updated`.
+The protocol surface was verified against ground truth rather than docs:
+
+```
+codex app-server generate-json-schema --out <dir>
+```
+
+which emits the installed binary's own `ClientRequest` / response schemas. All
+methods the adapter calls exist there — `initialize`, `account/read`,
+`model/list`, `account/rateLimits/read`, `thread/start`, `thread/resume`,
+`turn/start`, `turn/interrupt`. Four payload divergences were found and fixed:
+
+**Divergence 1 — the sandbox enum is spelled two different ways.**
+`thread/start` takes `sandbox`, a `SandboxMode` **string** in kebab-case
+(`read-only` | `workspace-write` | `danger-full-access`). `turn/start` takes
+`sandboxPolicy`, a tagged **object** whose `type` is camelCase (`readOnly` |
+`workspaceWrite` | `dangerFullAccess`). The adapter sent the camelCase tag as
+`sandbox` to both, so every real Codex run failed at `thread/start` with:
+
+```
+Invalid request: unknown variant `dangerFullAccess`,
+expected one of `read-only`, `workspace-write`, `danger-full-access`
+```
+
+**Divergence 2 — `model/list` returns `{data: [...]}`, not `{models: [...]}`.**
+The model picker was always empty. Each `Model` carries
+`supportedReasoningEfforts` and `defaultReasoningEffort`, so the effort ladder
+now comes from the model rather than from a hardcoded list.
+
+**Divergence 3 — `account/read` returns `{account: {type, planType, email},
+requiresOpenaiAuth}`**, not a flat `{authMode, plan}`. Auth state therefore
+always displayed as "unknown" for a signed-in account. `type` is `chatgpt` |
+`apiKey` | `amazonBedrock`; a null `account` means nobody is signed in.
+
+**Divergence 4 — capability reporting conflated two failures.** `Installed`
+was only set after the app-server handshake succeeded, so a handshake failure
+was reported to the user as a missing runtime. The binary's presence and the
+app-server's health are now reported separately.
+
+Confirmed working against the live binary: `approvalPolicy` values
+(`untrusted` | `on-request` | `never`), `turn/start` input items
+(`{"type":"text","text":...}`), `account/rateLimits/read` (returns
+`{rateLimits: {primary, secondary}}` with `usedPercent` / `resetsAt` /
+`windowDurationMins`, giving Codex `exact` quota confidence), and thread IDs
+surviving as the native session for inspection in the Codex extension.
+
+`tests/integration/providers-live.mjs` exercises all of this against the real
+binaries (`npm run test:live`), and `TestPermissionToCodexUsesTheProtocolSpellings`
+pins the enum spellings so a regression fails in unit tests rather than on a
+user's first real run.
+
+Still **unverified**: whether Codex reads a `[hooks.*]` table in
+`~/.codex/config.toml` at all. `InstallCodex` appends one delimited, removable
+block and leaves every other byte alone, so writing it is harmless if Codex
+ignores it. External-Codex detection degrades to `unknown` if it does.
 
 ## Claude Code (Anthropic)
 
@@ -118,7 +168,7 @@ Mitigations shipped instead of a verification:
 | --- | --- | --- | --- | --- |
 | `codex app-server` — JSON-RPC 2.0 over stdio (header omitted) | Documented | https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md | Long-lived child process owned by daemon | — |
 | `initialize` handshake with `clientInfo` | Documented | app-server README | performed at daemon start | — |
-| `thread/start` (params: `model`, `cwd`, `approvalPolicy`, `sandbox`, `serviceName`) → thread + `thread/started` | Documented | app-server README | Managed Codex runs; thread ID persisted immediately | — |
+| `thread/start` (params: `model`, `cwd`, `approvalPolicy`, `sandbox` as a kebab-case `SandboxMode`, `serviceName`) → thread + `thread/started` | **Verified** against the installed binary's JSON Schema and a live run | `codex app-server generate-json-schema` | Managed Codex runs; thread ID persisted immediately | — |
 | `thread/resume <id>`, `thread/read`, `thread/list` | Documented | app-server README / MCP interface doc | crash reconciliation, native visibility | — |
 | `turn/start` (params: `threadId`, `input[]`, `cwd`, `model`, `effort`, `sandboxPolicy`, `approvalPolicy`) | Documented | app-server README | prompt dispatch + staged intelligence model switch per turn | — |
 | `turn/interrupt`, `turn/steer` | Documented | app-server README | cancellation | process-level interrupt |
@@ -144,5 +194,5 @@ Mitigations shipped instead of a verification:
 ## Version constraints
 
 - Claude Code CLI: verified at runtime (`claude --version`, `claude --help` flag probe). Hooks require current CLI generations (2026 line).
-- Codex CLI: `codex app-server` required; detected via `codex --version` + spawn probe.
+- Codex CLI: `codex app-server` required; detected via `codex --version` + spawn probe. Discovery covers PATH, the usual install locations and editor extension bundles (`openai.chatgpt`), with `AC_CODEX_BIN` as an override.
 - VS Code >= 1.85 for contributed webview views without activation events.

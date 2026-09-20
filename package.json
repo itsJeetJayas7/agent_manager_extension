@@ -147,7 +147,8 @@
     "build:fast": "node scripts/build.mjs --host-only",
     "ci": "npm run lint && npm run test && npm run test:boot && node tests/integration/daemon-e2e.mjs",
     "test:e2e": "node scripts/build.mjs --host-only && node tests/integration/daemon-e2e.mjs",
-    "test:boot": "node scripts/build.mjs --host-only && node tests/integration/webview-boot.mjs"
+    "test:boot": "node scripts/build.mjs --host-only && node tests/integration/webview-boot.mjs",
+    "test:live": "node scripts/build.mjs --host-only && node tests/integration/providers-live.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.1.2 — verified against the real Codex and Claude binaries
+
+Everything below was found by running both real CLIs through the real daemon
+(`npm run test:live`), not by reading code.
+
+### Fixed — Codex reported "runtime missing" while installed and signed in
+
+- **Discovery.** Both CLIs are commonly installed *only* inside their official
+  VS Code extension (`openai.chatgpt/bin/<triple>/codex`,
+  `anthropic.claude-code/resources/native-binary/claude`) and never land on
+  `PATH`. Discovery now searches those bundles — VS Code, Insiders, the remote
+  server, Cursor, Windsurf, VSCodium — after `PATH` and the usual install
+  locations, preferring the newest copy. `AC_CODEX_BIN` / `AC_CLAUDE_BIN`
+  override it.
+- `agent-conductor diagnostics` called `exec.LookPath` directly and so could
+  disagree with the sidebar. Both now answer from the same lookup, and
+  diagnostics prints the resolved path when it is not the one on `PATH`.
+- Codex only reported `installed` *after* the app-server handshake succeeded,
+  so a handshake failure was shown to the user as a missing runtime. The
+  binary's presence and the app-server's health are now reported separately.
+
+### Fixed — three Codex protocol payloads were wrong
+
+Verified against the installed binary's own schema
+(`codex app-server generate-json-schema`):
+
+- `thread/start` takes `sandbox` as a kebab-case `SandboxMode`
+  (`danger-full-access`), while `turn/start` takes `sandboxPolicy` as a tagged
+  object (`{"type":"dangerFullAccess"}`). The adapter sent the camelCase tag to
+  both, so **every real Codex run failed at `thread/start`**.
+- `model/list` returns `{data: [...]}`, not `{models: [...]}` — the model
+  picker was always empty. Effort ladders now come from each model's
+  `supportedReasoningEfforts`.
+- `account/read` returns `{account: {type, planType, email}}`, not a flat
+  `{authMode, plan}` — auth always displayed as "unknown" for a signed-in
+  account.
+
+### Fixed — the Usage panel could only ever show zeros
+
+`ActiveNS`, `QueueWaitNS` and `QuotaWaitNS` were persisted, summed by
+`UsageSince` and rendered in the UI, but nothing ever incremented them: the
+only assignment in the codebase was `x.ActiveNS = r.ActiveNS`. Dwell time is
+now accounted in `TransitionRun`, the single funnel every state change passes
+through, on a clock the scheduler injects. A requeued run no longer charges its
+original wait twice.
+
+### Fixed — a spurious refused transition on every queued run
+
+`markWaitingExternal` decided from the in-memory run slice that `dispatchRow`
+had already invalidated in the same tick, so the moment a waiting run got its
+slot the scheduler asked the store to send it back to `QUEUED`. The transition
+table refused it — no run was ever corrupted — but each refusal landed in the
+daemon log and on the user's run timeline as
+`refused: illegal transition STARTING -> QUEUED`.
+
+### Added
+
+- `npm run test:live`: queues one real Claude run and one real Codex run
+  against the same file in a throwaway git repo, asserts the two never
+  executed concurrently, and verifies each agent's signed line is present and
+  correctly numbered. A lost update or a concurrent dispatch fails the test.
+- Unit tests pinning the Codex enum spellings and the bundled-CLI lookup, so
+  these regressions fail in CI rather than on a user's first real run.
+
 ## 0.1.1 — remediation
 
 The 0.1.0 VSIX did not work. This release fixes that, then goes considerably
