@@ -193,6 +193,19 @@ function RunCard({ run, events }: { run: any; events: any[] }) {
             }}>Skip</button>
           </>
         )}
+        {["COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "BLOCKED"].includes(run.state) && (
+          <button
+            className="ac-btn ghost ac-btn-sm"
+            title="Queue a new run with the same prompt and settings"
+            onClick={() =>
+              void rpc("requeueRun", { runId: run.id })
+                .then(() => notify("Queued again."))
+                .catch((e: any) => notify(String(e?.message ?? e), "error"))
+            }
+          >
+            Run it again
+          </button>
+        )}
         {["RUNNING", "STARTING", "PREPARING"].includes(run.state) && (
           <button className="ac-btn ac-btn-sm danger" onClick={() => void rpc("cancelRun", { runId: run.id })}>Cancel</button>
         )}

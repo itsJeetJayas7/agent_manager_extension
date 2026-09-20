@@ -171,12 +171,43 @@ func (c *Conductor) Poke() {
 }
 
 // Start launches the loop and recovery.
+// retentionInterval is how often run_events is pruned. Without this the table
+// grew without bound.
+const retentionInterval = 6 * time.Hour
+
+func (c *Conductor) maintenanceLoop(ctx context.Context) {
+	t := time.NewTicker(retentionInterval)
+	defer t.Stop()
+	prune := func() {
+		n, err := c.store.Prune(db.DefaultRetention(), c.Now())
+		if err != nil {
+			c.log.Errorf("retention: %v", err)
+			return
+		}
+		if n > 0 {
+			c.log.Infof("retention: pruned %d run event(s)", n)
+		}
+	}
+	prune() // once at startup, so an upgrade does not wait six hours
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.stopCh:
+			return
+		case <-t.C:
+			prune()
+		}
+	}
+}
+
 func (c *Conductor) Start(ctx context.Context) {
 	c.recoverOnStartup()
 	// A pause whose deadline passed while the daemon was down must not
 	// silently outlive it.
 	c.honourElapsedPause()
 	go c.hookEventLoop()
+	go c.maintenanceLoop(ctx)
 	go c.loop(ctx)
 }
 

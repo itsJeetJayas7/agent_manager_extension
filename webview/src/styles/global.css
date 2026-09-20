@@ -481,3 +481,9 @@ summary:focus-visible,
 .ac-clickable { cursor: pointer; }
 .ac-band-pad { margin: var(--ac-rhythm-3); }
 .ac-list-head { padding: 0 var(--ac-rhythm-3) var(--ac-rhythm-2); }
+
+/* Saved setups: a chip with a quiet remove affordance. */
+.ac-preset { display: inline-flex; align-items: center; }
+.ac-preset-x { opacity: 0; margin-left: -2px; }
+.ac-preset:hover .ac-preset-x,
+.ac-preset:focus-within .ac-preset-x { opacity: 1; }

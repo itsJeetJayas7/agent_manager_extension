@@ -267,3 +267,40 @@ describe("destructive actions", () => {
     });
   });
 });
+
+// §7.3 — most real usage is the same shape repeated, so the shape is nameable.
+describe("saved setups", () => {
+  it("offers to save the current composer configuration", () => {
+    render(<QueueView state={makeState(makeSnapshot())} />);
+    expect(screen.getByRole("button", { name: /save setup/i })).toBeTruthy();
+  });
+
+  it("round-trips a preset and applies it back to the composer", async () => {
+    const { unmount } = render(<QueueView state={makeState(makeSnapshot())} />);
+    fireEvent.change(screen.getByLabelText("Permission"), { target: { value: "plan" } });
+    fireEvent.change(screen.getByLabelText("Effort"), { target: { value: "low" } });
+    fireEvent.click(screen.getByRole("button", { name: /save setup/i }));
+    fireEvent.change(screen.getByLabelText(/name this setup/i), { target: { value: "read only" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(screen.getByRole("button", { name: "read only" })).toBeTruthy();
+    unmount();
+
+    render(<QueueView state={makeState(makeSnapshot())} />);
+    // Change away from the saved values, then apply the preset.
+    fireEvent.change(screen.getByLabelText("Permission"), { target: { value: "bypass" } });
+    fireEvent.click(screen.getByRole("button", { name: "read only" }));
+    await waitFor(() => {
+      expect((screen.getByLabelText("Permission") as HTMLSelectElement).value).toBe("plan");
+      expect((screen.getByLabelText("Effort") as HTMLSelectElement).value).toBe("low");
+    });
+  });
+
+  it("forgets a preset on request", () => {
+    render(<QueueView state={makeState(makeSnapshot())} />);
+    fireEvent.click(screen.getByRole("button", { name: /save setup/i }));
+    fireEvent.change(screen.getByLabelText(/name this setup/i), { target: { value: "temp" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: /forget the .temp. setup/i }));
+    expect(screen.queryByRole("button", { name: "temp" })).toBeNull();
+  });
+});

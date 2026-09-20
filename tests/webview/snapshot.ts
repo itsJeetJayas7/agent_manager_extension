@@ -45,7 +45,7 @@ export function makeSnapshot(
         installed: true,
         version: "2.1.278",
         models: [
-          { id: "sonnet", name: "Sonnet", efforts: ["high"] },
+          { id: "sonnet", name: "Sonnet", efforts: ["low", "medium", "high"] },
           { id: "opus", name: "Opus", efforts: ["high", "max"] },
         ],
         authState: "ok",

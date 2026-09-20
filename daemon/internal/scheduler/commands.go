@@ -855,3 +855,31 @@ func (c *Conductor) RunDiffStat(runID string) (*RunDiff, error) {
 	}
 	return &RunDiff{RunID: runID, Summary: summary, Files: files, Branch: r.Branch, Path: r.WorktreePath}, nil
 }
+
+// RequeueRun creates a NEW run from a past run's original prompt (§7.3).
+//
+// Distinct from RetryRun, which revives the same run in place: this leaves the
+// original history intact, which is what "run that again" means for a run that
+// already finished.
+func (c *Conductor) RequeueRun(runID string, runNext bool) (string, string, error) {
+	r, err := c.store.GetRun(runID)
+	if err != nil || r == nil {
+		return "", "", fmt.Errorf("run not found")
+	}
+	prompt, err := c.decryptPrompt(r)
+	if err != nil {
+		return "", "", fmt.Errorf("the original prompt is no longer readable: %w", err)
+	}
+	return c.EnqueueRun(EnqueueRunInput{
+		Prompt:        prompt,
+		Provider:      r.Provider,
+		Model:         r.Model,
+		Effort:        r.Effort,
+		Permission:    r.Permission,
+		AttachSecrets: r.AttachSecrets,
+		Staged:        r.Staged,
+		Cwd:           r.Cwd,
+		RunNext:       runNext,
+		Title:         r.Title,
+	})
+}

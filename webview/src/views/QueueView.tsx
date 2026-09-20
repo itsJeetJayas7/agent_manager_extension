@@ -7,6 +7,7 @@ import StatusGlyph from "../components/StatusGlyph";
 import { PauseButton, PauseBand } from "../components/PauseControl";
 import { useNow } from "../components/ticker";
 import Onboarding, { useSetupStatus } from "../components/Onboarding";
+import PresetBar, { usePresets, type Preset } from "../components/Presets";
 import { fmtDuration, elapsedSince, fmtRelative } from "../components/format";
 import {
   rpc,
@@ -94,6 +95,7 @@ function Composer({ state }: { state: ConductorState }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const hasSecret = !!state.snapshot?.hasSecretBlock;
+  const { presets, save: savePreset, remove: removePreset } = usePresets(workspace);
 
   // Re-read when the workspace changes (a new window, a different folder).
   useEffect(() => setPrefs(loadPrefs(workspace)), [workspace]);
@@ -266,6 +268,17 @@ function Composer({ state }: { state: ConductorState }) {
           {error}
         </div>
       )}
+
+      <PresetBar
+        presets={presets}
+        onApply={(p: Preset) => {
+          const { name, ...rest } = p;
+          void name;
+          update(rest);
+        }}
+        onSave={(name) => savePreset({ name, ...prefs })}
+        onRemove={removePreset}
+      />
 
       <div className="ac-row ac-mt-3">
         <button className="ac-btn" disabled={busy} onClick={() => void enqueue(false)}>

@@ -71,7 +71,16 @@ type Server struct {
 	capsMu    sync.Mutex
 	capsCache map[string]providers.Caps
 	capsAt    time.Time
+
+	// snapCache absorbs bursts: a daemon event can reach several webviews at
+	// once, each of which may ask for a snapshot.
+	snapMu    sync.Mutex
+	snapCache map[string]any
+	snapAt    time.Time
 }
+
+// snapshotTTL is short enough to stay live and long enough to collapse a burst.
+const snapshotTTL = 250 * time.Millisecond
 
 const capsTTL = 30 * time.Second
 
@@ -308,6 +317,9 @@ func (s *Server) handle(conn net.Conn) {
 			s.reply(writeMsg, req.ID, nil, map[string]string{"code": apiErr.code, "message": apiErr.message})
 			continue
 		}
+		if mutatingMethods[req.Method] {
+			s.invalidateSnapshot()
+		}
 		s.reply(writeMsg, req.ID, result, nil)
 	}
 }
@@ -332,6 +344,20 @@ func (s *Server) reply(write func(any), id json.RawMessage, result any, errObj m
 		resp["result"] = result
 	}
 	write(resp)
+}
+
+// mutatingMethods change state a snapshot would report, so the cached
+// snapshot must not outlive them.
+var mutatingMethods = map[string]bool{
+	"enqueueRun": true, "enqueueBatch": true, "reorderQueue": true,
+	"cancelRun": true, "retryRun": true, "continueRun": true, "skipRun": true,
+	"updateRun": true, "markComplete": true, "requeueRun": true,
+	"updateSettings": true, "patchSettings": true,
+	"updateSecretBlock": true, "deleteSecretBlock": true,
+	"pauseQueue": true, "resumeQueue": true, "extendPause": true,
+	"clearPauseTimer": true, "pauseScheduler": true, "resumeScheduler": true,
+	"applyBatch": true, "cleanupWorktrees": true, "trustWorkspace": true,
+	"clearStaleExternalSession": true, "compact": true, "hookEvent": true,
 }
 
 type apiError struct{ code, message string }
@@ -456,6 +482,17 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 			return nil, e("CANCEL", err.Error())
 		}
 		return map[string]any{"ok": true}, nil
+	case "requeueRun":
+		var in struct {
+			RunID   string `json:"runId"`
+			RunNext bool   `json:"runNext"`
+		}
+		json.Unmarshal(params, &in)
+		batchID, newRunID, err := s.conductor.RequeueRun(in.RunID, in.RunNext)
+		if err != nil {
+			return nil, e("REQUEUE", err.Error())
+		}
+		return map[string]any{"batchId": batchID, "runId": newRunID}, nil
 	case "retryRun":
 		var in struct {
 			RunID string `json:"runId"`
@@ -699,12 +736,37 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 	}
 }
 
-// snapshot builds the full UI state.
+// snapshot returns the UI state, reusing a very recent one.
+func (s *Server) snapshot() map[string]any {
+	s.snapMu.Lock()
+	if s.snapCache != nil && time.Since(s.snapAt) < snapshotTTL {
+		cached := s.snapCache
+		s.snapMu.Unlock()
+		return cached
+	}
+	s.snapMu.Unlock()
+
+	fresh := s.buildSnapshot()
+
+	s.snapMu.Lock()
+	s.snapCache, s.snapAt = fresh, time.Now()
+	s.snapMu.Unlock()
+	return fresh
+}
+
+// invalidateSnapshot drops the cache after a mutation.
+func (s *Server) invalidateSnapshot() {
+	s.snapMu.Lock()
+	s.snapCache = nil
+	s.snapMu.Unlock()
+}
+
+// buildSnapshot assembles the full UI state.
 //
 // Three queries regardless of batch count. It used to issue ListRunsByBatch +
 // ListRows per batch — about 200 SQLite round-trips per snapshot, on a path
 // the webview hit on every daemon event, every window focus and every 15s.
-func (s *Server) snapshot() map[string]any {
+func (s *Server) buildSnapshot() map[string]any {
 	batches, _ := s.store.ListBatches(100)
 	ids := make([]string, 0, len(batches))
 	for _, b := range batches {
