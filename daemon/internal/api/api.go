@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -718,6 +719,15 @@ func (s *Server) snapshot() map[string]any {
 			rows[b.ID] = []*model.Row{}
 		}
 	}
+	// Flat queue order, not batch order. Grouping by batch (newest first, for
+	// the batch list) made the sidebar's "Up next" disagree with the order the
+	// scheduler actually dispatches in.
+	sort.SliceStable(runs, func(i, j int) bool {
+		if runs[i].SortKey != runs[j].SortKey {
+			return runs[i].SortKey < runs[j].SortKey
+		}
+		return runs[i].CardIndex < runs[j].CardIndex
+	})
 	ext := map[string][]*model.ProviderSession{}
 	for _, p := range []string{model.ProviderClaude, model.ProviderCodex} {
 		sessions, _ := s.store.ListProviderSessions(p)

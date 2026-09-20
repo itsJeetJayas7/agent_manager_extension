@@ -129,7 +129,7 @@ async function main() {
       hook_event_name: "Stop", session_id: "e2e-sess", stop_hook_active: false,
       last_assistant_message: "I think I'm done",
     });
-    const r = spawnSync(BIN, ["hook", "claude"], {
+    const r = spawnSync(BIN, ["hook", "claude", "--gate"], {
       input: hookInput,
       env: { ...process.env, HOME, AGENT_CONDUCTOR_RUN_ID: runId },
       encoding: "utf8", timeout: 10000,
@@ -140,7 +140,7 @@ async function main() {
     assert(parsed.reason.includes("<AC_RESULT>COMPLETE</AC_RESULT>"));
     console.log("   gate blocks marker-less stop with continuation instruction");
     // second stop with stop_hook_active=true must NOT block
-    const r2 = spawnSync(BIN, ["hook", "claude"], {
+    const r2 = spawnSync(BIN, ["hook", "claude", "--gate"], {
       input: JSON.stringify({ hook_event_name: "Stop", session_id: "e2e-sess", stop_hook_active: true, last_assistant_message: "still no marker" }),
       env: { ...process.env, HOME, AGENT_CONDUCTOR_RUN_ID: runId },
       encoding: "utf8", timeout: 10000,
@@ -148,13 +148,22 @@ async function main() {
     assert.equal(r2.stdout.trim(), "", "second stop must be allowed (no infinite loop)");
     console.log("   second stop (stop_hook_active) allowed");
     // external session: no run id, never gated
-    const r3 = spawnSync(BIN, ["hook", "claude"], {
+    const r3 = spawnSync(BIN, ["hook", "claude", "--gate"], {
       input: JSON.stringify({ hook_event_name: "Stop", session_id: "ext-sess", last_assistant_message: "external chat" }),
       env: { ...process.env, HOME },
       encoding: "utf8", timeout: 10000,
     });
     assert.equal(r3.stdout.trim(), "", "external sessions must never be gated");
     console.log("   external session never gated");
+    // The globally installed hook is awareness-only: without --gate it never
+    // blocks, so Claude merging both configs cannot fire two decisions.
+    const r4 = spawnSync(BIN, ["hook", "claude"], {
+      input: JSON.stringify({ hook_event_name: "Stop", session_id: "e2e-sess-2", stop_hook_active: false, last_assistant_message: "no marker here" }),
+      env: { ...process.env, HOME, AGENT_CONDUCTOR_RUN_ID: runId },
+      encoding: "utf8", timeout: 10000,
+    });
+    assert.equal(r4.stdout.trim(), "", "the global hook must be awareness-only");
+    console.log("   global hook never gates (no double block decision)");
   }
 
   console.log("7) external awareness blocks FIFO queue…");
@@ -180,7 +189,106 @@ async function main() {
     console.log("   run dispatched after external stop");
   }
 
-  console.log("8) queue survives daemon restart…");
+  console.log("8) pause with a continuation timer…");
+  {
+    // Indefinite pause holds the queue.
+    const st = await c.req("pauseQueue", { reason: "e2e hold" });
+    assert.equal(st.paused, true);
+    assert.equal(st.scope, "QUEUE_ONLY");
+    assert.equal(st.resumeAt, undefined, "no timer was requested");
+
+    const { runId: held } = await c.req("enqueueRun", { prompt: "held by pause", provider: "fake", cwd: HOME });
+    await wait(1500);
+    let s = await c.req("getSnapshot", {});
+    assert.equal(s.pause.paused, true, "snapshot carries the pause state");
+    assert.equal(s.pause.reason, "e2e hold");
+    const heldState = s.runs.find((r) => r.id === held).state;
+    assert(["QUEUED", "WAITING_FOR_SLOT"].includes(heldState), `run dispatched while paused: ${heldState}`);
+    console.log("   queue held; run stayed", heldState);
+
+    // Extending and clearing the timer.
+    let timed = await c.req("pauseQueue", { durationMs: 60_000 });
+    assert(timed.resumeAt, "a timer was requested");
+    const first = new Date(timed.resumeAt).getTime();
+    timed = await c.req("extendPause", { deltaMs: 60_000 });
+    assert.equal(new Date(timed.resumeAt).getTime() - first, 60_000, "extend moves the deadline");
+    timed = await c.req("clearPauseTimer", {});
+    assert.equal(timed.paused, true, "clearing the timer keeps the pause");
+    assert.equal(timed.resumeAt, undefined);
+    console.log("   extendPause and clearPauseTimer behave");
+
+    // Validation.
+    for (const bad of [{ durationMs: -1 }, { durationMs: 8 * 24 * 3600_000 }, { resumeAt: new Date(Date.now() - 1000).toISOString() }]) {
+      let threw = false;
+      try { await c.req("pauseQueue", bad); } catch { threw = true; }
+      assert(threw, `invalid pause accepted: ${JSON.stringify(bad)}`);
+    }
+    console.log("   invalid durations rejected");
+
+    // A short timer really does resume on its own.
+    await c.req("pauseQueue", { durationMs: 2000 });
+    await waitFor(async () => (await c.req("getPauseState", {})).paused === false, 15000, "auto-resume");
+    await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === held)?.state === "COMPLETED", 25000, "held run after auto-resume");
+    console.log("   timer fired and the held run completed");
+  }
+
+  console.log("9) Run Next really runs next…");
+  {
+    await c.req("pauseQueue", {});
+    const { runId: a } = await c.req("enqueueRun", { prompt: "ordinary A", provider: "fake", cwd: HOME });
+    const { runId: b } = await c.req("enqueueRun", { prompt: "ordinary B", provider: "fake", cwd: HOME });
+    const { runId: urgent } = await c.req("enqueueRun", { prompt: "urgent", provider: "fake", cwd: HOME, runNext: true });
+    const s = await c.req("getSnapshot", {});
+    const waiting = s.runs.filter((r) => ["QUEUED", "WAITING_FOR_SLOT"].includes(r.state)).map((r) => r.id);
+    assert.equal(waiting[0], urgent, `Run Next did not go first: ${JSON.stringify(waiting)}`);
+    assert(waiting.indexOf(a) < waiting.indexOf(b), "existing order preserved behind it");
+    await c.req("resumeQueue", {});
+    await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === urgent)?.state === "COMPLETED", 25000, "urgent run");
+    console.log("   urgent run dispatched ahead of the queue");
+    await waitFor(async () => {
+      const snap = await c.req("getSnapshot", {});
+      return [a, b].every((id) => snap.runs.find((r) => r.id === id)?.state === "COMPLETED");
+    }, 30000, "remaining runs");
+  }
+
+  console.log("10) cancelling a queued run frees its slot…");
+  {
+    await c.req("pauseQueue", {});
+    const { runId: x } = await c.req("enqueueRun", { prompt: "cancel me", provider: "fake", cwd: HOME });
+    const { runId: y } = await c.req("enqueueRun", { prompt: "cancel me too", provider: "fake", cwd: HOME });
+    const { runId: survivor } = await c.req("enqueueRun", { prompt: "must still run", provider: "fake", cwd: HOME });
+    await c.req("cancelRun", { runId: x });
+    await c.req("cancelRun", { runId: y });
+    const s = await c.req("getSnapshot", {});
+    for (const id of [x, y]) {
+      assert.equal(s.runs.find((r) => r.id === id).state, "CANCELLED", "cancelled queued run must settle immediately");
+    }
+    await c.req("resumeQueue", {});
+    await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === survivor)?.state === "COMPLETED", 25000, "survivor run");
+    console.log("   two cancels did not kill the queue");
+  }
+
+  console.log("11) deleting the shared block really deletes it…");
+  {
+    let s = await c.req("getSnapshot", {});
+    assert.equal(s.hasSecretBlock, true, "precondition: a block is stored");
+    await c.req("deleteSecretBlock", {});
+    s = await c.req("getSnapshot", {});
+    assert.equal(s.hasSecretBlock, false, "snapshot still reports a block after delete");
+    let revealed = true;
+    try { await c.req("revealSecretBlock", {}); } catch { revealed = false; }
+    assert.equal(revealed, false, "a deleted block is still revealable");
+
+    const { runId: after } = await c.req("enqueueRun", { prompt: "after delete", provider: "fake", attachSecrets: true, cwd: HOME });
+    await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === after)?.state === "COMPLETED", 25000, "post-delete run");
+    const eff = await c.req("revealEffectivePrompt", { runId: after });
+    assert(!eff.text.includes("E2E-SECRET-hunter42"), "DELETED SECRET STILL SHIPPED TO THE PROVIDER");
+    assert(!eff.text.includes("SHARED TESTING / SUDO BLOCK"), "empty secret section still rendered");
+    assert.equal(eff.containsSecrets, false);
+    console.log("   deleted block is gone from storage and from new prompts");
+  }
+
+  console.log("12) queue survives daemon restart…");
   {
     const { runId: r4 } = await c.req("enqueueRun", { prompt: "survives restart", provider: "fake", cwd: HOME });
     c.close();

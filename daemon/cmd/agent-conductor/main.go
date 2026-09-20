@@ -28,8 +28,12 @@ import (
 	"agent-conductor/internal/worktrees"
 )
 
-// Version is the daemon version (kept in lockstep with package.json).
-const Version = "0.1.0"
+// Version is stamped at build time from package.json:
+//
+//	go build -ldflags "-X main.Version=$(node -p 'require("./package.json").version')"
+//
+// It used to be a const duplicated in three places.
+var Version = "dev"
 
 func main() {
 	args := os.Args[1:]

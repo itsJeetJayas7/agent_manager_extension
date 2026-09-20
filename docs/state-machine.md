@@ -23,6 +23,7 @@ DRAFT ───────────► QUEUED ──────────
                      │                     fix loop     │ manual continue   │    │
                      │                     └► RUNNING ──┘                   │    │
                      │                                                   │    │
+                     ├──► PAUSED (queue paused, scope INCLUDE_ACTIVE)
                      ├──► CANCEL_REQUESTED ──► CANCELLED                  │    │
                      ├──► FAILED ──► (retry: QUEUED)                      │    │
                      ├──► BLOCKED (marker)                                │    │
@@ -32,11 +33,38 @@ DRAFT ───────────► QUEUED ──────────
                                              INTEGRATING ──► AWAITING_INTEGRATION
 ```
 
+## PAUSED
+
+A run reaches `PAUSED` only from an `INCLUDE_ACTIVE` queue pause: the adapter
+is asked to stop at a safe point and the native session is left intact. It is
+not a failure state and carries no error. When the queue resumes, every
+`PAUSED` run is continued in the *same* session (`ContinueRun`), or requeued
+if it never reached the provider. A `PAUSED` run does not hold a slot.
+
+## ORPHANED and restart recovery
+
+`ORPHANED` is reachable from every dispatched state, because it is what a run
+*is* after the daemon dies under it. On startup:
+
+- a run with a known `ProviderSessionID` whose adapter can resume is marked
+  `ORPHANED` and then reattached (`ORPHANED → AUTO_RESUMING → RUNNING`) in the
+  same native session;
+- a run with no session goes to `NEEDS_ATTENTION`;
+- a `CANCEL_REQUESTED` run settles as `CANCELLED`, so it cannot hold a slot.
+
+`CANCEL_REQUESTED` is also reaped by a 60-second watchdog when no adapter
+execution is live: otherwise nothing would ever emit `TurnInterrupted` for it
+and the slot would be lost until the next restart.
+
 ## Terminal states
 
 `COMPLETED`, `BLOCKED`, `NEEDS_ATTENTION`, `FAILED`, `CANCELLED`, `SKIPPED`,
-`ORPHANED`. COMPLETED can transition back to RUNNING via an explicit
-user-ordered continuation.
+`ORPHANED`. `COMPLETED` can transition back to `RUNNING` via an explicit
+user-ordered continuation, and to `INTEGRATING` so a batch can be re-integrated
+after a manual fix.
+
+`AUTO_RESUMING` is a transient pre-dispatch marker, never a dispatched state:
+dispatch always moves a run to `RUNNING` (session known) or `STARTING`.
 
 ## Completion gate
 
@@ -46,6 +74,15 @@ lacks `<AC_RESULT>…</AC_RESULT>` and instructs the agent to finish properly.
 If the second stop (flagged `stop_hook_active`) still lacks a marker, the run
 is marked `NEEDS_ATTENTION` — never an infinite loop. External sessions are
 never gated.
+
+## Queue holds
+
+Dispatch is held — and only dispatch — by `PauseState`. Quota resolution, the
+cancellation watchdog, hook processing and the pause timer all keep running
+while the queue is paused. A hold records its source (`user`, `quota`,
+`external-agent`, `schedule`), so the UI always has one honest answer to "why
+is nothing running?". A user pause outranks every system hold and is cleared
+only by the user or by its own timer.
 
 ## Quota waits
 

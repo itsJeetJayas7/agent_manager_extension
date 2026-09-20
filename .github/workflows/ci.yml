@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  daemon:
+    name: daemon (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.27"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: daemon/go.sum
+      - name: go vet
+        working-directory: daemon
+        run: go vet ./...
+      - name: gofmt
+        working-directory: daemon
+        run: |
+          unformatted=$(gofmt -l ./internal ./cmd)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+      # The race detector is not optional here: the daemon's whole job is to
+      # coordinate concurrent work, and a data race in it is a fatal crash.
+      - name: go test -race
+        working-directory: daemon
+        run: go test -race -count=1 ./...
+      - name: cross-compile every shipped target
+        working-directory: daemon
+        run: |
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build ./... || exit 1
+          done
+
+  extension:
+    name: extension & webview
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: typecheck (extension host)
+        run: npx tsc -p tsconfig.json --noEmit
+      - name: typecheck (webview)
+        run: npx tsc -p webview/tsconfig.json --noEmit
+      - name: unit tests
+        run: npx vitest run
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache-dependency-path: daemon/go.sum
+      # Boots the real built bundle in the real generated host HTML. This is
+      # what catches "the extension renders a blank sidebar".
+      - name: webview boots
+        run: npm run test:boot
+
+  package:
+    name: VSIX smoke build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache-dependency-path: daemon/go.sum
+      - run: npm ci
+      - name: build all platform daemons + bundles
+        run: node scripts/build.mjs
+      - name: end-to-end protocol test
+        run: node tests/integration/daemon-e2e.mjs
+      - name: package
+        run: npx vsce package --no-dependencies -o agent-conductor-ci.vsix
+      - name: confirm the VSIX carries every platform daemon
+        run: |
+          unzip -l agent-conductor-ci.vsix | grep -q 'dist/bin/agent-conductor$'
+          for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+            unzip -l agent-conductor-ci.vsix | grep -q "dist/bin/agent-conductor-$target" || exit 1
+          done
+          unzip -l agent-conductor-ci.vsix | grep -q 'dist/webview/webview.js'
+          unzip -l agent-conductor-ci.vsix | grep -q 'dist/extension.js'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: agent-conductor-ci.vsix

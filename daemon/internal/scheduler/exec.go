@@ -25,7 +25,7 @@ func (c *Conductor) startRun(ctx context.Context, r *model.Run) error {
 				if !cl.IsWorkspaceTrusted(cwd) {
 					if err := c.store.TransitionRun(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 						x.ErrorCode = "WORKSPACE_UNTRUSTED"
-						x.ErrorMsg = "Claude Code has not trusted this folder yet. Open it once in Claude Code (or use Trust Workspace in Agent Conductor), then Continue the run."
+						x.ErrorMsg = "You have not approved agents working in this folder yet. Claude Code's headless mode skips its own trust dialog, so this is Agent Conductor asking: use Trust Workspace, then Continue the run."
 					}); err != nil {
 						return err
 					}

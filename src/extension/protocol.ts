@@ -8,6 +8,8 @@ export interface RunLike {
   batchId: string;
   rowId: string;
   cardIndex: number;
+  /** Queue position; the snapshot already arrives in this order. */
+  sortKey?: number;
   title: string;
   provider: string;
   model: string;

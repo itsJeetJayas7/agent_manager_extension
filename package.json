@@ -133,15 +133,19 @@
     "build:ext": "node esbuild.mjs --production",
     "watch:ext": "node esbuild.mjs --watch",
     "daemon:build": "bash scripts/build-daemon.sh",
-    "daemon:test": "cd daemon && go test ./... ",
-    "test": "npm run daemon:test && npm run test:ext && npm run test:webview",
+    "daemon:test": "cd daemon && go test -race ./...",
+    "test": "npm run daemon:test && npx vitest run",
     "test:ext": "vitest run --project extension",
     "test:webview": "vitest run --project webview",
     "lint": "tsc -p tsconfig.json --noEmit && tsc -p webview/tsconfig.json --noEmit",
     "typecheck": "npm run lint",
     "package": "node scripts/package.mjs",
     "dev": "node esbuild.mjs --watch",
-    "test:node": "vitest run"
+    "test:node": "vitest run",
+    "build:fast": "node scripts/build.mjs --host-only",
+    "ci": "npm run lint && npm run test && npm run test:boot && node tests/integration/daemon-e2e.mjs",
+    "test:e2e": "node scripts/build.mjs --host-only && node tests/integration/daemon-e2e.mjs",
+    "test:boot": "node scripts/build.mjs --host-only && node tests/integration/webview-boot.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -162,5 +166,23 @@
     "typescript": "^5.5.4",
     "vite": "^5.4.0",
     "vitest": "^2.0.5"
-  }
+  },
+  "icon": "assets/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agent-conductor/agent-conductor"
+  },
+  "bugs": {
+    "url": "https://github.com/agent-conductor/agent-conductor/issues"
+  },
+  "homepage": "https://github.com/agent-conductor/agent-conductor#readme",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "codex",
+    "agent",
+    "queue",
+    "orchestration",
+    "automation"
+  ]
 }

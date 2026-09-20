@@ -1,6 +1,8 @@
+.github/**
 .vscode/**
 src/**
 webview/**
+shared/**
 tests/**
 docs/**
 scripts/**
@@ -10,8 +12,11 @@ node_modules/**
 esbuild.mjs
 vite.config.ts
 vitest.config.ts
+vitest.workspace.ts
 tsconfig.json
+AGENT_BRIEF.md
 **/*.map
 **/*_test.go
 **/.DS_Store
 .agent-conductor-smoke/**
+.gitignore

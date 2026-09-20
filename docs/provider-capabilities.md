@@ -1,8 +1,96 @@
 # Provider Capabilities Matrix
 
-Research date: 2026-09-19. Verified against official documentation where possible.
-Agent Conductor verifies everything below at runtime through capability detection;
-entries marked *inferred* are never treated as guarantees.
+Research date: 2026-09-19. Verification pass against installed binaries:
+2026-09-20. Agent Conductor verifies everything below at runtime through
+capability detection; entries marked *inferred* are never treated as
+guarantees.
+
+> **Read this section first.** Several rows in the tables below were written
+> from documentation and later contradicted by the installed CLIs. Where
+> reality and this document disagreed, reality won and the code follows
+> reality.
+
+## Verification status, 2026-09-20
+
+| Provider | Installed on the verification machine | Surface verified |
+| --- | --- | --- |
+| Claude Code | **yes** — `claude 2.1.278` | Headless stream-json protocol observed end to end, including the frame shapes below |
+| Codex | **no** — not installed | **Nothing verified.** Every `codex app-server` method name below remains as documented, unconfirmed against a running binary |
+
+### Claude Code: what the installed CLI actually does
+
+Probed with:
+
+```
+echo "Reply with exactly: OK" | claude -p --output-format stream-json --verbose \
+  --model haiku --permission-mode plan --tools ""
+```
+
+Frames observed, in order:
+
+1. `{"type":"system","subtype":"init", session_id, model, permissionMode, tools, …}`
+2. `{"type":"rate_limit_event","rate_limit_info":{…}}`
+3. `{"type":"assistant","message":{model, content:[{type:"text"|"tool_use", …}]}}`
+4. `{"type":"result","subtype":"success","is_error":false,"result":"…","stop_reason":"end_turn","num_turns":1,"session_id":"…","permission_denials":[],"terminal_reason":…,"api_error_status":…}`
+
+**Divergence 1 — Claude DOES expose structured quota.** This document
+previously recorded that exact reset timestamps were "not structurally
+exposed", and the adapter's own comment said Claude "exposes no structured
+quota read". Both were wrong. `rate_limit_event` carries:
+
+```json
+{"status":"allowed","resetsAt":1789887600,"rateLimitType":"five_hour",
+ "unifiedWindows":{"five_hour":{"utilization":0.84,"resetsAt":1789887600},
+                   "seven_day":{"utilization":0.06,"resetsAt":1790485200}}}
+```
+
+`utilization` is a fraction (0..1), `resetsAt` a Unix second. The adapter now
+converts these to windows with `source: provider_structured` and
+`confidence: exact`, and `ProbeQuota` answers from the newest observation
+instead of returning an error. Text-derived windows remain only as a fallback
+for the PTY path.
+
+**Divergence 2 — the headless protocol is available and is now the default.**
+`--print`, `--output-format stream-json`, `--input-format stream-json`,
+`--resume <id>`, `--session-id <uuid>`, `--settings`, `--permission-mode`,
+`--permission-prompts`, `--effort` and `--model` all exist in 2.1.278. The
+adapter drove the interactive TUI through a PTY, slept 2500ms and pasted the
+prompt as a bracketed-paste escape sequence; that path is now a fallback behind
+a `--help` capability probe.
+
+**Divergence 3 — `--permission-prompts none` is passed on the headless path.**
+Nobody is present to answer a permission prompt in a daemon, so anything that
+would prompt is denied rather than left hanging. Permission *mode* still
+decides everything else.
+
+**Divergence 4 — tool use is visible in the stream.** `MeaningfulProgress`
+(which decides resume-vs-restart after a quota wait) is now derived from
+`tool_use` blocks and tool results. It previously branched on `PreToolUse` /
+`PostToolUse` hooks that `managedSettingsJSON()` never registered, so it could
+only ever be set from a non-empty final message. Those hooks are registered
+now as well, for the PTY path.
+
+### Codex: what could NOT be verified
+
+`codex` is not installed on the verification machine, so **none** of the
+JSON-RPC method names in the Codex table below have been confirmed against a
+running `codex app-server`. They are still as documented upstream.
+
+Mitigations shipped instead of a verification:
+
+- The adapter records the outcome of every JSON-RPC method it calls
+  (`Codex.MethodSupport()`), so an unsupported method surfaces as a concrete
+  error rather than silently doing nothing.
+- `InstallCodex` no longer rewrites `~/.codex/config.toml`. It appends one
+  delimited block and leaves every other byte alone, and refuses to write
+  anything that would not parse. Whether Codex reads a `[hooks.*]` table at all
+  is **unverified**; the block is delimited and removable precisely so that
+  writing it is harmless if Codex ignores it.
+
+**If you have Codex installed, verify before trusting the Codex column**:
+`account/read`, `model/list`, `thread/start`, `thread/resume`, `turn/start`,
+`turn/interrupt`, `account/rateLimits/read`, and the notification names
+`item/agentMessage/delta`, `turn/completed`, `account/rateLimits/updated`.
 
 ## Claude Code (Anthropic)
 
@@ -19,9 +107,9 @@ entries marked *inferred* are never treated as guarantees.
 | CLI `--settings <file\|json>` | Documented | cli reference | Managed per-run settings incl. hooks | — |
 | CLI `--session-id <uuid>` | Documented | cli reference | Deterministic session ID chosen by daemon; persisted before launch | capture from `SessionStart` hook |
 | CLI `--model`, `--effort` | Documented (`--effort` used by `claude agents` dispatch) | cli reference | Passed through; capability-probed via `claude --help` at setup | omit flag |
-| `-p`/SDK sessions not in picker but resumable by ID | Documented | sessions guide | We launch **interactive in a daemon-owned PTY** (spec), so sessions appear normally | — |
+| `-p --output-format stream-json` headless protocol | **Verified** on claude 2.1.278 | observed | **Default execution path.** Structured events: session init, assistant text, tool use, result with stop reason | interactive PTY path, behind a `--help` capability probe |
 | VS Code URI handler `vscode://anthropic.claude-code/open?session=<id>` | Community-documented; **inferred** — attempted at runtime, degrades gracefully | VS Code marketplace docs | "Open in Claude Code" tries URI, verifies extension presence first | open command palette + show session ID |
-| Five-hour + weekly limits; native quota auto-resume | Documented behaviorally (plan limits), exact reset timestamps **not** structurally exposed | Anthropic plan docs | Quota windows from `StopFailure` + notification text; confidence `high`/`medium`; never fake percentages | user-configured weekly reset override |
+| Five-hour + weekly limits; native quota auto-resume | **Verified structurally exposed** (2026-09-20): `rate_limit_event.unifiedWindows.{five_hour,seven_day}` with `utilization` and `resetsAt` | observed on claude 2.1.278 | Quota windows parsed from the stream; `source: provider_structured`, `confidence: exact` | `StopFailure` + notification text (PTY path), then the user-configured weekly reset override |
 | `ANTHROPIC_API_KEY` in env may switch billing away from subscription | Documented risk pattern | CLI env docs | Stripped from managed subprocess env unless API mode explicitly enabled | — |
 
 ## Codex (OpenAI)

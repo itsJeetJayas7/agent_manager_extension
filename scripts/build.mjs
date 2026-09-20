@@ -8,6 +8,9 @@ import { join } from "path";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
+// package.json is the single source of truth for the version; the daemon has
+// it stamped in at build time rather than duplicating the literal.
+const { version } = require("../package.json");
 const {
   DAEMON_BIN_DIR,
   DAEMON_BIN_NAME,
@@ -45,7 +48,7 @@ const targets = hostOnly
 for (const t of targets) {
   const out = join(stageDir, daemonBinNameFor(t.goos, t.goarch));
   console.log(`building daemon (${t.goos}-${t.goarch})…`);
-  run(goBin, ["build", "-trimpath", "-ldflags", "-s -w", "-o", out, "./cmd/agent-conductor"], {
+  run(goBin, ["build", "-trimpath", "-ldflags", `-s -w -X main.Version=${version}`, "-o", out, "./cmd/agent-conductor"], {
     cwd: join(root, "daemon"),
     env: { ...process.env, GOOS: t.goos, GOARCH: t.goarch, CGO_ENABLED: "0" },
   });
@@ -76,4 +79,4 @@ copyFileSync(hostBin, canonical);
 chmodSync(canonical, 0o755);
 
 const mb = (p) => (statSync(p).size / 1024 / 1024).toFixed(1);
-console.log(`build complete — daemon ${mb(canonical)}MB × ${targets.length} target(s) in ${DAEMON_BIN_DIR}/`);
+console.log(`build complete — v${version}, daemon ${mb(canonical)}MB × ${targets.length} target(s) in ${DAEMON_BIN_DIR}/`);
