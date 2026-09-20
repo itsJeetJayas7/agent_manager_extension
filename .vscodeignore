@@ -1,0 +1,17 @@
+.vscode/**
+src/**
+webview/**
+tests/**
+docs/**
+scripts/**
+dist-bin/**
+daemon/**
+node_modules/**
+esbuild.mjs
+vite.config.ts
+vitest.config.ts
+tsconfig.json
+**/*.map
+**/*_test.go
+**/.DS_Store
+.agent-conductor-smoke/**

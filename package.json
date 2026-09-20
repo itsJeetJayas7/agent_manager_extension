@@ -1,0 +1,137 @@
+{
+  "name": "agent-conductor",
+  "displayName": "Agent Conductor",
+  "description": "Queue, supervise, and orchestrate Claude Code and Codex coding-agent runs from one quiet sidebar. Survives VS Code shutdown via a persistent daemon.",
+  "version": "0.1.0",
+  "publisher": "agent-conductor-local",
+  "license": "MIT",
+  "private": true,
+  "extensionKind": [
+    "workspace"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agent-conductor",
+          "title": "Agent Conductor",
+          "icon": "assets/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "agent-conductor": [
+        {
+          "type": "webview",
+          "id": "agent-conductor.sidebar",
+          "name": "Agent Conductor"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agent-conductor.open",
+        "title": "Agent Conductor: Open"
+      },
+      {
+        "command": "agent-conductor.buildBatch",
+        "title": "Agent Conductor: Build Batch"
+      },
+      {
+        "command": "agent-conductor.diagnostics",
+        "title": "Agent Conductor: Diagnostics"
+      },
+      {
+        "command": "agent-conductor.startDevDaemon",
+        "title": "Agent Conductor: Start Development Daemon"
+      },
+      {
+        "command": "agent-conductor.repairRuntime",
+        "title": "Agent Conductor: Repair Runtime"
+      },
+      {
+        "command": "agent-conductor.openLogs",
+        "title": "Agent Conductor: Open Logs"
+      },
+      {
+        "command": "agent-conductor.installService",
+        "title": "Agent Conductor: Install Background Service"
+      },
+      {
+        "command": "agent-conductor.uninstallService",
+        "title": "Agent Conductor: Uninstall Background Service & Hooks"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Conductor",
+      "properties": {
+        "agentConductor.daemonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the agent-conductor daemon binary. Empty = use bundled/installed binary."
+        },
+        "agentConductor.mockProviders": {
+          "type": "boolean",
+          "default": false,
+          "description": "Development: use fake providers that do not call real agents."
+        },
+        "agentConductor.verificationCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Optional commands run from the run's worktree after a COMPLETE marker (e.g. npm test)."
+        },
+        "agentConductor.maxVerifyFixCycles": {
+          "type": "number",
+          "default": 2,
+          "description": "Maximum automatic verify -> agent-fix -> re-verify cycles before NEEDS_ATTENTION."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:webview": "vite build",
+    "build:ext": "node esbuild.mjs --production",
+    "watch:ext": "node esbuild.mjs --watch",
+    "daemon:build": "bash scripts/build-daemon.sh",
+    "daemon:test": "cd daemon && go test ./... ",
+    "test": "npm run daemon:test && npm run test:ext && npm run test:webview",
+    "test:ext": "vitest run tests/extension --environment node",
+    "test:webview": "vitest run tests/webview --environment jsdom",
+    "lint": "tsc -p tsconfig.json --noEmit && tsc -p webview/tsconfig.json --noEmit",
+    "typecheck": "npm run lint",
+    "package": "node scripts/package.mjs",
+    "dev": "node esbuild.mjs --watch"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^22.5.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/vscode": "^1.85.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "@vscode/vsce": "^3.1.0",
+    "esbuild": "^0.23.0",
+    "jsdom": "^25.0.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0",
+    "vitest": "^2.0.5"
+  }
+}

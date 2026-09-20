@@ -1,0 +1,14 @@
+node_modules/
+dist/
+out/
+*.vsix
+daemon/agent-conductor
+daemon/bin/
+daemon/vendor/
+.DS_Store
+*.log
+.vite/
+daemon/coverage/
+
+# build output
+dist-bin/
