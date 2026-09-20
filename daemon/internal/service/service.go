@@ -15,11 +15,11 @@ import (
 
 // InstallResult reports what was installed.
 type InstallResult struct {
-	Mode         string `json:"mode"` // systemd | launchd
-	UnitPath     string `json:"unitPath"`
-	BinPath      string `json:"binPath"`
-	LingerNote   string `json:"lingerNote,omitempty"`
-	Commands     []string `json:"commands"`
+	Mode       string   `json:"mode"` // systemd | launchd
+	UnitPath   string   `json:"unitPath"`
+	BinPath    string   `json:"binPath"`
+	LingerNote string   `json:"lingerNote,omitempty"`
+	Commands   []string `json:"commands"`
 }
 
 // Installer plans and applies the service installation.

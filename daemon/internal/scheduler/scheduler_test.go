@@ -22,17 +22,17 @@ import (
 
 // harness wires a full conductor with fake adapters and a virtual clock.
 type harness struct {
-	t        *testing.T
-	store    *db.Store
-	conductor *Conductor
+	t          *testing.T
+	store      *db.Store
+	conductor  *Conductor
 	fakeClaude *providers.Fake
 	fakeCodex  *providers.Fake
-	guardian *quota.Guardian
-	repo     string
+	guardian   *quota.Guardian
+	repo       string
 
-	mu       sync.Mutex
-	vnow     time.Time
-	stopFn   func()
+	mu     sync.Mutex
+	vnow   time.Time
+	stopFn func()
 }
 
 func newHarness(t *testing.T) *harness {
@@ -714,8 +714,8 @@ func TestExternalBlocksSameProviderOnlyInParallel(t *testing.T) {
 // ---- verification loop ----
 
 type fakeVerifier struct {
-	mu     sync.Mutex
-	calls  int
+	mu        sync.Mutex
+	calls     int
 	failFirst int
 }
 

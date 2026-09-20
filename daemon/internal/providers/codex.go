@@ -35,8 +35,8 @@ type Codex struct {
 }
 
 type rpcResult struct {
-	Result json.RawMessage   `json:"result"`
-	Error  *rpcError         `json:"error"`
+	Result json.RawMessage `json:"result"`
+	Error  *rpcError       `json:"error"`
 }
 
 type rpcError struct {
@@ -115,10 +115,10 @@ func (c *Codex) Capabilities(ctx context.Context) Caps {
 	if raw, err := c.call(ctx2, "model/list", map[string]any{}); err == nil {
 		var ml struct {
 			Models []struct {
-				ID           string   `json:"id"`
-				DisplayName  string   `json:"displayName"`
+				ID              string `json:"id"`
+				DisplayName     string `json:"displayName"`
 				ReasoningEffort string `json:"reasoningEffort"`
-				Hidden       bool     `json:"hidden"`
+				Hidden          bool   `json:"hidden"`
 			} `json:"models"`
 		}
 		if json.Unmarshal(raw, &ml) == nil {

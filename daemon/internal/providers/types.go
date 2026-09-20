@@ -14,13 +14,13 @@ import (
 type EventKind string
 
 const (
-	EvSessionStarted  EventKind = "session_started"
-	EvTurnStarted     EventKind = "turn_started"
-	EvMessageDelta    EventKind = "message_delta"
-	EvTurnCompleted   EventKind = "turn_completed" // terminal for the turn
-	EvProcessExited   EventKind = "process_exited"
-	EvQuotaUpdate     EventKind = "quota_update"
-	EvAccountUpdate   EventKind = "account_update"
+	EvSessionStarted EventKind = "session_started"
+	EvTurnStarted    EventKind = "turn_started"
+	EvMessageDelta   EventKind = "message_delta"
+	EvTurnCompleted  EventKind = "turn_completed" // terminal for the turn
+	EvProcessExited  EventKind = "process_exited"
+	EvQuotaUpdate    EventKind = "quota_update"
+	EvAccountUpdate  EventKind = "account_update"
 )
 
 // TurnStatus on EvTurnCompleted: completed | interrupted | failed.
@@ -49,10 +49,10 @@ type Event struct {
 	SubSession string // codex session id when distinct
 	TurnID     string
 	Status     TurnStatus
-	Text       string          // final assistant message or delta
-	FinalMsg   string          // full final assistant message at turn end
+	Text       string // final assistant message or delta
+	FinalMsg   string // full final assistant message at turn end
 	Error      *ProviderError
-	Progress   bool            // meaningful progress evidence
+	Progress   bool // meaningful progress evidence
 	Quota      []QuotaWindow
 	Model      string
 	At         time.Time
@@ -67,8 +67,8 @@ type QuotaWindow struct {
 	ResetsAt    time.Time `json:"resetsAt"`
 	HasReset    bool      `json:"hasReset"`
 	Exhausted   bool      `json:"exhausted"`
-	Source      string    `json:"source"`      // provider_structured | provider_event | provider_text | user_config | inferred
-	Confidence  string    `json:"confidence"`  // exact | high | medium | experimental | unknown
+	Source      string    `json:"source"`     // provider_structured | provider_event | provider_text | user_config | inferred
+	Confidence  string    `json:"confidence"` // exact | high | medium | experimental | unknown
 }
 
 // ExecSpec fully describes one provider execution (turn).
@@ -79,31 +79,31 @@ type ExecSpec struct {
 	Effort     string
 	Permission string // bypass | plan | default | acceptEdits
 	Cwd        string
-	Prompt     string        // fully assembled effective prompt (may contain secrets)
-	SessionID  string        // non-empty => continue SAME native session
-	Continue   bool          // true = continuation turn on SessionID
+	Prompt     string // fully assembled effective prompt (may contain secrets)
+	SessionID  string // non-empty => continue SAME native session
+	Continue   bool   // true = continuation turn on SessionID
 	Stage      model.Stage
-	Title      string        // deterministic native session/thread title
+	Title      string // deterministic native session/thread title
 	Env        map[string]string
 }
 
 // Caps describes what an adapter/runtime supports.
 type Caps struct {
-	Installed      bool     `json:"installed"`
-	Version        string   `json:"version"`
-	Models         []ModelInfo `json:"models"`
-	AuthState      string   `json:"authState"` // ok | api_key | none | unknown
-	PlanLabel      string   `json:"planLabel"`
-	Notes          []string `json:"notes"`
-	RealTimeQuota  bool     `json:"realTimeQuota"`
+	Installed     bool        `json:"installed"`
+	Version       string      `json:"version"`
+	Models        []ModelInfo `json:"models"`
+	AuthState     string      `json:"authState"` // ok | api_key | none | unknown
+	PlanLabel     string      `json:"planLabel"`
+	Notes         []string    `json:"notes"`
+	RealTimeQuota bool        `json:"realTimeQuota"`
 }
 
 // ModelInfo is one discoverable model.
 type ModelInfo struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Efforts  []string `json:"efforts"`
-	Hidden   bool     `json:"hidden,omitempty"`
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Efforts []string `json:"efforts"`
+	Hidden  bool     `json:"hidden,omitempty"`
 }
 
 // Sink receives events for one execution.
@@ -165,27 +165,27 @@ func (r *Registry) All() []Adapter {
 // to whichever component subscribed. Claude adapter subscribes to correlate
 // hook observations with managed PTY processes.
 type HookBus struct {
-	mu  sync.Mutex
+	mu   sync.Mutex
 	subs []chan HookPayload
 }
 
 // HookPayload is the JSON the hook bridge forwards.
 type HookPayload struct {
-	Provider   string `json:"provider"`
-	Event      string `json:"event"`       // SessionStart, UserPromptSubmit, Stop, ...
-	SessionID  string `json:"sessionId"`
-	ThreadID   string `json:"threadId,omitempty"`
-	TurnID     string `json:"turnId,omitempty"`
-	Cwd        string `json:"cwd,omitempty"`
-	Model      string `json:"model,omitempty"`
-	RunID      string `json:"runId,omitempty"` // present only for managed runs
-	StopHookActive bool `json:"stopHookActive,omitempty"`
-	LastAssistantMessage string `json:"lastAssistantMessage,omitempty"`
-	ErrorType  string `json:"errorType,omitempty"` // StopFailure error type
-	ErrorMessage string `json:"errorMessage,omitempty"`
-	NotificationType string `json:"notificationType,omitempty"`
-	NotificationMessage string `json:"notificationMessage,omitempty"`
-	Raw        map[string]any `json:"raw,omitempty"`
+	Provider             string         `json:"provider"`
+	Event                string         `json:"event"` // SessionStart, UserPromptSubmit, Stop, ...
+	SessionID            string         `json:"sessionId"`
+	ThreadID             string         `json:"threadId,omitempty"`
+	TurnID               string         `json:"turnId,omitempty"`
+	Cwd                  string         `json:"cwd,omitempty"`
+	Model                string         `json:"model,omitempty"`
+	RunID                string         `json:"runId,omitempty"` // present only for managed runs
+	StopHookActive       bool           `json:"stopHookActive,omitempty"`
+	LastAssistantMessage string         `json:"lastAssistantMessage,omitempty"`
+	ErrorType            string         `json:"errorType,omitempty"` // StopFailure error type
+	ErrorMessage         string         `json:"errorMessage,omitempty"`
+	NotificationType     string         `json:"notificationType,omitempty"`
+	NotificationMessage  string         `json:"notificationMessage,omitempty"`
+	Raw                  map[string]any `json:"raw,omitempty"`
 }
 
 // NewHookBus creates the bus.

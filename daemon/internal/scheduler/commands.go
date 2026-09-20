@@ -61,13 +61,13 @@ func (c *Conductor) EnqueueRun(in EnqueueRunInput) (batchID, runID string, err e
 	row := &model.Row{ID: newID("row"), BatchID: batch.ID, Position: 0, Mode: model.RowLinear, Status: model.RowPending}
 	run := &model.Run{
 		ID: newID("run"), BatchID: batch.ID, RowID: row.ID,
-		Title: model.PreviewRedacted(in.Prompt, 60),
+		Title:    model.PreviewRedacted(in.Prompt, 60),
 		Provider: in.Provider, Model: in.Model, Effort: in.Effort, Permission: in.Permission,
 		AttachSecrets: in.AttachSecrets, Staged: in.Staged,
 		State: model.StateQueued, Stage: stageFor(in.Staged),
 		PromptCipherStore: cipher, PromptHash: model.HashPrompt(in.Prompt),
 		PromptPreview: model.PreviewRedacted(in.Prompt, 120),
-		CreatedAt: c.Now(), QueuedAt: c.Now(), Cwd: in.Cwd,
+		CreatedAt:     c.Now(), QueuedAt: c.Now(), Cwd: in.Cwd,
 	}
 	sortKey, err := c.store.NextSortKey()
 	if err != nil {
@@ -107,15 +107,15 @@ func stageFor(staged bool) model.Stage {
 
 // BatchSpecInput defines an explicit batch from the planner.
 type BatchSpecInput struct {
-	Title  string        `json:"title"`
-	Cwd    string        `json:"cwd"`
-	Rows   []RowSpecInput `json:"rows"`
+	Title string         `json:"title"`
+	Cwd   string         `json:"cwd"`
+	Rows  []RowSpecInput `json:"rows"`
 }
 
 // RowSpecInput is one row; Parallel rows contain multiple runs.
 type RowSpecInput struct {
-	Mode  string          `json:"mode"` // LINEAR | PARALLEL
-	Runs  []RunSpecInput  `json:"runs"`
+	Mode string         `json:"mode"` // LINEAR | PARALLEL
+	Runs []RunSpecInput `json:"runs"`
 }
 
 // RunSpecInput is one card.
@@ -204,7 +204,7 @@ func (c *Conductor) ApplyBatch(spec BatchSpecInput) (batchID string, err error) 
 				State: model.StateQueued, Stage: stageFor(rr.Staged),
 				PromptCipherStore: cipher, PromptHash: model.HashPrompt(rr.Prompt),
 				PromptPreview: model.PreviewRedacted(rr.Prompt, 120),
-				CreatedAt: c.Now(), QueuedAt: c.Now(), SortKey: sortKey, Cwd: spec.Cwd,
+				CreatedAt:     c.Now(), QueuedAt: c.Now(), SortKey: sortKey, Cwd: spec.Cwd,
 			}
 			sortKey++
 			if err := c.store.CreateRun(run); err != nil {

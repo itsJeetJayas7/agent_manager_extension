@@ -14,20 +14,20 @@ import (
 // matches a substring of the prompt (or "*") and describes what the fake
 // provider does.
 type Script struct {
-	Match       string     `json:"match"`
-	FailBefore  bool       `json:"failBefore"`  // provider error before meaningful start
+	Match       string           `json:"match"`
+	FailBefore  bool             `json:"failBefore"` // provider error before meaningful start
 	Class       model.ErrorClass `json:"class"`
-	RateLimit   bool       `json:"rateLimit"`   // rate limit error
-	PartialWork bool       `json:"partialWork"` // progress before rate limit
-	Weekly      bool       `json:"weekly"`
-	ResetAfter  time.Duration `json:"resetAfter"`
-	Duration    time.Duration `json:"duration"`
-	FinalMsg    string      `json:"finalMsg"`
-	NoMarker    bool        `json:"noMarker"`
-	Blocked     bool        `json:"blocked"`
-	Interrupt   bool        `json:"interrupt"` // pretend user interrupt
-	Crash       bool        `json:"crash"`
-	Resumes     bool        `json:"resumes"` // auto-resumes natively after reset
+	RateLimit   bool             `json:"rateLimit"`   // rate limit error
+	PartialWork bool             `json:"partialWork"` // progress before rate limit
+	Weekly      bool             `json:"weekly"`
+	ResetAfter  time.Duration    `json:"resetAfter"`
+	Duration    time.Duration    `json:"duration"`
+	FinalMsg    string           `json:"finalMsg"`
+	NoMarker    bool             `json:"noMarker"`
+	Blocked     bool             `json:"blocked"`
+	Interrupt   bool             `json:"interrupt"` // pretend user interrupt
+	Crash       bool             `json:"crash"`
+	Resumes     bool             `json:"resumes"` // auto-resumes natively after reset
 }
 
 // Fake is a deterministic in-process provider used by tests and dev mode.
@@ -75,9 +75,13 @@ func (f *Fake) Quota() []QuotaWindow { f.mu.Lock(); defer f.mu.Unlock(); return 
 func (f *Fake) Now() time.Time { f.mu.Lock(); defer f.mu.Unlock(); return f.clock() }
 
 // IsCancelled reports whether the run was cancelled.
-func (f *Fake) IsCancelled(runID string) bool { f.mu.Lock(); defer f.mu.Unlock(); return f.cancelled[runID] }
+func (f *Fake) IsCancelled(runID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cancelled[runID]
+}
 
-func (f *Fake) Name() string { return f.name }
+func (f *Fake) Name() string                   { return f.name }
 func (f *Fake) Available(context.Context) bool { return true }
 
 func (f *Fake) Capabilities(context.Context) Caps {

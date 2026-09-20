@@ -197,7 +197,7 @@ func (c *Conductor) tryAnchor(ctx context.Context, provider string, s Settings, 
 	}
 	windowKey := windowReset.UTC().Format(time.RFC3339)
 	// a real run already anchored this window naturally
-	if _, claimed, _ := c.store.GetServiceState("anchor."+provider+"."+windowKey); claimed {
+	if _, claimed, _ := c.store.GetServiceState("anchor." + provider + "." + windowKey); claimed {
 		return
 	}
 	// Resolve the adapter BEFORE claiming: the claim is exactly-once, so

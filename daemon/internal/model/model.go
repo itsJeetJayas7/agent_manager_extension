@@ -22,27 +22,27 @@ type RunState string
 
 // Run states. Transitions are validated by CanTransition.
 const (
-	StateDraft                RunState = "DRAFT"
-	StateQueued               RunState = "QUEUED"
-	StateWaitingForSlot       RunState = "WAITING_FOR_SLOT"
-	StateWaitingForExternal   RunState = "WAITING_FOR_EXTERNAL_AGENT"
-	StatePreparing            RunState = "PREPARING"
-	StateStarting             RunState = "STARTING"
-	StateRunning              RunState = "RUNNING"
-	StateWaitingForProvider   RunState = "WAITING_FOR_PROVIDER"
-	StateWaitingForQuota      RunState = "WAITING_FOR_QUOTA"
-	StateAutoResuming         RunState = "AUTO_RESUMING"
-	StateVerifying            RunState = "VERIFYING"
-	StateCompleted            RunState = "COMPLETED"
-	StateBlocked              RunState = "BLOCKED"
-	StateNeedsAttention       RunState = "NEEDS_ATTENTION"
-	StateFailed               RunState = "FAILED"
-	StateCancelRequested      RunState = "CANCEL_REQUESTED"
-	StateCancelled            RunState = "CANCELLED"
-	StateOrphaned             RunState = "ORPHANED"
-	StateSkipped              RunState = "SKIPPED"
-	StateIntegrating          RunState = "INTEGRATING"
-	StateAwaitingIntegration  RunState = "AWAITING_INTEGRATION"
+	StateDraft               RunState = "DRAFT"
+	StateQueued              RunState = "QUEUED"
+	StateWaitingForSlot      RunState = "WAITING_FOR_SLOT"
+	StateWaitingForExternal  RunState = "WAITING_FOR_EXTERNAL_AGENT"
+	StatePreparing           RunState = "PREPARING"
+	StateStarting            RunState = "STARTING"
+	StateRunning             RunState = "RUNNING"
+	StateWaitingForProvider  RunState = "WAITING_FOR_PROVIDER"
+	StateWaitingForQuota     RunState = "WAITING_FOR_QUOTA"
+	StateAutoResuming        RunState = "AUTO_RESUMING"
+	StateVerifying           RunState = "VERIFYING"
+	StateCompleted           RunState = "COMPLETED"
+	StateBlocked             RunState = "BLOCKED"
+	StateNeedsAttention      RunState = "NEEDS_ATTENTION"
+	StateFailed              RunState = "FAILED"
+	StateCancelRequested     RunState = "CANCEL_REQUESTED"
+	StateCancelled           RunState = "CANCELLED"
+	StateOrphaned            RunState = "ORPHANED"
+	StateSkipped             RunState = "SKIPPED"
+	StateIntegrating         RunState = "INTEGRATING"
+	StateAwaitingIntegration RunState = "AWAITING_INTEGRATION"
 )
 
 // Terminal reports whether the state is terminal for scheduling purposes.
@@ -67,25 +67,25 @@ func (s RunState) Active() bool {
 
 // transitions is the legal transition table. Anything not listed is illegal.
 var transitions = map[RunState][]RunState{
-	StateDraft:              {StateQueued, StateCancelled, StateSkipped},
-	StateQueued:             {StateWaitingForSlot, StateWaitingForExternal, StatePreparing, StateCancelRequested, StateCancelled, StateSkipped, StateFailed, StateNeedsAttention},
-	StateWaitingForSlot:     {StatePreparing, StateWaitingForExternal, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
-	StateWaitingForExternal: {StatePreparing, StateWaitingForSlot, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
-	StatePreparing:          {StateStarting, StateFailed, StateNeedsAttention, StateCancelRequested, StateBlocked},
-	StateStarting:           {StateRunning, StateFailed, StateNeedsAttention, StateCancelRequested, StateWaitingForQuota},
-	StateRunning:            {StateWaitingForQuota, StateVerifying, StateCompleted, StateBlocked, StateNeedsAttention, StateFailed, StateCancelRequested, StateWaitingForProvider, StateIntegrating, StateOrphaned},
-	StateWaitingForProvider: {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StateOrphaned},
-	StateWaitingForQuota:    {StateAutoResuming, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
-	StateAutoResuming:       {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested},
-	StateVerifying:          {StateCompleted, StateRunning, StateNeedsAttention, StateFailed, StateCancelRequested, StateBlocked},
-	StateIntegrating:        {StateCompleted, StateAwaitingIntegration, StateNeedsAttention, StateFailed, StateCancelRequested},
+	StateDraft:               {StateQueued, StateCancelled, StateSkipped},
+	StateQueued:              {StateWaitingForSlot, StateWaitingForExternal, StatePreparing, StateCancelRequested, StateCancelled, StateSkipped, StateFailed, StateNeedsAttention},
+	StateWaitingForSlot:      {StatePreparing, StateWaitingForExternal, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
+	StateWaitingForExternal:  {StatePreparing, StateWaitingForSlot, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
+	StatePreparing:           {StateStarting, StateFailed, StateNeedsAttention, StateCancelRequested, StateBlocked},
+	StateStarting:            {StateRunning, StateFailed, StateNeedsAttention, StateCancelRequested, StateWaitingForQuota},
+	StateRunning:             {StateWaitingForQuota, StateVerifying, StateCompleted, StateBlocked, StateNeedsAttention, StateFailed, StateCancelRequested, StateWaitingForProvider, StateIntegrating, StateOrphaned},
+	StateWaitingForProvider:  {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StateOrphaned},
+	StateWaitingForQuota:     {StateAutoResuming, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
+	StateAutoResuming:        {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested},
+	StateVerifying:           {StateCompleted, StateRunning, StateNeedsAttention, StateFailed, StateCancelRequested, StateBlocked},
+	StateIntegrating:         {StateCompleted, StateAwaitingIntegration, StateNeedsAttention, StateFailed, StateCancelRequested},
 	StateAwaitingIntegration: {StateIntegrating, StateCompleted, StateNeedsAttention, StateFailed, StateCancelled},
-	StateCancelRequested:    {StateCancelled, StateFailed, StateCompleted},
-	StateCompleted:          {StateRunning}, // completed run may be continued manually
-	StateBlocked:            {StateRunning, StateSkipped, StateCancelled, StateFailed, StateQueued},
-	StateNeedsAttention:     {StateRunning, StateQueued, StateAutoResuming, StateSkipped, StateCancelled, StateFailed, StatePreparing},
-	StateFailed:             {StateQueued, StateSkipped, StateCancelled, StatePreparing},
-	StateOrphaned:           {StateAutoResuming, StateNeedsAttention, StateSkipped, StateCancelled, StateFailed},
+	StateCancelRequested:     {StateCancelled, StateFailed, StateCompleted},
+	StateCompleted:           {StateRunning}, // completed run may be continued manually
+	StateBlocked:             {StateRunning, StateSkipped, StateCancelled, StateFailed, StateQueued},
+	StateNeedsAttention:      {StateRunning, StateQueued, StateAutoResuming, StateSkipped, StateCancelled, StateFailed, StatePreparing},
+	StateFailed:              {StateQueued, StateSkipped, StateCancelled, StatePreparing},
+	StateOrphaned:            {StateAutoResuming, StateNeedsAttention, StateSkipped, StateCancelled, StateFailed},
 }
 
 // CanTransition validates a state change.
@@ -105,49 +105,49 @@ func CanTransition(from, to RunState) bool {
 type RunEventType string
 
 const (
-	EventQueued                RunEventType = "RUN_QUEUED"
+	EventQueued                 RunEventType = "RUN_QUEUED"
 	EventProviderSessionCreated RunEventType = "PROVIDER_SESSION_CREATED"
-	EventTurnStarted           RunEventType = "TURN_STARTED"
-	EventAgentStopped          RunEventType = "AGENT_STOPPED"
-	EventCompletionMarkerFound RunEventType = "COMPLETION_MARKER_FOUND"
-	EventRateLimitDetected     RunEventType = "RATE_LIMIT_DETECTED"
-	EventWaitScheduled         RunEventType = "WAIT_SCHEDULED"
-	EventAutoResumeStarted     RunEventType = "AUTO_RESUME_STARTED"
-	EventAutoResumeSucceeded   RunEventType = "AUTO_RESUME_SUCCEEDED"
-	EventWorktreeCreated       RunEventType = "WORKTREE_CREATED"
-	EventWorktreeCommitted     RunEventType = "WORKTREE_COMMITTED"
-	EventIntegrationStarted    RunEventType = "INTEGRATION_STARTED"
-	EventIntegrationConflict   RunEventType = "INTEGRATION_CONFLICT"
-	EventRunCompleted          RunEventType = "RUN_COMPLETED"
-	EventRunFailed             RunEventType = "RUN_FAILED"
-	EventStateChanged          RunEventType = "STATE_CHANGED"
-	EventStageChanged          RunEventType = "STAGE_CHANGED"
-	EventVerificationStarted   RunEventType = "VERIFICATION_STARTED"
-	EventVerificationFinished  RunEventType = "VERIFICATION_FINISHED"
-	EventContinuationSent      RunEventType = "CONTINUATION_SENT"
-	EventCancelRequested       RunEventType = "CANCEL_REQUESTED"
-	EventRunCancelled          RunEventType = "RUN_CANCELLED"
-	EventExternalWait          RunEventType = "EXTERNAL_AGENT_WAIT"
-	EventOrphaned              RunEventType = "RUN_ORPHANED"
+	EventTurnStarted            RunEventType = "TURN_STARTED"
+	EventAgentStopped           RunEventType = "AGENT_STOPPED"
+	EventCompletionMarkerFound  RunEventType = "COMPLETION_MARKER_FOUND"
+	EventRateLimitDetected      RunEventType = "RATE_LIMIT_DETECTED"
+	EventWaitScheduled          RunEventType = "WAIT_SCHEDULED"
+	EventAutoResumeStarted      RunEventType = "AUTO_RESUME_STARTED"
+	EventAutoResumeSucceeded    RunEventType = "AUTO_RESUME_SUCCEEDED"
+	EventWorktreeCreated        RunEventType = "WORKTREE_CREATED"
+	EventWorktreeCommitted      RunEventType = "WORKTREE_COMMITTED"
+	EventIntegrationStarted     RunEventType = "INTEGRATION_STARTED"
+	EventIntegrationConflict    RunEventType = "INTEGRATION_CONFLICT"
+	EventRunCompleted           RunEventType = "RUN_COMPLETED"
+	EventRunFailed              RunEventType = "RUN_FAILED"
+	EventStateChanged           RunEventType = "STATE_CHANGED"
+	EventStageChanged           RunEventType = "STAGE_CHANGED"
+	EventVerificationStarted    RunEventType = "VERIFICATION_STARTED"
+	EventVerificationFinished   RunEventType = "VERIFICATION_FINISHED"
+	EventContinuationSent       RunEventType = "CONTINUATION_SENT"
+	EventCancelRequested        RunEventType = "CANCEL_REQUESTED"
+	EventRunCancelled           RunEventType = "RUN_CANCELLED"
+	EventExternalWait           RunEventType = "EXTERNAL_AGENT_WAIT"
+	EventOrphaned               RunEventType = "RUN_ORPHANED"
 )
 
 // RunEvent is one timeline entry for a run.
 type RunEvent struct {
-	ID        int64      `json:"id"`
-	RunID     string     `json:"runId"`
-	Timestamp time.Time  `json:"timestamp"`
+	ID        int64        `json:"id"`
+	RunID     string       `json:"runId"`
+	Timestamp time.Time    `json:"timestamp"`
 	Type      RunEventType `json:"type"`
-	Data      string     `json:"data,omitempty"` // JSON blob, redacted
+	Data      string       `json:"data,omitempty"` // JSON blob, redacted
 }
 
 // Stage for staged intelligence.
 type Stage string
 
 const (
-	StageNone  Stage = ""
-	StagePlan  Stage = "PLAN"
-	StageBuild Stage = "BUILD"
-	StageAudit Stage = "AUDIT"
+	StageNone   Stage = ""
+	StagePlan   Stage = "PLAN"
+	StageBuild  Stage = "BUILD"
+	StageAudit  Stage = "AUDIT"
 	StageVerify Stage = "VERIFY"
 )
 
@@ -210,7 +210,7 @@ type Run struct {
 	AuditCycles        int        `json:"auditCycles"`
 	VerifyCycles       int        `json:"verifyCycles"`
 	ErrorCode          string     `json:"errorCode,omitempty"`
-	ErrorMsg           string     `json:"errorMsg,omitempty"` // redacted
+	ErrorMsg           string     `json:"errorMsg,omitempty"`     // redacted
 	FinalOutcome       string     `json:"finalOutcome,omitempty"` // COMPLETE | BLOCKED:...
 	MeaningfulProgress bool       `json:"meaningfulProgress"`
 	CreatedAt          time.Time  `json:"createdAt"`
@@ -229,54 +229,54 @@ type Run struct {
 
 // Batch is an ordered set of rows.
 type Batch struct {
-	ID                string     `json:"id"`
-	Title             string     `json:"title"`
+	ID                string      `json:"id"`
+	Title             string      `json:"title"`
 	Status            BatchStatus `json:"status"`
-	BaseCwd           string     `json:"baseCwd"`
-	BaseBranch        string     `json:"baseBranch"`
-	BaseCommit        string     `json:"baseCommit"`
-	IntegrationBranch string     `json:"integrationBranch,omitempty"`
-	IntegrationWTPath string     `json:"integrationWorktreePath,omitempty"`
-	CreatedAt         time.Time  `json:"createdAt"`
-	StartedAt         time.Time  `json:"startedAt"`
-	FinishedAt        time.Time  `json:"finishedAt"`
-	Applied           bool       `json:"applied"`
-	Implicit          bool       `json:"implicit"`
+	BaseCwd           string      `json:"baseCwd"`
+	BaseBranch        string      `json:"baseBranch"`
+	BaseCommit        string      `json:"baseCommit"`
+	IntegrationBranch string      `json:"integrationBranch,omitempty"`
+	IntegrationWTPath string      `json:"integrationWorktreePath,omitempty"`
+	CreatedAt         time.Time   `json:"createdAt"`
+	StartedAt         time.Time   `json:"startedAt"`
+	FinishedAt        time.Time   `json:"finishedAt"`
+	Applied           bool        `json:"applied"`
+	Implicit          bool        `json:"implicit"`
 }
 
 // Row is one LINEAR or PARALLEL row inside a batch.
 type Row struct {
-	ID       string   `json:"id"`
-	BatchID  string   `json:"batchId"`
-	Position int      `json:"position"`
-	Mode     RowMode  `json:"mode"`
+	ID       string    `json:"id"`
+	BatchID  string    `json:"batchId"`
+	Position int       `json:"position"`
+	Mode     RowMode   `json:"mode"`
 	Status   RowStatus `json:"status"`
 }
 
 // ProviderSession is a native provider conversation known to the daemon.
 type ProviderSession struct {
-	Provider    string    `json:"provider"`
-	NativeID    string    `json:"nativeId"` // claude session id / codex thread id
-	RunID       string    `json:"runId,omitempty"`
-	Kind        string    `json:"kind"` // managed | external
-	Cwd         string    `json:"cwd,omitempty"`
-	Model       string    `json:"model,omitempty"`
-	Title       string    `json:"title,omitempty"`
-	LastEvent   string    `json:"lastEvent"`
-	LastSeenAt  time.Time `json:"lastSeenAt"`
+	Provider   string    `json:"provider"`
+	NativeID   string    `json:"nativeId"` // claude session id / codex thread id
+	RunID      string    `json:"runId,omitempty"`
+	Kind       string    `json:"kind"` // managed | external
+	Cwd        string    `json:"cwd,omitempty"`
+	Model      string    `json:"model,omitempty"`
+	Title      string    `json:"title,omitempty"`
+	LastEvent  string    `json:"lastEvent"`
+	LastSeenAt time.Time `json:"lastSeenAt"`
 }
 
 // ExternalBusy reports whether provider has an active non-managed session.
 type ExternalBusy struct {
-	Provider string    `json:"provider"`
-	Busy     bool      `json:"busy"`
+	Provider string           `json:"provider"`
+	Busy     bool             `json:"busy"`
 	Session  *ProviderSession `json:"session,omitempty"`
 }
 
 // Result markers.
 const (
-	MarkerComplete = "<AC_RESULT>COMPLETE</AC_RESULT>"
-	MarkerBlocked  = "<AC_RESULT>BLOCKED:"
+	MarkerComplete  = "<AC_RESULT>COMPLETE</AC_RESULT>"
+	MarkerBlocked   = "<AC_RESULT>BLOCKED:"
 	MarkerStagePlan = "<AC_STAGE>PLAN_READY</AC_STAGE>"
 )
 
@@ -403,18 +403,18 @@ func DeterministicSessionTitle(batchNum, rowNum, cardNum int, preview string) st
 type ErrorClass string
 
 const (
-	ErrRateLimit         ErrorClass = "RATE_LIMIT"
-	ErrAuth              ErrorClass = "AUTH"
-	ErrBilling           ErrorClass = "BILLING"
-	ErrModelUnavailable  ErrorClass = "MODEL_UNAVAILABLE"
-	ErrNetwork           ErrorClass = "NETWORK"
+	ErrRateLimit          ErrorClass = "RATE_LIMIT"
+	ErrAuth               ErrorClass = "AUTH"
+	ErrBilling            ErrorClass = "BILLING"
+	ErrModelUnavailable   ErrorClass = "MODEL_UNAVAILABLE"
+	ErrNetwork            ErrorClass = "NETWORK"
 	ErrProviderOverloaded ErrorClass = "PROVIDER_OVERLOADED"
-	ErrPermission        ErrorClass = "PERMISSION"
-	ErrWorkspace         ErrorClass = "WORKSPACE"
-	ErrContextLimit      ErrorClass = "CONTEXT_LIMIT"
-	ErrProcessCrash      ErrorClass = "PROCESS_CRASH"
-	ErrUserInterrupt     ErrorClass = "USER_INTERRUPT"
-	ErrUnknown           ErrorClass = "UNKNOWN"
+	ErrPermission         ErrorClass = "PERMISSION"
+	ErrWorkspace          ErrorClass = "WORKSPACE"
+	ErrContextLimit       ErrorClass = "CONTEXT_LIMIT"
+	ErrProcessCrash       ErrorClass = "PROCESS_CRASH"
+	ErrUserInterrupt      ErrorClass = "USER_INTERRUPT"
+	ErrUnknown            ErrorClass = "UNKNOWN"
 )
 
 // ClassifyClaudeStopFailure maps a Claude StopFailure error type to the

@@ -51,7 +51,7 @@ func Run(provider string) int {
 func emitBlockDecision() {
 	out := map[string]any{
 		"decision": "block",
-		"reason": "Before ending this managed run, finish any remaining work. Then end your final response with exactly one Agent Conductor result marker:\n<AC_RESULT>COMPLETE</AC_RESULT>\nor\n<AC_RESULT>BLOCKED: precise reason</AC_RESULT>",
+		"reason":   "Before ending this managed run, finish any remaining work. Then end your final response with exactly one Agent Conductor result marker:\n<AC_RESULT>COMPLETE</AC_RESULT>\nor\n<AC_RESULT>BLOCKED: precise reason</AC_RESULT>",
 	}
 	b, _ := json.Marshal(out)
 	fmt.Print(string(b))

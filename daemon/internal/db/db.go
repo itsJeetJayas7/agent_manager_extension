@@ -646,14 +646,14 @@ func (s *Store) DeleteProviderSession(provider, nativeID string) error {
 
 // QuotaWindowRow mirrors the normalized quota model.
 type QuotaWindowRow struct {
-	Provider     string  `json:"provider"`
-	WindowID     string  `json:"windowId"`
-	Name         string  `json:"name"`
-	UsedPercent  float64 `json:"usedPercent"`
-	ResetsAt     string  `json:"resetsAt"`
-	Exhausted    bool    `json:"exhausted"`
-	Source       string  `json:"source"`
-	Confidence   string  `json:"confidence"`
+	Provider    string  `json:"provider"`
+	WindowID    string  `json:"windowId"`
+	Name        string  `json:"name"`
+	UsedPercent float64 `json:"usedPercent"`
+	ResetsAt    string  `json:"resetsAt"`
+	Exhausted   bool    `json:"exhausted"`
+	Source      string  `json:"source"`
+	Confidence  string  `json:"confidence"`
 }
 
 // UpsertQuotaWindow records one quota observation.
@@ -773,13 +773,13 @@ func (s *Store) GetSecretVersion(id int64) (*SecretVersion, error) {
 
 // WorktreeRecord tracks created worktrees.
 type WorktreeRecord struct {
-	ID        int64
-	BatchID   string
-	RunID     string
-	Path      string
-	Branch    string
-	Kind      string // card | integration
-	Status    string // ACTIVE | PRESERVED | CLEANED
+	ID      int64
+	BatchID string
+	RunID   string
+	Path    string
+	Branch  string
+	Kind    string // card | integration
+	Status  string // ACTIVE | PRESERVED | CLEANED
 }
 
 // AddWorktree records a worktree.

@@ -22,15 +22,15 @@ import (
 // Subscription mode by default: ANTHROPIC_API_KEY is stripped from the child
 // environment so runs bill against the user's Claude subscription.
 type Claude struct {
-	mu        sync.Mutex
-	binPath   string
-	hooks     *HookBus
-	log       *logging.Logger
-	selfBin   string // path to agent-conductor binary used by hook bridge
+	mu         sync.Mutex
+	binPath    string
+	hooks      *HookBus
+	log        *logging.Logger
+	selfBin    string // path to agent-conductor binary used by hook bridge
 	socketPath string // daemon socket the hook bridge forwards to
-	apiMode   bool   // advanced opt-in to keep ANTHROPIC_API_KEY
-	effortOK  *bool  // capability cache for --effort
-	running   map[string]*claudeRun
+	apiMode    bool   // advanced opt-in to keep ANTHROPIC_API_KEY
+	effortOK   *bool  // capability cache for --effort
+	running    map[string]*claudeRun
 }
 
 type claudeRun struct {

@@ -53,7 +53,7 @@ func TestRunLifecyclePersistence(t *testing.T) {
 	if err := s.TransitionRun("run1", model.StateRunning, nil, nil); err == nil {
 		t.Fatal("expected illegal transition error")
 	}
-	if err := s.TransitionRun("run1", model.StatePreparing, nil, nil, ); err != nil {
+	if err := s.TransitionRun("run1", model.StatePreparing, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.TransitionRun("run1", model.StateStarting, nil, nil); err != nil {

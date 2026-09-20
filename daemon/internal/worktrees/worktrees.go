@@ -207,9 +207,9 @@ func (m *Manager) MergeBranch(integrationDir, branch string) error {
 
 // ApplyOptions guard final application to the user's original branch.
 type ApplyOptions struct {
-	Repo             string
-	OriginalBranch   string
-	OriginalCommit   string
+	Repo              string
+	OriginalBranch    string
+	OriginalCommit    string
 	IntegrationBranch string
 }
 

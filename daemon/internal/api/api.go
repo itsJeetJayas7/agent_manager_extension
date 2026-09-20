@@ -30,12 +30,12 @@ const ProtocolVersion = 1
 
 // Paths computes daemon filesystem locations from a root (~/.agent-conductor).
 type Paths struct {
-	Root     string
-	Socket   string
-	Token    string
-	DB       string
-	Key      string
-	Logs     string
+	Root      string
+	Socket    string
+	Token     string
+	DB        string
+	Key       string
+	Logs      string
 	Worktrees string
 }
 
@@ -67,9 +67,9 @@ type Server struct {
 	clients   map[net.Conn]*clientConn
 	startedAt time.Time
 
-	capsMu      sync.Mutex
-	capsCache   map[string]providers.Caps
-	capsAt      time.Time
+	capsMu    sync.Mutex
+	capsCache map[string]providers.Caps
+	capsAt    time.Time
 }
 
 const capsTTL = 30 * time.Second
@@ -237,10 +237,10 @@ func (s *Server) handle(conn net.Conn) {
 		}
 		var req struct {
 			Protocol int             `json:"protocol"`
-			ID        json.RawMessage `json:"id"`
-			Method    string          `json:"method"`
-			Auth      string          `json:"auth"`
-			Params    json.RawMessage `json:"params"`
+			ID       json.RawMessage `json:"id"`
+			Method   string          `json:"method"`
+			Auth     string          `json:"auth"`
+			Params   json.RawMessage `json:"params"`
 		}
 		if err := json.Unmarshal(line, &req); err != nil {
 			s.reply(writeMsg, nil, nil, map[string]string{"code": "BAD_JSON", "message": err.Error()})
@@ -364,8 +364,8 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		return map[string]any{"ok": true}, nil
 	case "reorderQueue":
 		var in struct {
-			RunID        string `json:"runId"`
-			BeforeRunID  string `json:"beforeRunId"`
+			RunID       string `json:"runId"`
+			BeforeRunID string `json:"beforeRunId"`
 		}
 		json.Unmarshal(params, &in)
 		if err := s.conductor.ReorderQueue(in.RunID, in.BeforeRunID); err != nil {
@@ -383,14 +383,18 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		return map[string]any{"ok": true}, nil
 	case "cancelRun":
-		var in struct{ RunID string `json:"runId"` }
+		var in struct {
+			RunID string `json:"runId"`
+		}
 		json.Unmarshal(params, &in)
 		if err := s.conductor.CancelRun(in.RunID); err != nil {
 			return nil, e("CANCEL", err.Error())
 		}
 		return map[string]any{"ok": true}, nil
 	case "retryRun":
-		var in struct{ RunID string `json:"runId"` }
+		var in struct {
+			RunID string `json:"runId"`
+		}
 		json.Unmarshal(params, &in)
 		if err := s.conductor.RetryRun(in.RunID); err != nil {
 			return nil, e("RETRY", err.Error())
@@ -407,7 +411,9 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		return map[string]any{"ok": true}, nil
 	case "skipRun":
-		var in struct{ RunID string `json:"runId"` }
+		var in struct {
+			RunID string `json:"runId"`
+		}
 		json.Unmarshal(params, &in)
 		if err := s.conductor.SkipRun(in.RunID); err != nil {
 			return nil, e("SKIP", err.Error())
@@ -415,7 +421,7 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		return map[string]any{"ok": true}, nil
 	case "updateRun":
 		var in struct {
-			RunID string `json:"runId"`
+			RunID string                    `json:"runId"`
 			Run   scheduler.EnqueueRunInput `json:"run"`
 		}
 		json.Unmarshal(params, &in)
@@ -424,7 +430,9 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		return map[string]any{"ok": true}, nil
 	case "markComplete":
-		var in struct{ RunID string `json:"runId"` }
+		var in struct {
+			RunID string `json:"runId"`
+		}
 		json.Unmarshal(params, &in)
 		if err := s.store.TransitionRun(in.RunID, model.StateCompleted, &model.RunEvent{Type: model.EventRunCompleted}, func(x *model.Run) {
 			x.FinalOutcome = "COMPLETE"
@@ -445,7 +453,9 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 	case "getSettings":
 		return s.conductor.Settings(), nil
 	case "updateSecretBlock":
-		var in struct{ Text string `json:"text"` }
+		var in struct {
+			Text string `json:"text"`
+		}
 		json.Unmarshal(params, &in)
 		if _, err := s.conductor.UpdateSecretBlock(in.Text); err != nil {
 			return nil, e("SECRET", err.Error())
@@ -463,7 +473,9 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		return map[string]any{"ok": true}, nil
 	case "trustWorkspace":
-		var in struct{ Path string `json:"path"` }
+		var in struct {
+			Path string `json:"path"`
+		}
 		json.Unmarshal(params, &in)
 		if in.Path == "" {
 			return nil, e("BAD_PARAMS", "path required")
@@ -481,7 +493,9 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		return map[string]any{"ok": true}, nil
 	case "revealEffectivePrompt":
-		var in struct{ RunID string `json:"runId"` }
+		var in struct {
+			RunID string `json:"runId"`
+		}
 		json.Unmarshal(params, &in)
 		text, err := s.conductor.EffectivePromptForRun(in.RunID)
 		if err != nil {
@@ -503,7 +517,9 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		return map[string]any{"ok": true}, nil
 	case "applyBatch":
-		var in struct{ BatchID string `json:"batchId"` }
+		var in struct {
+			BatchID string `json:"batchId"`
+		}
 		json.Unmarshal(params, &in)
 		out, err := s.conductor.ApplyBatchToBranch(in.BatchID)
 		if err != nil {
@@ -511,14 +527,18 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		return map[string]any{"output": out}, nil
 	case "cleanupWorktrees":
-		var in struct{ BatchID string `json:"batchId"` }
+		var in struct {
+			BatchID string `json:"batchId"`
+		}
 		json.Unmarshal(params, &in)
 		if err := s.conductor.CleanupWorktrees(in.BatchID); err != nil {
 			return nil, e("CLEANUP", err.Error())
 		}
 		return map[string]any{"ok": true}, nil
 	case "batchReport":
-		var in struct{ BatchID string `json:"batchId"` }
+		var in struct {
+			BatchID string `json:"batchId"`
+		}
 		json.Unmarshal(params, &in)
 		rep, err := s.conductor.CopyBatchReport(in.BatchID)
 		if err != nil {
@@ -526,7 +546,9 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		return map[string]any{"report": rep}, nil
 	case "getBatchDetail":
-		var in struct{ BatchID string `json:"batchId"` }
+		var in struct {
+			BatchID string `json:"batchId"`
+		}
 		json.Unmarshal(params, &in)
 		return s.batchDetail(in.BatchID)
 	case "getRunEvents":
@@ -556,7 +578,7 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 	case "daemonHealth":
 		return map[string]any{
 			"version": s.version, "pid": os.Getpid(),
-			"uptime": time.Since(s.startedAt).String(),
+			"uptime":   time.Since(s.startedAt).String(),
 			"protocol": ProtocolVersion,
 		}, nil
 	case "goodbye":
@@ -585,16 +607,16 @@ func (s *Server) snapshot() map[string]any {
 		ext[p] = sessions
 	}
 	return map[string]any{
-		"daemon":     map[string]any{"version": s.version, "pid": os.Getpid(), "protocol": ProtocolVersion, "uptime": time.Since(s.startedAt).String()},
-		"batches":    batches,
-		"runs":       runs,
-		"rows":       rows,
-		"external":   ext,
-		"quota":      s.quotaState(),
-		"providers":  s.capabilities(),
-		"settings":   s.conductor.Settings(),
-		"paused":     s.conductor.Settings().Paused,
-		"host":       hostInfo(),
+		"daemon":    map[string]any{"version": s.version, "pid": os.Getpid(), "protocol": ProtocolVersion, "uptime": time.Since(s.startedAt).String()},
+		"batches":   batches,
+		"runs":      runs,
+		"rows":      rows,
+		"external":  ext,
+		"quota":     s.quotaState(),
+		"providers": s.capabilities(),
+		"settings":  s.conductor.Settings(),
+		"paused":    s.conductor.Settings().Paused,
+		"host":      hostInfo(),
 	}
 }
 
@@ -651,9 +673,9 @@ func (s *Server) quotaState() map[string]any {
 		now := time.Now().UTC()
 		blocked, ne, ht, missing := s.guardian.Blocked(p, now)
 		st := map[string]any{
-			"windows":       ws,
-			"blocked":       blocked,
-			"confidence":    quota.Confidence(ws),
+			"windows":    ws,
+			"blocked":    blocked,
+			"confidence": quota.Confidence(ws),
 		}
 		if ht {
 			st["nextEligibleAt"] = ne.UTC().Format(time.RFC3339)
@@ -701,8 +723,8 @@ func (s *Server) batchDetail(batchID string) (any, *apiError) {
 
 func (s *Server) diagnostics() map[string]any {
 	diag := map[string]any{
-		"daemon":  map[string]any{"version": s.version, "pid": os.Getpid(), "socket": s.paths.Socket},
-		"host":    hostInfo(),
+		"daemon": map[string]any{"version": s.version, "pid": os.Getpid(), "socket": s.paths.Socket},
+		"host":   hostInfo(),
 	}
 	// Bounded: a hung `claude --help` or `codex app-server` must not wedge
 	// diagnostics indefinitely. capabilities() carries a 15s per-probe timeout

@@ -21,33 +21,33 @@ import (
 
 // Settings are conductor tunables persisted in the settings table.
 type Settings struct {
-	MaxTotal              int      `json:"maxTotalRuns"`
-	MaxClaude             int      `json:"maxClaudeRuns"`
-	MaxCodex              int      `json:"maxCodexRuns"`
-	AnchorCodexEnabled    bool     `json:"anchorCodexEnabled"`
-	AnchorClaudeEnabled   bool     `json:"anchorClaudeEnabled"`
-	AnchorModelCodex      string   `json:"anchorModelCodex"`
-	AnchorModelClaude     string   `json:"anchorModelClaude"`
-	ClaudeWeeklyResetUTC  string   `json:"claudeWeeklyResetUtc"`
-	ClaudePlanModel       string   `json:"claudePlanModel"`
-	ClaudePlanEffort      string   `json:"claudePlanEffort"`
-	ClaudeBuildModel      string   `json:"claudeBuildModel"`
-	ClaudeBuildEffort     string   `json:"claudeBuildEffort"`
-	ClaudeAuditModel      string   `json:"claudeAuditModel"`
-	ClaudeAuditEffort     string   `json:"claudeAuditEffort"`
-	CodexPlanModel        string   `json:"codexPlanModel"`
-	CodexPlanEffort       string   `json:"codexPlanEffort"`
-	CodexBuildModel       string   `json:"codexBuildModel"`
-	CodexBuildEffort      string   `json:"codexBuildEffort"`
-	CodexAuditModel       string   `json:"codexAuditModel"`
-	CodexAuditEffort      string   `json:"codexAuditEffort"`
-	AuditEnabled          bool     `json:"auditEnabled"`
-	MaxAuditCycles        int      `json:"maxAuditCycles"`
-	MaxVerifyFixCycles    int      `json:"maxVerifyFixCycles"`
-	VerificationCommands  []string `json:"verificationCommands"`
-	ClaudeAPIMode         bool     `json:"claudeApiMode"`
-	FIFOBlockOnExternal   bool     `json:"fifoBlockOnExternal"`
-	Paused                bool     `json:"paused"`
+	MaxTotal             int      `json:"maxTotalRuns"`
+	MaxClaude            int      `json:"maxClaudeRuns"`
+	MaxCodex             int      `json:"maxCodexRuns"`
+	AnchorCodexEnabled   bool     `json:"anchorCodexEnabled"`
+	AnchorClaudeEnabled  bool     `json:"anchorClaudeEnabled"`
+	AnchorModelCodex     string   `json:"anchorModelCodex"`
+	AnchorModelClaude    string   `json:"anchorModelClaude"`
+	ClaudeWeeklyResetUTC string   `json:"claudeWeeklyResetUtc"`
+	ClaudePlanModel      string   `json:"claudePlanModel"`
+	ClaudePlanEffort     string   `json:"claudePlanEffort"`
+	ClaudeBuildModel     string   `json:"claudeBuildModel"`
+	ClaudeBuildEffort    string   `json:"claudeBuildEffort"`
+	ClaudeAuditModel     string   `json:"claudeAuditModel"`
+	ClaudeAuditEffort    string   `json:"claudeAuditEffort"`
+	CodexPlanModel       string   `json:"codexPlanModel"`
+	CodexPlanEffort      string   `json:"codexPlanEffort"`
+	CodexBuildModel      string   `json:"codexBuildModel"`
+	CodexBuildEffort     string   `json:"codexBuildEffort"`
+	CodexAuditModel      string   `json:"codexAuditModel"`
+	CodexAuditEffort     string   `json:"codexAuditEffort"`
+	AuditEnabled         bool     `json:"auditEnabled"`
+	MaxAuditCycles       int      `json:"maxAuditCycles"`
+	MaxVerifyFixCycles   int      `json:"maxVerifyFixCycles"`
+	VerificationCommands []string `json:"verificationCommands"`
+	ClaudeAPIMode        bool     `json:"claudeApiMode"`
+	FIFOBlockOnExternal  bool     `json:"fifoBlockOnExternal"`
+	Paused               bool     `json:"paused"`
 }
 
 // DefaultSettings returns production defaults.
@@ -79,14 +79,14 @@ type Verifier interface {
 
 // Conductor is the scheduling engine.
 type Conductor struct {
-	store     *db.Store
-	vault     *vault.Vault
-	registry  *providers.Registry
-	guardian  *quota.Guardian
-	wt        *worktrees.Manager
-	hookBus   *providers.HookBus
-	log       *logging.Logger
-	verifier  Verifier
+	store    *db.Store
+	vault    *vault.Vault
+	registry *providers.Registry
+	guardian *quota.Guardian
+	wt       *worktrees.Manager
+	hookBus  *providers.HookBus
+	log      *logging.Logger
+	verifier Verifier
 
 	mu      sync.Mutex
 	wake    chan struct{}

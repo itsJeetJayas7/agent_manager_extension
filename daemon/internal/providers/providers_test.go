@@ -120,7 +120,7 @@ func TestHookBusFanout(t *testing.T) {
 func TestCodexRateLimitParsing(t *testing.T) {
 	payload := map[string]any{
 		"rateLimits": map[string]any{
-			"primary": map[string]any{"usedPercent": 100.0, "resetsAt": "2026-01-01T05:00:00Z", "windowMinutes": 300.0, "isAtLimit": true},
+			"primary":   map[string]any{"usedPercent": 100.0, "resetsAt": "2026-01-01T05:00:00Z", "windowMinutes": 300.0, "isAtLimit": true},
 			"secondary": map[string]any{"usedPercent": 42.0, "resetsAt": "2026-01-05T00:00:00Z", "windowMinutes": 10080.0},
 		},
 	}

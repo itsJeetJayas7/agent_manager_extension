@@ -61,12 +61,12 @@ func (c *Conductor) schedule(ctx context.Context) error {
 }
 
 type slotState struct {
-	counts       map[string]int
-	total        int
-	queueActive  int // active runs from implicit queue batches
-	busyExt      map[string]*model.ProviderSession
-	s            Settings
-	now          time.Time
+	counts        map[string]int
+	total         int
+	queueActive   int // active runs from implicit queue batches
+	busyExt       map[string]*model.ProviderSession
+	s             Settings
+	now           time.Time
 	batchImplicit bool
 }
 
