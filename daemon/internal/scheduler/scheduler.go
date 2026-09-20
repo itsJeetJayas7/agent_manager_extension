@@ -7,6 +7,7 @@ package scheduler
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agent-conductor/internal/db"
@@ -94,7 +95,10 @@ type Conductor struct {
 	subsMu  sync.Mutex
 	subs    []chan OutEvent
 	cancels map[string]context.CancelFunc
-	clock   func() time.Time
+
+	// clock is swapped by tests (virtual clock) while the scheduling loop and
+	// every provider callback read it, so it cannot be a plain field.
+	clock atomic.Pointer[clockFunc]
 
 	anchorMu sync.Mutex
 
@@ -109,8 +113,8 @@ func New(store *db.Store, vv *vault.Vault, reg *providers.Registry, g *quota.Gua
 		hookBus: hookBus, log: log, verifier: verifier,
 		wake: make(chan struct{}, 1), stopCh: make(chan struct{}),
 		cancels: map[string]context.CancelFunc{},
-		clock:   time.Now,
 	}
+	c.SetClock(time.Now)
 	c.settings = DefaultSettings()
 	if s := c.loadSettings(); s != nil {
 		c.settings = *s
@@ -118,11 +122,22 @@ func New(store *db.Store, vv *vault.Vault, reg *providers.Registry, g *quota.Gua
 	return c
 }
 
+// clockFunc is the swappable time source.
+type clockFunc func() time.Time
+
 // Now returns the (possibly virtual) clock.
-func (c *Conductor) Now() time.Time { return c.clock().UTC() }
+func (c *Conductor) Now() time.Time {
+	if fn := c.clock.Load(); fn != nil {
+		return (*fn)().UTC()
+	}
+	return time.Now().UTC()
+}
 
 // SetClock installs a virtual clock (tests/dev fake quota clock).
-func (c *Conductor) SetClock(fn func() time.Time) { c.clock = fn }
+func (c *Conductor) SetClock(fn func() time.Time) {
+	f := clockFunc(fn)
+	c.clock.Store(&f)
+}
 
 // Poke wakes the scheduling loop.
 func (c *Conductor) Poke() {

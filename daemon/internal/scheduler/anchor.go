@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"strings"
+	"sync"
 	"time"
 
 	"agent-conductor/internal/model"
@@ -67,18 +69,19 @@ func (c *Conductor) onHookPayload(p providers.HookPayload) {
 	if p.Provider == model.ProviderClaude && p.Event == "Notification" {
 		msg := p.NotificationMessage
 		nt := p.NotificationType
-		if containsAny(nt+msg, "rate limit", "limit reached", "usage limit", "quota") {
+		if containsAny(strings.ToLower(nt+" "+msg), "rate limit", "limit reached", "usage limit", "quota") {
 			c.observeQuota(model.ProviderClaude, claudeQuotaFromNotification(nt, msg, c.Now()))
 		}
 	}
 }
 
+// containsAny reports whether s contains any of subs. Needles are lower-case
+// by convention, so every caller must lower-case s first — three call sites
+// did not, and therefore never matched anything.
 func containsAny(s string, subs ...string) bool {
 	for _, sub := range subs {
-		for i := 0; i+len(sub) <= len(s); i++ {
-			if s[i:i+len(sub)] == sub {
-				return true
-			}
+		if strings.Contains(s, sub) {
+			return true
 		}
 	}
 	return false
@@ -87,7 +90,7 @@ func containsAny(s string, subs ...string) bool {
 // claudeQuotaFromNotification derives low-confidence windows from
 // notification text. Confidence never claimed as exact.
 func claudeQuotaFromNotification(nt, msg string, now time.Time) []providers.QuotaWindow {
-	low := string(nt + " " + msg)
+	low := strings.ToLower(nt + " " + msg)
 	var ws []providers.QuotaWindow
 	if containsAny(low, "weekly", "week") {
 		ws = append(ws, providers.QuotaWindow{
@@ -197,13 +200,15 @@ func (c *Conductor) tryAnchor(ctx context.Context, provider string, s Settings, 
 	if _, claimed, _ := c.store.GetServiceState("anchor."+provider+"."+windowKey); claimed {
 		return
 	}
+	// Resolve the adapter BEFORE claiming: the claim is exactly-once, so
+	// claiming first and then finding no adapter burned the window forever.
+	adapter, okA := c.registry.Get(provider)
+	if !okA {
+		return
+	}
 	// exactly-once claim (unique provider+window_reset)
 	ok, err := c.store.ClaimAnchor(provider, windowKey, newID("anchor"))
 	if err != nil || !ok {
-		return
-	}
-	adapter, okA := c.registry.Get(provider)
-	if !okA {
 		return
 	}
 	modelID := s.AnchorModelCodex
@@ -215,43 +220,39 @@ func (c *Conductor) tryAnchor(ctx context.Context, provider string, s Settings, 
 	}
 	c.log.Infof("window anchor firing for %s (window reset %s, model %s)", provider, windowReset.Format(time.RFC3339), modelID)
 
-	done := make(chan providers.Event, 8)
+	// The adapter callback keeps firing after the turn completes (Codex emits
+	// account/rateLimits/updated freely), so completion is handled inline under
+	// a sync.Once instead of by a second goroutine that closes the channel out
+	// from under the still-live producer — which panicked the whole daemon with
+	// "send on closed channel".
+	var once sync.Once
+	complete := func(sessionID string) {
+		c.store.CompleteAnchor(provider, windowKey, sessionID)
+		c.log.Infof("window anchor completed for %s", provider)
+		// refresh quota right after anchoring
+		cctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if ws2, err := adapter.ProbeQuota(cctx); err == nil {
+			c.observeQuota(provider, ws2)
+		}
+	}
 	go func() {
 		spec := providers.ExecSpec{
-			RunID:     newID("anchor"),
-			Provider:  provider,
-			Model:     modelID,
-			Effort:    "low",
+			RunID:      newID("anchor"),
+			Provider:   provider,
+			Model:      modelID,
+			Effort:     "low",
 			Permission: "plan", // anchor must not touch anything
-			Cwd:       homeDirOr("/tmp"),
-			Prompt:    "Reply exactly: OK",
-			Title:     "[AC] Window Anchor",
+			Cwd:        homeDirOr("/tmp"),
+			Prompt:     "Reply exactly: OK",
+			Title:      "[AC] Window Anchor",
 		}
 		adapter.Execute(ctx, spec, func(ev providers.Event) {
-			select {
-			case done <- ev:
-			default:
+			if ev.Kind == providers.EvTurnCompleted {
+				sessionID := ev.SessionID
+				once.Do(func() { complete(sessionID) })
 			}
 		})
-	}()
-	go func() {
-		for ev := range done {
-			if ev.Kind == providers.EvTurnCompleted {
-				session := ev.SessionID
-				c.store.CompleteAnchor(provider, windowKey, session)
-				c.log.Infof("window anchor completed for %s", provider)
-				// refresh quota right after anchoring
-				if a, ok := c.registry.Get(provider); ok {
-					cctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-					if ws2, err := a.ProbeQuota(cctx); err == nil {
-						c.observeQuota(provider, ws2)
-					}
-					cancel()
-				}
-				close(done)
-				return
-			}
-		}
 	}()
 }
 
@@ -272,9 +273,7 @@ func (c *Conductor) pickAnchorModel(provider string) string {
 			if m.Hidden {
 				continue
 			}
-			id := m.ID
-			name := m.Name
-			lower := id + " " + name
+			lower := strings.ToLower(m.ID + " " + m.Name)
 			if containsAny(lower, want) {
 				return m.ID
 			}

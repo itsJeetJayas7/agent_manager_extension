@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -73,9 +74,15 @@ type Server struct {
 
 const capsTTL = 30 * time.Second
 
+// clientConn tracks one connection's writer channel and its lifetime.
+// `out` is never closed: the subscription goroutine may still be selecting on
+// it, and closing a channel from anywhere but the sole sender panics the
+// daemon. Shutting `done` instead stops every writer cleanly.
 type clientConn struct {
-	conn net.Conn
-	out  chan any
+	conn     net.Conn
+	out      chan any
+	done     chan struct{}
+	shutdown func()
 }
 
 // NewServer wires the API server.
@@ -157,8 +164,8 @@ func (s *Server) Close() {
 		ln.Close()
 	}
 	for c, cc := range clients {
+		cc.shutdown()
 		c.Close()
-		close(cc.out)
 	}
 	os.Remove(s.paths.Socket)
 }
@@ -168,9 +175,23 @@ func (s *Server) handle(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 	out := make(chan any, 256)
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	shutdown := func() { closeOnce.Do(func() { close(done) }) }
+	defer shutdown()
+
+	// One subscription per connection, unsubscribed when the connection ends.
+	// Previously every reconnect leaked a goroutine plus a 256-slot channel
+	// that the conductor kept fanning out to forever.
+	var subCh chan scheduler.OutEvent
+	defer func() {
+		if subCh != nil {
+			s.conductor.Unsubscribe(subCh)
+		}
+	}()
 
 	s.mu.Lock()
-	s.clients[conn] = &clientConn{conn: conn, out: out}
+	s.clients[conn] = &clientConn{conn: conn, out: out, done: done, shutdown: shutdown}
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -196,8 +217,13 @@ func (s *Server) handle(conn net.Conn) {
 	authed := false
 
 	go func() {
-		for msg := range out {
-			writeMsg(msg)
+		for {
+			select {
+			case <-done:
+				return
+			case msg := <-out:
+				writeMsg(msg)
+			}
 		}
 	}()
 
@@ -238,7 +264,7 @@ func (s *Server) handle(conn net.Conn) {
 				s.reply(writeMsg, req.ID, nil, map[string]string{"code": "UNAUTHORIZED", "message": "send hello with auth token first"})
 				return
 			}
-			if auth != want {
+			if subtle.ConstantTimeCompare([]byte(auth), []byte(want)) != 1 {
 				s.reply(writeMsg, req.ID, nil, map[string]string{"code": "UNAUTHORIZED", "message": "invalid token"})
 				return
 			}
@@ -247,12 +273,24 @@ func (s *Server) handle(conn net.Conn) {
 			continue
 		}
 		if req.Method == "subscribe" {
-			ch := s.conductor.Subscribe()
-			go func() {
-				for ev := range ch {
-					s.send(out, map[string]any{"event": ev.Type, "payload": ev.Payload})
-				}
-			}()
+			// Idempotent: a repeated subscribe on one connection used to
+			// multiply the fan-out instead of being a no-op.
+			if subCh == nil {
+				subCh = s.conductor.Subscribe()
+				go func(ch chan scheduler.OutEvent) {
+					for {
+						select {
+						case <-done:
+							return
+						case ev, ok := <-ch:
+							if !ok {
+								return
+							}
+							s.send(out, done, map[string]any{"event": ev.Type, "payload": ev.Payload})
+						}
+					}
+				}(subCh)
+			}
 			s.reply(writeMsg, req.ID, map[string]any{"ok": true}, nil)
 			continue
 		}
@@ -265,10 +303,12 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-func (s *Server) send(out chan any, msg any) {
+// send never blocks and never writes to a connection that has gone away.
+func (s *Server) send(out chan any, done <-chan struct{}, msg any) {
 	select {
+	case <-done:
 	case out <- msg:
-	default:
+	default: // slow consumer: drop rather than stall the conductor
 	}
 }
 
@@ -341,7 +381,7 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		if err := s.conductor.ResumeScheduler(); err != nil {
 			return nil, e("RESUME", err.Error())
 		}
-		return map[string]any{"ok": any(true)}, nil
+		return map[string]any{"ok": true}, nil
 	case "cancelRun":
 		var in struct{ RunID string `json:"runId"` }
 		json.Unmarshal(params, &in)
@@ -529,10 +569,6 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 // snapshot builds the full UI state.
 func (s *Server) snapshot() map[string]any {
 	batches, _ := s.store.ListBatches(100)
-	type runOut struct {
-		*model.Run
-		Events int64 `json:"eventCount"`
-	}
 	var runs []*model.Run
 	for _, b := range batches {
 		brs, _ := s.store.ListRunsByBatch(b.ID)
@@ -668,11 +704,10 @@ func (s *Server) diagnostics() map[string]any {
 		"daemon":  map[string]any{"version": s.version, "pid": os.Getpid(), "socket": s.paths.Socket},
 		"host":    hostInfo(),
 	}
-	caps := map[string]providers.Caps{}
-	for _, a := range s.registry.All() {
-		caps[a.Name()] = a.Capabilities(contextBG())
-	}
-	diag["providers"] = caps
+	// Bounded: a hung `claude --help` or `codex app-server` must not wedge
+	// diagnostics indefinitely. capabilities() carries a 15s per-probe timeout
+	// and a short cache.
+	diag["providers"] = s.capabilities()
 	diag["quota"] = s.quotaState()
 	ext := map[string][]*model.ProviderSession{}
 	for _, p := range []string{model.ProviderClaude, model.ProviderCodex} {

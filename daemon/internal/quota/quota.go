@@ -4,13 +4,21 @@
 package quota
 
 import (
+	"sync"
 	"time"
 
 	"agent-conductor/internal/providers"
 )
 
 // Guardian computes eligibility from the freshest provider observations.
+//
+// It is read and written concurrently from the scheduler loop, provider event
+// callbacks, the API server's snapshot handlers and startup restore, so every
+// access is guarded. Without the mutex this produced "concurrent map read and
+// map write", which is a fatal, unrecoverable runtime error rather than a
+// warning.
 type Guardian struct {
+	mu      sync.RWMutex
 	windows map[string][]providers.QuotaWindow // provider -> windows
 }
 
@@ -27,6 +35,8 @@ func (g *Guardian) Observe(provider string, ws []providers.QuotaWindow, now time
 		}
 		kept = append(kept, w)
 	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.windows[provider] = kept
 }
 
@@ -35,8 +45,9 @@ func (g *Guardian) Observe(provider string, ws []providers.QuotaWindow, now time
 // exhausted required window); a window with no reset timestamp yields
 // hasTime=false (caller must not invent one).
 func (g *Guardian) Blocked(provider string, now time.Time) (blocked bool, nextEligible time.Time, hasTime bool, missingReset bool) {
+	g.mu.RLock()
 	ws := g.windows[provider]
-	any := false
+	g.mu.RUnlock()
 	for _, w := range ws {
 		if !w.Exhausted {
 			continue
@@ -46,7 +57,6 @@ func (g *Guardian) Blocked(provider string, now time.Time) (blocked bool, nextEl
 			continue
 		}
 		blocked = true
-		any = true
 		if !w.HasReset {
 			missingReset = true
 			continue
@@ -58,12 +68,23 @@ func (g *Guardian) Blocked(provider string, now time.Time) (blocked bool, nextEl
 			nextEligible = w.ResetsAt
 		}
 	}
-	_ = any
 	return blocked, nextEligible, hasTime, missingReset
 }
 
-// Windows returns current observations for a provider.
-func (g *Guardian) Windows(provider string) []providers.QuotaWindow { return g.windows[provider] }
+// Windows returns a copy of the current observations for a provider. Callers
+// range over the result outside the lock, so handing out the live slice would
+// race with the next Observe.
+func (g *Guardian) Windows(provider string) []providers.QuotaWindow {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	ws := g.windows[provider]
+	if len(ws) == 0 {
+		return nil
+	}
+	out := make([]providers.QuotaWindow, len(ws))
+	copy(out, ws)
+	return out
+}
 
 // Confidence summarizes observation quality for display.
 func Confidence(ws []providers.QuotaWindow) string {
