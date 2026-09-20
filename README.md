@@ -164,6 +164,17 @@ AC_MOCK=1 agent-conductor serve   # daemon with a fake provider (no real spend)
 The build supports `darwin/arm64`, `darwin/amd64`, `linux/amd64`,
 `linux/arm64` (`AC_RELEASE=1 bash scripts/build-daemon.sh`).
 
+## One daemon per state directory
+
+Exactly one daemon serves `~/.agent-conductor` at a time, enforced with an
+advisory lock. A second `agent-conductor serve` against the same root exits
+immediately and says who holds it — it does not take over the socket while the
+first keeps scheduling. Use `AC_ROOT` to run a genuinely separate instance.
+
+VS Code's **Restricted Mode** disables Agent Conductor: it runs coding agents
+that modify files, so it declares that it cannot work in an untrusted folder.
+Trust the folder and it activates.
+
 ## Known limitations (honest list)
 
 - Claude quota windows are learned from the first managed run: the

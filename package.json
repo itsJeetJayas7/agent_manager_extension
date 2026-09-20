@@ -15,7 +15,9 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -184,5 +186,11 @@
     "queue",
     "orchestration",
     "automation"
-  ]
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Agent Conductor runs coding agents that read and modify files in this folder."
+    }
+  }
 }

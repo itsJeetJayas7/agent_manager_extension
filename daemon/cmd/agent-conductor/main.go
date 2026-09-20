@@ -98,6 +98,16 @@ func serve(mock bool) error {
 		}
 	}
 
+	// Exactly one daemon per root. A second one used to steal the socket while
+	// the first kept scheduling against the same database.
+	lock, err := api.AcquireInstanceLock(paths.Root)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "agent-conductor:", err)
+		fmt.Fprintln(os.Stderr, "the running daemon is already serving this root; nothing to do.")
+		return nil
+	}
+	defer lock.Release()
+
 	redactor := logging.NewRedactor()
 	log, err := logging.New(filepath.Join(paths.Logs, "daemon.jsonl"), logging.Info, redactor)
 	if err != nil {

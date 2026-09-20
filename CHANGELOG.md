@@ -47,6 +47,22 @@ further. Full detail is in the commit series; the headlines:
   `~/.codex/config.toml`, destroying comments and formatting and emitting
   invalid TOML for datetimes.
 
+### Fixed — found by installing the VSIX into a real VS Code
+
+- The daemon had **no single-instance guard**. A second one removed the socket
+  file and listened in the first one's place, so the first became unreachable
+  while its scheduler kept running: two schedulers on one database, and the
+  older one started runs while the queue was paused. There is now an advisory
+  lock per state directory.
+- The extension re-spawned a daemon every 1.5 seconds, forever, whenever
+  connecting failed for a reason starting a daemon cannot fix. Spawns now
+  follow the reconnect backoff, and after five attempts it says so.
+- The extension only activated when the sidebar was opened, so the status bar
+  item, the reconnect loop and the away-summary notification never appeared on
+  their own. It activates on startup now.
+- It now declares that it does not support untrusted workspaces, so VS Code's
+  Restricted Mode explains itself instead of silently doing nothing.
+
 ### Added — manual pause with a continuation timer
 
 Hold the queue indefinitely or until a deadline. Live countdown from an

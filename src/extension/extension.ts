@@ -76,6 +76,8 @@ class ConductorExtension implements vscode.Disposable {
   private binaryProblemShown = false;
   private notifier: Notifier;
   private reportedAway = false;
+  private lastSpawnAt = 0;
+  private spawnAttempts = 0;
 
   constructor(private context: vscode.ExtensionContext) {
     this.statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
@@ -140,7 +142,18 @@ class ConductorExtension implements vscode.Disposable {
       this.scheduleReconnect();
       return;
     }
+    // Never spawn faster than the backoff. If connecting keeps failing for a
+    // reason starting a daemon cannot fix — an unreadable token, a socket in
+    // an unexpected place — the old code launched a fresh daemon every 1.5
+    // seconds, forever.
+    const sinceLastSpawn = Date.now() - this.lastSpawnAt;
+    if (sinceLastSpawn < this.reconnectDelay) {
+      this.scheduleReconnect();
+      return;
+    }
     try {
+      this.lastSpawnAt = Date.now();
+      this.spawnAttempts++;
       const env = { ...process.env };
       if (mockProviders()) {
         env.AC_MOCK = "1";
@@ -150,6 +163,18 @@ class ConductorExtension implements vscode.Disposable {
       this.scheduleReconnect(1500);
     } catch {
       this.scheduleReconnect(10000);
+    }
+    if (this.spawnAttempts === 5) {
+      void vscode.window
+        .showWarningMessage(
+          "Agent Conductor keeps starting the daemon but cannot connect to it.",
+          "Show diagnostics"
+        )
+        .then((c) => {
+          if (c === "Show diagnostics") {
+            void vscode.commands.executeCommand("agent-conductor.diagnostics");
+          }
+        });
     }
   }
 
@@ -202,6 +227,7 @@ class ConductorExtension implements vscode.Disposable {
     }
     this.reconnectDelay = RECONNECT_MIN_MS;
     this.binaryProblemShown = false;
+    this.spawnAttempts = 0;
     this.setStatus("idle", "Agent Conductor");
 
     client.onClose(() => {
