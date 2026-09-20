@@ -2,10 +2,19 @@
 // panels, daemon lifecycle, commands. The extension NEVER owns agent
 // processes; the persistent daemon does.
 import * as vscode from "vscode";
-import { DaemonClient } from "./daemonClient";
+import { DaemonClient, ProtocolMismatchError } from "./daemonClient";
 import { Snapshot } from "./protocol";
-import { resolveDaemonBinary, mockProviders, hostIndicator, verificationCommands } from "./configuration";
+import {
+  resolveDaemonBinary,
+  resolveDaemonBinaryDetailed,
+  DaemonBinaryResolution,
+  mockProviders,
+  hostIndicator,
+  verificationCommands,
+} from "./configuration";
 import { openClaudeSession, openCodexThread, openWorktreeWindow } from "./sessionOpeners";
+import { WEBVIEW_DIR, WEBVIEW_BUNDLE } from "../../shared/artifacts.cjs";
+import { webviewHtml } from "./webviewHtml";
 import { spawn, ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
@@ -18,25 +27,66 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
+/** Reconnect backoff: 1s doubling to a 30s ceiling. */
+const RECONNECT_MIN_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
+
+/**
+ * A webview plus its readiness state. Messages posted before the bundle has
+ * booted are dropped by VS Code, which is how `detailBatchId` went missing;
+ * we queue until the webview announces itself with `{type:"ready"}`.
+ */
+class WebviewTarget {
+  ready = false;
+  private queue: unknown[] = [];
+  constructor(readonly webview: vscode.Webview) {}
+
+  post(msg: unknown): void {
+    if (!this.ready) {
+      this.queue.push(msg);
+      return;
+    }
+    void this.webview.postMessage(msg);
+  }
+
+  markReady(): void {
+    this.ready = true;
+    const pending = this.queue;
+    this.queue = [];
+    for (const m of pending) {
+      void this.webview.postMessage(m);
+    }
+  }
+}
+
+type StatusKind = "offline" | "connecting" | "idle" | "running" | "paused" | "error";
+
 class ConductorExtension implements vscode.Disposable {
   private client: DaemonClient | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectDelay = RECONNECT_MIN_MS;
+  private disposed = false;
   private devDaemon: ChildProcess | null = null;
   private statusItem: vscode.StatusBarItem;
-  private panels = new Set<vscode.WebviewPanel>();
-  private sidebar?: vscode.WebviewView;
+  private panels = new Map<vscode.WebviewPanel, WebviewTarget>();
+  private sidebar?: WebviewTarget;
+  private lastSnapshot: Snapshot | null = null;
+  private binaryProblemShown = false;
 
   constructor(private context: vscode.ExtensionContext) {
     this.statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
     this.statusItem.command = "agent-conductor.open";
+    context.subscriptions.push(this.statusItem);
   }
 
   dispose() {
+    this.disposed = true;
     this.statusItem.dispose();
     this.devDaemon?.kill();
     this.client?.close();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
   }
 
@@ -51,20 +101,38 @@ class ConductorExtension implements vscode.Disposable {
   // ---- daemon lifecycle ----
 
   private async ensureDaemonAndConnect(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     try {
-      this.client = new DaemonClient();
-      await this.client.connect();
+      const client = new DaemonClient();
+      await client.connect();
+      this.client = client;
       this.onConnected();
-    } catch {
-      this.setStatus("Agent Conductor: daemon offline", true);
+    } catch (e) {
+      if (e instanceof ProtocolMismatchError) {
+        this.setStatus("error", "Agent Conductor: version mismatch");
+        this.pushToWebviews({ type: "daemonOffline", reason: "protocol", detail: e.message });
+        void vscode.window.showErrorMessage(e.message);
+        return; // retrying cannot help until one side is updated
+      }
+      this.setStatus("offline", "Agent Conductor: daemon offline");
       this.tryStartDaemon();
     }
   }
 
   private tryStartDaemon(): void {
-    const bin = resolveDaemonBinary(this.context);
-    if (!bin) {
-      this.pushToWebviews({ type: "daemonOffline", reason: "no-binary" });
+    const res = resolveDaemonBinaryDetailed(this.context);
+    if (!res.path) {
+      this.reportBinaryProblem(res);
+      this.pushToWebviews({
+        type: "daemonOffline",
+        reason: res.problem?.code ?? "no-binary",
+        detail: res.problem?.message,
+        remedy: res.problem?.remedy,
+      });
+      // Still retry slowly: the user may install the service meanwhile.
+      this.scheduleReconnect();
       return;
     }
     try {
@@ -72,55 +140,164 @@ class ConductorExtension implements vscode.Disposable {
       if (mockProviders()) {
         env.AC_MOCK = "1";
       }
-      const child = spawn(bin, ["serve"], {
-        env,
-        detached: true,
-        stdio: "ignore",
-      });
+      const child = spawn(res.path, ["serve"], { env, detached: true, stdio: "ignore" });
       child.unref();
-      // retry connection shortly after spawn
       this.scheduleReconnect(1500);
     } catch {
       this.scheduleReconnect(10000);
     }
   }
 
-  private scheduleReconnect(delayMs: number): void {
+  /** Tell the user exactly what is wrong and exactly what to run about it. */
+  private reportBinaryProblem(res: DaemonBinaryResolution): void {
+    if (this.binaryProblemShown || !res.problem) {
+      return;
+    }
+    this.binaryProblemShown = true;
+    const { message, remedy } = res.problem;
+    if (!remedy) {
+      void vscode.window.showErrorMessage(message);
+      return;
+    }
+    void vscode.window
+      .showErrorMessage(message, "Copy fix command", "Show details")
+      .then((choice) => {
+        if (choice === "Copy fix command") {
+          void vscode.env.clipboard.writeText(remedy);
+          void vscode.window.showInformationMessage(`Copied: ${remedy}`);
+        } else if (choice === "Show details") {
+          void vscode.commands.executeCommand("agent-conductor.diagnostics");
+        }
+      });
+  }
+
+  /** Exponential backoff, so a daemon crash self-heals instead of bricking the UI. */
+  private scheduleReconnect(delayMs?: number): void {
+    if (this.disposed) {
+      return;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
     }
-    this.reconnectTimer = setTimeout(() => void this.ensureDaemonAndConnect(), delayMs);
+    const delay = delayMs ?? this.reconnectDelay;
+    if (delayMs === undefined) {
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
+    }
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.ensureDaemonAndConnect();
+    }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   private onConnected(): void {
-    if (!this.client) {
+    const client = this.client;
+    if (!client) {
       return;
     }
-    this.setStatus("Agent Conductor", false);
-    // push verification commands setting to daemon
-    const cmds = verificationCommands();
-    void this.client.request("getSettings", {}).then((s: any) => {
-      if (cmds.length > 0 && JSON.stringify(s.verificationCommands ?? []) !== JSON.stringify(cmds)) {
-        return this.client!.request("updateSettings", { ...s, verificationCommands: cmds });
-      }
-      return undefined;
-    }).catch(() => undefined);
+    this.reconnectDelay = RECONNECT_MIN_MS;
+    this.binaryProblemShown = false;
+    this.setStatus("idle", "Agent Conductor");
 
-    this.client.subscribe((ev) => {
+    client.onClose(() => {
+      if (this.disposed || this.client !== client) {
+        return;
+      }
+      this.client = null;
+      this.setStatus("offline", "Agent Conductor: daemon offline");
+      this.pushToWebviews({ type: "daemonOffline", reason: "disconnected" });
+      this.scheduleReconnect();
+    });
+
+    // push verification commands setting to daemon (patch, never read-modify-write)
+    const cmds = verificationCommands();
+    if (cmds.length > 0) {
+      void client.request("patchSettings", { verificationCommands: cmds }).catch(() => undefined);
+    }
+
+    client.subscribe((ev) => {
       if (ev.event === "snapshot") {
-        this.pushToWebviews({ type: "snapshot", snapshot: ev.payload as Snapshot });
+        this.onSnapshot(ev.payload as Snapshot);
       } else {
         this.pushToWebviews({ type: "daemonEvent", event: ev.event, payload: ev.payload });
+        if (ev.event === "runUpdated" || ev.event === "pauseUpdated") {
+          void this.refreshStatus();
+        }
       }
     });
     void this.sendSnapshot();
     this.pushToWebviews({ type: "daemonOnline" });
   }
 
-  private setStatus(text: string, warn: boolean): void {
-    this.statusItem.text = warn ? `$(debug-disconnect) ${text}` : `$(agent) ${text}`;
-    this.statusItem.tooltip = text;
-    this.pushToWebviews({ type: "daemonHealth", healthy: !warn, text });
+  // ---- status bar ----
+
+  private setStatus(kind: StatusKind, text: string, tooltip?: string): void {
+    const icon: Record<StatusKind, string> = {
+      offline: "$(debug-disconnect)",
+      connecting: "$(sync~spin)",
+      idle: "$(circle-outline)",
+      running: "$(pulse)",
+      paused: "$(debug-pause)",
+      error: "$(warning)",
+    };
+    this.statusItem.text = `${icon[kind]} ${text}`;
+    this.statusItem.tooltip = tooltip ?? text;
+    this.statusItem.backgroundColor =
+      kind === "error" ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
+    const healthy = kind !== "offline" && kind !== "error";
+    this.pushToWebviews({ type: "daemonHealth", healthy, text });
+  }
+
+  /** Derive the status-bar presentation from the latest snapshot. */
+  private async refreshStatus(): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+    const snap = this.lastSnapshot;
+    if (!snap) {
+      return;
+    }
+    const pause = snap.pause;
+    if (pause?.paused) {
+      const until = pause.resumeAt ? new Date(pause.resumeAt).getTime() : 0;
+      const remainMs = until ? Math.max(0, until - Date.now()) : 0;
+      const short = until ? ` · ${formatShort(remainMs)}` : "";
+      const why =
+        pause.source && pause.source !== "user" ? ` (${pause.source})` : "";
+      this.setStatus(
+        "paused",
+        `Paused${short}`,
+        [
+          `Agent Conductor queue paused${why}`,
+          pause.reason ? `Reason: ${pause.reason}` : "",
+          until ? `Resumes at ${new Date(until).toLocaleTimeString()}` : "Paused until you resume",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+      return;
+    }
+    const active = (snap.runs ?? []).filter((r) =>
+      ["PREPARING", "STARTING", "RUNNING", "WAITING_FOR_PROVIDER", "VERIFYING", "INTEGRATING"].includes(
+        r.state
+      )
+    ).length;
+    const waiting = (snap.runs ?? []).filter((r) =>
+      ["QUEUED", "WAITING_FOR_SLOT", "WAITING_FOR_EXTERNAL_AGENT", "WAITING_FOR_QUOTA"].includes(r.state)
+    ).length;
+    if (active > 0) {
+      this.setStatus("running", `${active} running`, `${active} running · ${waiting} waiting`);
+    } else if (waiting > 0) {
+      this.setStatus("idle", `${waiting} waiting`, `${waiting} waiting to start`);
+    } else {
+      this.setStatus("idle", "Agent Conductor", "Queue is empty");
+    }
+  }
+
+  private onSnapshot(snap: Snapshot): void {
+    this.lastSnapshot = snap;
+    this.pushToWebviews({ type: "snapshot", snapshot: snap });
+    void this.refreshStatus();
   }
 
   private async sendSnapshot(): Promise<void> {
@@ -129,101 +306,124 @@ class ConductorExtension implements vscode.Disposable {
     }
     try {
       const snap = await this.client.request<Snapshot>("getSnapshot", {});
-      this.pushToWebviews({ type: "snapshot", snapshot: snap });
-    } catch (e) {
-      this.setStatus("Agent Conductor: daemon error", true);
+      this.onSnapshot(snap);
+    } catch {
+      this.setStatus("error", "Agent Conductor: daemon error");
     }
   }
 
   // ---- webview surfaces ----
 
   private registerWebviewView(): void {
-    vscode.window.registerWebviewViewProvider("agent-conductor.sidebar", {
-      resolveWebviewView: (view) => {
-        this.sidebar = view;
-        view.webview.options = { enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "dist", "webview")] };
-        view.webview.html = this.webviewHtml(view.webview, "sidebar");
-        view.webview.onDidReceiveMessage((m) => void this.onWebviewMessage(m, view.webview));
-        view.onDidDispose(() => { this.sidebar = undefined; });
-        void this.sendSnapshot();
-      },
-    });
+    this.context.subscriptions.push(
+      vscode.window.registerWebviewViewProvider(
+        "agent-conductor.sidebar",
+        {
+          resolveWebviewView: (view) => {
+            const target = new WebviewTarget(view.webview);
+            this.sidebar = target;
+            view.webview.options = {
+              enableScripts: true,
+              localResourceRoots: [
+                vscode.Uri.joinPath(this.context.extensionUri, ...WEBVIEW_DIR.split("/")),
+              ],
+            };
+            view.webview.html = this.webviewHtml(view.webview, "sidebar");
+            view.webview.onDidReceiveMessage((m) => void this.onWebviewMessage(m, target));
+            view.onDidDispose(() => {
+              if (this.sidebar === target) {
+                this.sidebar = undefined;
+              }
+            });
+          },
+        },
+        { webviewOptions: { retainContextWhenHidden: true } }
+      )
+    );
   }
 
   private openPanel(mode: "planner" | "detail", title: string, state?: unknown): void {
-    const existing = [...this.panels].find((p) => (p as any)._acMode === mode && (mode === "planner" || (p as any)._acBatchId === state));
-    if (existing) {
-      existing.reveal();
-      if (mode === "detail" && state) {
-        (existing as any)._acBatchId = state;
-        existing.webview.postMessage({ type: "detailBatchId", batchId: state });
+    for (const [panel, target] of this.panels) {
+      const p = panel as any;
+      if (p._acMode !== mode) {
+        continue;
       }
-      return;
+      if (mode === "planner" || p._acBatchId === state) {
+        panel.reveal();
+        if (mode === "detail" && state) {
+          p._acBatchId = state;
+          target.post({ type: "detailBatchId", batchId: state });
+        }
+        return;
+      }
     }
-    const panel = vscode.window.createWebviewPanel(
-      `agent-conductor.${mode}`,
-      title,
-      vscode.ViewColumn.One,
-      { enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "dist", "webview")] }
-    );
+    const panel = vscode.window.createWebviewPanel(`agent-conductor.${mode}`, title, vscode.ViewColumn.One, {
+      enableScripts: true,
+      retainContextWhenHidden: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, ...WEBVIEW_DIR.split("/"))],
+    });
     (panel as any)._acMode = mode;
     if (mode === "detail") {
       (panel as any)._acBatchId = state;
     }
+    const target = new WebviewTarget(panel.webview);
+    this.panels.set(panel, target);
     panel.webview.html = this.webviewHtml(panel.webview, mode);
-    panel.webview.onDidReceiveMessage((m) => void this.onWebviewMessage(m, panel.webview));
-    this.panels.add(panel);
+    panel.webview.onDidReceiveMessage((m) => void this.onWebviewMessage(m, target));
     panel.onDidDispose(() => this.panels.delete(panel));
     if (mode === "detail" && state) {
-      panel.webview.postMessage({ type: "detailBatchId", batchId: state });
+      target.post({ type: "detailBatchId", batchId: state });
     }
-    void this.sendSnapshot();
   }
 
   private webviewHtml(webview: vscode.Webview, mode: string): string {
-    const js = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "dist", "webview", "webview.js"));
-    const nonce = Array.from({ length: 32 }, () => Math.random().toString(36)[2]).join("");
-    const csp = [
-      "default-src 'none'",
-      `script-src 'nonce-${nonce}'`,
-      "style-src 'unsafe-inline'",
-      "font-src 'none'",
-    ].join("; ");
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="${csp}">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-</head>
-<body data-mode="${mode}">
-<div id="root"></div>
-<script nonce="${nonce}">window.__acVscode=acquireVscodeApi();</script>
-<script nonce="${nonce}" src="${js.toString()}"></script>
-</body>
-</html>`;
+    const js = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.context.extensionUri, ...WEBVIEW_DIR.split("/"), WEBVIEW_BUNDLE)
+    );
+    return webviewHtml({ scriptUri: js.toString(), cspSource: webview.cspSource, mode });
+  }
+
+  private targets(): WebviewTarget[] {
+    const out: WebviewTarget[] = [];
+    if (this.sidebar) {
+      out.push(this.sidebar);
+    }
+    out.push(...this.panels.values());
+    return out;
   }
 
   private pushToWebviews(msg: unknown): void {
-    this.sidebar?.webview.postMessage(msg);
-    for (const p of this.panels) {
-      p.webview.postMessage(msg);
+    for (const t of this.targets()) {
+      t.post(msg);
     }
   }
 
   // ---- message routing (webview -> extension -> daemon) ----
 
-  private async onWebviewMessage(m: any, source: vscode.Webview): Promise<void> {
+  private async onWebviewMessage(m: any, source: WebviewTarget): Promise<void> {
     if (!m || typeof m.type !== "string") {
       return;
     }
     try {
       switch (m.type) {
+        case "ready": {
+          source.markReady();
+          source.post({
+            type: "hostInfo",
+            host: hostIndicator(),
+            workspace: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "",
+          });
+          if (this.lastSnapshot) {
+            source.post({ type: "snapshot", snapshot: this.lastSnapshot });
+          }
+          await this.sendSnapshot();
+          return;
+        }
         case "requestSnapshot":
           await this.sendSnapshot();
           return;
         case "hostInfo": {
-          source.postMessage({
+          source.post({
             type: "hostInfo",
             host: hostIndicator(),
             workspace: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "",
@@ -232,21 +432,46 @@ class ConductorExtension implements vscode.Disposable {
         }
         case "rpc": {
           if (!this.client) {
-            source.postMessage({ type: "rpcError", requestId: m.requestId, error: "daemon offline" });
+            source.post({ type: "rpcError", requestId: m.requestId, error: "daemon offline" });
             return;
           }
           const result = await this.client.request(m.method, m.params ?? {});
-          source.postMessage({ type: "rpcResult", requestId: m.requestId, result });
+          source.post({ type: "rpcResult", requestId: m.requestId, result });
+          return;
+        }
+        case "confirm": {
+          // VS Code webviews are sandboxed: window.confirm() does nothing there.
+          const choice = await vscode.window.showWarningMessage(
+            String(m.message ?? "Are you sure?"),
+            { modal: true, detail: m.detail ? String(m.detail) : undefined },
+            String(m.confirmLabel ?? "Confirm")
+          );
+          source.post({
+            type: "confirmResult",
+            requestId: m.requestId,
+            confirmed: choice === String(m.confirmLabel ?? "Confirm"),
+          });
+          return;
+        }
+        case "notify": {
+          const text = String(m.message ?? "");
+          if (m.level === "error") {
+            void vscode.window.showErrorMessage(text);
+          } else if (m.level === "warning") {
+            void vscode.window.showWarningMessage(text);
+          } else {
+            void vscode.window.showInformationMessage(text);
+          }
           return;
         }
         case "openClaude": {
           const r = await openClaudeSession(m.sessionId);
-          vscode.window.showInformationMessage(r.how);
+          void vscode.window.showInformationMessage(r.how);
           return;
         }
         case "openCodex": {
           const r = await openCodexThread(m.threadId, m.title);
-          vscode.window.showInformationMessage(r.how);
+          void vscode.window.showInformationMessage(r.how);
           return;
         }
         case "openWorktree": {
@@ -268,7 +493,9 @@ class ConductorExtension implements vscode.Disposable {
         case "copy": {
           await vscode.env.clipboard.writeText(String(m.text ?? ""));
           if (m.warnSecrets) {
-            vscode.window.showWarningMessage("Copied text includes Shared Testing & Sudo content. Handle carefully.");
+            void vscode.window.showWarningMessage(
+              "Copied text includes Shared Testing & Sudo content. Handle carefully."
+            );
           }
           return;
         }
@@ -276,8 +503,24 @@ class ConductorExtension implements vscode.Disposable {
           if (!this.client) {
             return;
           }
-          const r = await this.client.request("revealEffectivePrompt", { runId: m.runId });
-          const doc = await vscode.workspace.openTextDocument({ content: (r as any).text, language: "markdown" });
+          const r = await this.client.request<{ text: string; containsSecrets: boolean }>(
+            "revealEffectivePrompt",
+            { runId: m.runId }
+          );
+          if (r.containsSecrets) {
+            const go = await vscode.window.showWarningMessage(
+              "This prompt contains your Shared Testing & Sudo block in plain text.",
+              { modal: true },
+              "Show anyway"
+            );
+            if (go !== "Show anyway") {
+              return;
+            }
+          }
+          const doc = await vscode.workspace.openTextDocument({
+            content: r.text,
+            language: "markdown",
+          });
           await vscode.window.showTextDocument(doc, { preview: true });
           return;
         }
@@ -285,7 +528,7 @@ class ConductorExtension implements vscode.Disposable {
           return;
       }
     } catch (e: any) {
-      source.postMessage({ type: "rpcError", requestId: m.requestId, error: String(e?.message ?? e) });
+      source.post({ type: "rpcError", requestId: m.requestId, error: String(e?.message ?? e) });
     }
   }
 
@@ -296,7 +539,7 @@ class ConductorExtension implements vscode.Disposable {
       this.context.subscriptions.push(vscode.commands.registerCommand(id, fn));
 
     reg("agent-conductor.open", () => {
-      vscode.commands.executeCommand("agent-conductor.sidebar.focus");
+      void vscode.commands.executeCommand("agent-conductor.sidebar.focus");
     });
     reg("agent-conductor.buildBatch", () => this.openPanel("planner", "Batch Planner"));
     reg("agent-conductor.diagnostics", () => void this.runDiagnostics());
@@ -305,32 +548,120 @@ class ConductorExtension implements vscode.Disposable {
     reg("agent-conductor.openLogs", () => void this.openLogs());
     reg("agent-conductor.installService", () => void this.installService());
     reg("agent-conductor.uninstallService", () => void this.uninstallService());
+    reg("agent-conductor.pauseQueue", () => void this.pauseQueueInteractive());
+    reg("agent-conductor.resumeQueue", () => void this.resumeQueue());
+    reg("agent-conductor.extendPause", () => void this.extendPause(15 * 60_000));
+  }
+
+  // ---- pause commands (§5.6) ----
+
+  private async pauseQueueInteractive(): Promise<void> {
+    if (!this.client) {
+      void vscode.window.showWarningMessage("Agent Conductor daemon is not connected.");
+      return;
+    }
+    const choices: { label: string; description?: string; durationMs?: number }[] = [
+      { label: "Until I resume", description: "No timer" },
+      { label: "15 minutes", durationMs: 15 * 60_000 },
+      { label: "30 minutes", durationMs: 30 * 60_000 },
+      { label: "1 hour", durationMs: 60 * 60_000 },
+      { label: "2 hours", durationMs: 2 * 60 * 60_000 },
+      { label: "4 hours", durationMs: 4 * 60 * 60_000 },
+      { label: "8 hours", durationMs: 8 * 60 * 60_000 },
+    ];
+    const pick = await vscode.window.showQuickPick(choices, {
+      title: "Pause the Agent Conductor queue",
+      placeHolder: "Resume automatically after…",
+    });
+    if (!pick) {
+      return;
+    }
+    try {
+      await this.client.request("pauseQueue", {
+        durationMs: pick.durationMs,
+        scope: "QUEUE_ONLY",
+        reason: "",
+      });
+      await this.sendSnapshot();
+      void vscode.window.showInformationMessage(
+        pick.durationMs ? `Queue paused — resumes in ${pick.label}.` : "Queue paused."
+      );
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Could not pause: ${e?.message ?? e}`);
+    }
+  }
+
+  private async resumeQueue(): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+    try {
+      await this.client.request("resumeQueue", {});
+      await this.sendSnapshot();
+      void vscode.window.showInformationMessage("Queue resumed.");
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Could not resume: ${e?.message ?? e}`);
+    }
+  }
+
+  private async extendPause(deltaMs: number): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+    try {
+      await this.client.request("extendPause", { deltaMs });
+      await this.sendSnapshot();
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Could not extend the pause: ${e?.message ?? e}`);
+    }
   }
 
   private async runDiagnostics(): Promise<void> {
-    if (!this.client) {
-      vscode.window.showWarningMessage("Agent Conductor daemon is not connected.");
-      return;
-    }
-    const d = await this.client.request<any>("diagnostics", {});
     const lines = ["# Agent Conductor Diagnostics", ""];
-    lines.push(`Daemon: v${d.daemon.version} (pid ${d.daemon.pid}, ${d.daemon.platform ?? ""})`);
-    for (const [p, caps] of Object.entries<any>(d.providers ?? {})) {
-      lines.push(`${p}: installed=${caps.installed} version=${caps.version} auth=${caps.authState}${caps.notes?.length ? " — " + caps.notes.join("; ") : ""}`);
+    const res = resolveDaemonBinaryDetailed(this.context);
+    lines.push("## Daemon binary", "");
+    lines.push(`- Resolved: ${res.path || "(none found)"}`);
+    lines.push(`- Source: ${res.source}`);
+    if (res.version) {
+      lines.push(`- Reports: ${res.version}`);
     }
-    const doc = await vscode.workspace.openTextDocument({ content: lines.join("\n"), language: "markdown" });
+    if (res.problem) {
+      lines.push(`- Problem: ${res.problem.message}`);
+      if (res.problem.remedy) {
+        lines.push(`- Fix: \`${res.problem.remedy}\``);
+      }
+    }
+    lines.push("");
+    if (!this.client) {
+      lines.push("Daemon is not connected.");
+    } else {
+      const d = await this.client.request<any>("diagnostics", {});
+      lines.push(`Daemon: v${d.daemon.version} (pid ${d.daemon.pid})`);
+      lines.push("");
+      lines.push("## Providers", "");
+      for (const [p, caps] of Object.entries<any>(d.providers ?? {})) {
+        lines.push(
+          `- **${p}**: installed=${caps.installed} version=${caps.version} auth=${caps.authState}` +
+            (caps.notes?.length ? ` — ${caps.notes.join("; ")}` : "")
+        );
+      }
+    }
+    const doc = await vscode.workspace.openTextDocument({
+      content: lines.join("\n"),
+      language: "markdown",
+    });
     await vscode.window.showTextDocument(doc);
   }
 
   private startDevDaemon(): void {
-    const bin = resolveDaemonBinary(this.context);
-    if (!bin) {
-      vscode.window.showErrorMessage("No agent-conductor daemon binary found. Build it with `npm run daemon:build`.");
+    const res = resolveDaemonBinaryDetailed(this.context);
+    if (!res.path) {
+      this.reportBinaryProblem(res);
       return;
     }
     const term = vscode.window.createTerminal({ name: "Agent Conductor daemon" });
     this.devDaemon = null;
-    term.sendText(`"${bin}" serve`);
+    term.sendText(`"${res.path}" serve`);
     term.show();
     this.scheduleReconnect(2500);
   }
@@ -338,19 +669,19 @@ class ConductorExtension implements vscode.Disposable {
   private async repairRuntime(): Promise<void> {
     const bin = resolveDaemonBinary(this.context);
     if (!bin) {
-      vscode.window.showErrorMessage("Daemon binary missing; cannot repair hooks.");
+      void vscode.window.showErrorMessage("Daemon binary missing; cannot repair hooks.");
       return;
     }
     const { spawnSync } = require("child_process") as typeof import("child_process");
     const r = spawnSync(bin, ["repair-hooks"], { encoding: "utf8" });
-    vscode.window.showInformationMessage(`Hook repair:\n${r.stdout || r.stderr}`);
+    void vscode.window.showInformationMessage(`Hook repair:\n${r.stdout || r.stderr}`);
   }
 
   private async openLogs(): Promise<void> {
     const logDir = path.join(require("os").homedir(), ".agent-conductor", "logs");
     const logFile = path.join(logDir, "daemon.jsonl");
     if (!fs.existsSync(logFile)) {
-      vscode.window.showWarningMessage("No daemon log yet.");
+      void vscode.window.showWarningMessage("No daemon log yet.");
       return;
     }
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(logFile));
@@ -358,9 +689,9 @@ class ConductorExtension implements vscode.Disposable {
   }
 
   private async installService(): Promise<void> {
-    const bin = resolveDaemonBinary(this.context);
-    if (!bin) {
-      vscode.window.showErrorMessage("Daemon binary missing.");
+    const res = resolveDaemonBinaryDetailed(this.context);
+    if (!res.path) {
+      this.reportBinaryProblem(res);
       return;
     }
     const choice = await vscode.window.showInformationMessage(
@@ -371,9 +702,9 @@ class ConductorExtension implements vscode.Disposable {
       return;
     }
     const { spawnSync } = require("child_process") as typeof import("child_process");
-    const r = spawnSync(bin, ["install-service"], { encoding: "utf8" });
+    const r = spawnSync(res.path, ["install-service"], { encoding: "utf8" });
     const out = (r.stdout || "") + (r.stderr || "");
-    vscode.window.showInformationMessage(out.slice(0, 800));
+    void vscode.window.showInformationMessage(out.slice(0, 800));
     this.scheduleReconnect(3000);
   }
 
@@ -392,15 +723,32 @@ class ConductorExtension implements vscode.Disposable {
     }
     const { spawnSync } = require("child_process") as typeof import("child_process");
     const r = spawnSync(bin, ["uninstall-service"], { encoding: "utf8" });
-    vscode.window.showInformationMessage(((r.stdout || "") + (r.stderr || "")).slice(0, 800));
+    void vscode.window.showInformationMessage(((r.stdout || "") + (r.stderr || "")).slice(0, 800));
   }
 
   private registerWatcher(): void {
     // refresh snapshot when the window gains focus (cheap, event-driven)
-    vscode.window.onDidChangeWindowState((s) => {
-      if (s.focused) {
-        void this.sendSnapshot();
-      }
-    }, undefined, this.context.subscriptions);
+    vscode.window.onDidChangeWindowState(
+      (s) => {
+        if (s.focused) {
+          void this.sendSnapshot();
+        }
+      },
+      undefined,
+      this.context.subscriptions
+    );
   }
 }
+
+/** `23m` / `1h 05m`, for the status bar. */
+function formatShort(ms: number): string {
+  const totalMin = Math.max(0, Math.round(ms / 60_000));
+  if (totalMin < 60) {
+    return `${totalMin}m`;
+  }
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${h}h ${String(m).padStart(2, "0")}m`;
+}
+
+export const __test = { formatShort, WebviewTarget };

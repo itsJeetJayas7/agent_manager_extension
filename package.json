@@ -107,12 +107,13 @@
     "daemon:build": "bash scripts/build-daemon.sh",
     "daemon:test": "cd daemon && go test ./... ",
     "test": "npm run daemon:test && npm run test:ext && npm run test:webview",
-    "test:ext": "vitest run tests/extension --environment node",
-    "test:webview": "vitest run tests/webview --environment jsdom",
+    "test:ext": "vitest run --project extension",
+    "test:webview": "vitest run --project webview",
     "lint": "tsc -p tsconfig.json --noEmit && tsc -p webview/tsconfig.json --noEmit",
     "typecheck": "npm run lint",
     "package": "node scripts/package.mjs",
-    "dev": "node esbuild.mjs --watch"
+    "dev": "node esbuild.mjs --watch",
+    "test:node": "vitest run"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -1,27 +1,7 @@
 import { describe, it, expect } from "vitest";
 
-// Pure-logic tests that don't require a VS Code instance. extension.ts and
-// friends are exercised through the Extension Development Host manually /
-// via @vscode/test-electron when available.
-
-// Mirror of the CSP/nonce logic in extension.ts
-export function buildCsp(nonce: string): string {
-  return [
-    "default-src 'none'",
-    `script-src 'nonce-${nonce}'`,
-    "style-src 'unsafe-inline'",
-    "font-src 'none'",
-  ].join("; ");
-}
-
-describe("webview CSP", () => {
-  it("denies everything by default and scripts only by nonce", () => {
-    const csp = buildCsp("abc123");
-    expect(csp).toContain("default-src 'none'");
-    expect(csp).toContain("script-src 'nonce-abc123'");
-    expect(csp).not.toContain("https://"); // no remote origins, no CDN
-  });
-});
+// Wire-protocol tests. The CSP and webview bootstrap are covered against the
+// real implementation in webviewHtml.test.ts rather than a copy of it.
 
 describe("protocol constants", () => {
   it("uses protocol version 1", async () => {

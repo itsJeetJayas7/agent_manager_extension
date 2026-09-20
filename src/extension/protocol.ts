@@ -131,6 +131,29 @@ export interface SettingsLike {
   paused: boolean;
 }
 
+/** Why the queue is held. A user pause always outranks a system pause. */
+export type PauseSource = "user" | "quota" | "external-agent" | "schedule" | "api";
+
+/**
+ * QUEUE_ONLY  — stop dispatching; runs already executing finish normally.
+ * INCLUDE_ACTIVE — also ask in-flight runs to stop at a safe point, resumable
+ *                  in the same native session.
+ */
+export type PauseScope = "QUEUE_ONLY" | "INCLUDE_ACTIVE";
+
+export interface PauseStateLike {
+  paused: boolean;
+  scope: PauseScope;
+  reason: string;
+  pausedAt?: string;
+  /** Absolute ISO timestamp; absent means "until I resume". */
+  resumeAt?: string;
+  /** The human input that produced resumeAt, e.g. "45m", for display only. */
+  resumeAfter: string;
+  source: PauseSource;
+  autoResume: boolean;
+}
+
 export interface Snapshot {
   daemon: { version: string; pid: number; protocol: number; uptime: string };
   host: { hostname: string; platform: string };
@@ -141,7 +164,11 @@ export interface Snapshot {
   quota: Record<string, QuotaStateLike>;
   providers: Record<string, ProviderCapsLike>;
   settings: SettingsLike;
+  /** Legacy mirror of pause.paused; kept for older webviews. */
   paused: boolean;
+  pause: PauseStateLike;
+  /** True when a Shared Testing & Sudo block exists — never the block itself. */
+  hasSecretBlock: boolean;
 }
 
 export interface RunEventLike {
