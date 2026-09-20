@@ -482,7 +482,30 @@ func (c *Conductor) finishFailure(r *model.Run, code, msg string) {
 	c.Poke()
 }
 
-func (c *Conductor) emitRun(runID string) { c.emit("runUpdated", runID) }
+// emitRun publishes the changed run itself, not just its id, so the UI can
+// merge one entity instead of re-requesting a full snapshot per event.
+func (c *Conductor) emitRun(runID string) {
+	r, err := c.store.GetRun(runID)
+	if err != nil || r == nil {
+		c.emit("runUpdated", map[string]any{"id": runID})
+		return
+	}
+	c.emit("runUpdated", r)
+}
+
+// emitBatch publishes the changed batch with its rows, so the UI can merge it.
+func (c *Conductor) emitBatch(batchID string) {
+	b, err := c.store.GetBatch(batchID)
+	if err != nil || b == nil {
+		c.emit("batchUpdated", map[string]any{"id": batchID})
+		return
+	}
+	rows, _ := c.store.ListRows(batchID)
+	if rows == nil {
+		rows = []*model.Row{}
+	}
+	c.emit("batchUpdated", map[string]any{"batch": b, "rows": rows})
+}
 
 func newDispatchUUID(runID string, attempt int) string {
 	return fmt.Sprintf("%s-%d-%d", runID, attempt, time.Now().UnixNano())

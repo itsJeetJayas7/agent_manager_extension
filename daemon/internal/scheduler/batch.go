@@ -87,7 +87,7 @@ func (c *Conductor) advanceBatch(ctx context.Context, b *model.Batch, st *slotSt
 					b.Status = model.BatchRunning
 					b.StartedAt = c.Now()
 					c.store.UpdateBatch(b)
-					c.emit("batchUpdated", b.ID)
+					c.emitBatch(b.ID)
 				}
 				firstStarted = true
 			}
@@ -106,7 +106,7 @@ func (c *Conductor) advanceBatch(ctx context.Context, b *model.Batch, st *slotSt
 					if b.Status != model.BatchAttention {
 						b.Status = model.BatchAttention
 						c.store.UpdateBatch(b)
-						c.emit("batchUpdated", b.ID)
+						c.emitBatch(b.ID)
 					}
 					return nil
 				}
@@ -119,7 +119,7 @@ func (c *Conductor) advanceBatch(ctx context.Context, b *model.Batch, st *slotSt
 				}
 			}
 			c.store.UpdateRowStatus(row.ID, model.RowDone)
-			c.emit("batchUpdated", b.ID)
+			c.emitBatch(b.ID)
 			continue // next row
 		}
 		return nil
@@ -130,7 +130,7 @@ func (c *Conductor) advanceBatch(ctx context.Context, b *model.Batch, st *slotSt
 		b.Status = model.BatchDone
 		b.FinishedAt = c.Now()
 		c.store.UpdateBatch(b)
-		c.emit("batchUpdated", b.ID)
+		c.emitBatch(b.ID)
 	}
 	return nil
 }
@@ -232,7 +232,7 @@ func (c *Conductor) failBatch(b *model.Batch, why string) error {
 		}
 	}
 	c.log.Errorf("batch %s blocked: %s", b.ID, why)
-	c.emit("batchUpdated", b.ID)
+	c.emitBatch(b.ID)
 	return fmt.Errorf("%s", why)
 }
 
@@ -323,7 +323,7 @@ func (c *Conductor) awaitIntegration(b *model.Batch, why string) error {
 		}
 	}
 	c.log.Errorf("batch %s awaiting integration: %s", b.ID, why)
-	c.emit("batchUpdated", b.ID)
+	c.emitBatch(b.ID)
 	return fmt.Errorf("integration stopped: %s", why)
 }
 

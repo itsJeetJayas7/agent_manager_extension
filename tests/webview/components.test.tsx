@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, it, expect, afterEach } from "vitest";
+import { render, screen, cleanup } from "@testing-library/react";
 import React from "react";
 import StatusGlyph from "../../webview/src/components/StatusGlyph";
 import { fmtDuration, fmtRelative } from "../../webview/src/components/format";
 import { EffectivePromptMock } from "./fixtures";
+
+// vitest runs with globals disabled, so React Testing Library's automatic
+// cleanup does not fire; unmount explicitly between tests.
+afterEach(cleanup);
 
 describe("StatusGlyph", () => {
   it("renders non-color status labels", () => {
@@ -25,9 +29,13 @@ describe("format helpers", () => {
     expect(fmtDuration(2 * 3_600_000 + 41 * 60_000)).toBe("2h 41m");
   });
   it("formats relative times", () => {
-    const future = new Date(Date.now() + 60_000).toISOString();
-    expect(fmtRelative(future)).toBe("in 1m 0s");
+    // A hair over a minute, so the assertion does not race the clock.
+    const future = new Date(Date.now() + 61_000).toISOString();
+    expect(fmtRelative(future)).toMatch(/^in 1m \d+s$/);
+    const past = new Date(Date.now() - 125_000).toISOString();
+    expect(fmtRelative(past)).toMatch(/^2m \d+s ago$/);
     expect(fmtRelative(undefined)).toBe("—");
+    expect(fmtRelative("not a date")).toBe("—");
   });
 });
 

@@ -126,6 +126,7 @@ export interface SettingsLike {
   maxAuditCycles: number;
   maxVerifyFixCycles: number;
   verificationCommands: string[];
+  verificationTimeoutSec: number;
   claudeApiMode: boolean;
   fifoBlockOnExternal: boolean;
   paused: boolean;

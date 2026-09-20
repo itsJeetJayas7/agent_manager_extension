@@ -1,7 +1,7 @@
 // Batch detail: deterministic analysis, run cards, timeline, report.
 import { useEffect, useState } from "react";
 import { detailBatchId } from "../state/store";
-import { rpc, openClaudeSession, openCodexThread, openWorktree, copyText } from "../api/client";
+import { rpc, confirm, notify, openClaudeSession, openCodexThread, openWorktree, copyText } from "../api/client";
 import StatusGlyph from "../components/StatusGlyph";
 import { fmtDuration, elapsedSince } from "../components/format";
 
@@ -56,15 +56,15 @@ export default function BatchDetail() {
   return (
     <div className="ac-planner">
       <div className="ac-row between">
-        <h1 style={{ fontSize: 16, margin: 0 }}>{b.title}</h1>
+        <h1 className="ac-display ac-h1">{b.title}</h1>
         <StatusGlyph state={b.status === "COMPLETED" ? "COMPLETED" : b.status === "ATTENTION" ? "NEEDS_ATTENTION" : "RUNNING"} />
       </div>
-      <div className="ac-small ac-muted" style={{ margin: "4px 0 12px" }}>
+      <div className="ac-small ac-muted ac-mt-1 ac-mb-3">
         {done}/{runs.length} complete · {b.startedAt ? `elapsed ${fmtDuration(elapsedSince(b.startedAt))}` : "not started"}
         {` · continuations ${quotaWaits} · failed ${failed} · blocked ${blocked}`}
       </div>
 
-      <div className="ac-row" style={{ gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+      <div className="ac-row ac-gap-1 wrap ac-mb-3">
         <button className="ac-btn ac-btn-sm" onClick={async () => {
           const r = await rpc<any>("batchReport", { batchId });
           copyText(r.report);
@@ -72,44 +72,66 @@ export default function BatchDetail() {
         }}>Copy Batch Report</button>
         {b.integrationBranch && (
           <>
+            {/* window.confirm and window.alert do nothing inside a sandboxed
+                webview, so this button silently merged — or silently failed. */}
             <button className="ac-btn ac-btn-sm" onClick={async () => {
-              if (!confirm(`Merge ${b.integrationBranch} into your original branch ${b.baseBranch}? Your branch must be clean and unchanged.`)) {
+              const okToApply = await confirm(
+                `Merge ${b.integrationBranch} into ${b.baseBranch}?`,
+                {
+                  detail: "Your branch must be clean and unchanged since the batch started. A safety ref is taken first, so you can always get back.",
+                  confirmLabel: "Merge",
+                }
+              );
+              if (!okToApply) {
                 return;
               }
               try {
-                await rpc("applyBatch", { batchId });
+                const r = await rpc<{ output: string }>("applyBatch", { batchId });
+                notify(`Applied to ${b.baseBranch}. ${r.output.split("\n").pop() ?? ""}`);
               } catch (e: any) {
-                alert(`Apply failed: ${e.message}`);
+                notify(`Apply failed: ${e?.message ?? e}`, "error");
               }
-            }}>Apply Batch to Current Branch</button>
-            <button className="ac-btn ac-btn-sm secondary" onClick={() => copyText(`git merge --no-ff --no-edit ${b.integrationBranch}`)}>
+            }}>Apply batch to current branch</button>
+            <button className="ac-btn ghost ac-btn-sm" onClick={() => copyText(`git merge --no-ff --no-edit ${b.integrationBranch}`)}>
               Copy merge command
             </button>
           </>
         )}
         {b.integrationWorktreePath && (
-          <button className="ac-btn ac-btn-sm secondary" onClick={() => openWorktree(b.integrationWorktreePath)}>
+          <button className="ac-btn ghost ac-btn-sm" onClick={() => openWorktree(b.integrationWorktreePath)}>
             Open integration worktree
           </button>
         )}
         {b.status === "COMPLETED" && !b.applied && (
-          <button className="ac-btn ac-btn-sm secondary" onClick={() => void rpc("cleanupWorktrees", { batchId })}>
+          <button className="ac-btn ghost ac-btn-sm" onClick={async () => {
+            if (await confirm("Clean up this batch's worktrees?", {
+              detail: "Branches holding unmerged commits are kept, and you are told which.",
+              confirmLabel: "Clean up",
+            })) {
+              try {
+                await rpc("cleanupWorktrees", { batchId });
+                notify("Worktrees cleaned up.");
+              } catch (e: any) {
+                notify(String(e?.message ?? e), "warning");
+              }
+            }
+          }}>
             Clean up worktrees
           </button>
         )}
       </div>
       {report && (
         <details className="ac-card">
-          <summary className="ac-small" style={{ cursor: "pointer" }}>Report preview</summary>
-          <pre className="ac-mono ac-small" style={{ whiteSpace: "pre-wrap" }}>{report}</pre>
+          <summary className="ac-small ac-clickable">Report preview</summary>
+          <pre className="ac-mono ac-small ac-pre">{report}</pre>
         </details>
       )}
 
       {(detail.rows ?? []).map((row: any) => {
         const rowRuns = runs.filter((r: any) => r.rowId === row.id);
         return (
-          <section key={row.id} style={{ marginBottom: 16 }} aria-label={`Row ${row.position + 1} (${row.mode})`}>
-            <div className="ac-row" style={{ gap: 8, marginBottom: 6 }}>
+          <section key={row.id} className="ac-mb-3" aria-label={`Row ${row.position + 1} (${row.mode})`}>
+            <div className="ac-row ac-mb-2">
               <span className="ac-rownum ac-num">{row.position + 1}</span>
               <span className="ac-small ac-muted">{row.mode}</span>
               <StatusGlyph state={row.status === "COMPLETED" ? "COMPLETED" : row.status === "RUNNING" ? "RUNNING" : row.status === "BLOCKED" ? "BLOCKED" : "QUEUED"} />
@@ -136,8 +158,8 @@ function RunCard({ run, events }: { run: any; events: any[] }) {
         <strong className="ac-trunc ac-grow">{run.title || run.promptPreview}</strong>
         <StatusGlyph state={run.state} pulse={run.state === "RUNNING"} />
       </div>
-      <dl className="ac-kv" style={{ marginTop: 6 }}>
-        <dt>Provider</dt><dd style={{ textTransform: "capitalize" }}>{run.provider} · {run.model || "default"} · {run.effort || "default effort"}</dd>
+      <dl className="ac-kv ac-mt-2">
+        <dt>Provider</dt><dd className="ac-cap">{run.provider} · {run.model || "default"} · {run.effort || "default effort"}</dd>
         {run.staged && <><dt>Stage</dt><dd>{run.stage || "PLAN → BUILD"}</dd></>}
         {run.continuationCount > 0 && <><dt>Continuations</dt><dd className="ac-num">{run.continuationCount}</dd></>}
         {run.branch && <><dt>Branch</dt><dd className="ac-mono ac-small">{run.branch}</dd></>}
@@ -150,32 +172,36 @@ function RunCard({ run, events }: { run: any; events: any[] }) {
         {run.finalOutcome && <><dt>Outcome</dt><dd>{run.finalOutcome}</dd></>}
         {run.errorMsg && <><dt>Issue</dt><dd>{run.errorMsg}</dd></>}
       </dl>
-      <div className="ac-row" style={{ marginTop: 8, flexWrap: "wrap", gap: 6 }}>
+      <div className="ac-row wrap ac-gap-1 ac-mt-2">
         {run.providerSessionId && (
-          <button className="ac-btn ac-btn-sm secondary" onClick={openNative}>
+          <button className="ac-btn ghost ac-btn-sm" onClick={openNative}>
             {run.provider === "claude" ? "Open in Claude Code" : "Open in Codex"}
           </button>
         )}
-        {run.worktreePath && <button className="ac-btn ac-btn-sm secondary" onClick={() => openWorktree(run.worktreePath)}>Open worktree</button>}
-        <button className="ac-btn ac-btn-sm secondary" onClick={() => rpc("revealEffectivePrompt", { runId: run.id }).then((r: any) => {
+        {run.worktreePath && <button className="ac-btn ghost ac-btn-sm" onClick={() => openWorktree(run.worktreePath)}>Open worktree</button>}
+        <button className="ac-btn ghost ac-btn-sm" onClick={() => rpc("revealEffectivePrompt", { runId: run.id }).then((r: any) => {
           copyText(r.text, !!r.containsSecrets);
         })}>Copy effective prompt</button>
         {["FAILED", "NEEDS_ATTENTION", "ORPHANED", "BLOCKED"].includes(run.state) && (
           <>
             <button className="ac-btn ac-btn-sm" onClick={() => void rpc("continueRun", { runId: run.id })}>Continue</button>
-            <button className="ac-btn ac-btn-sm secondary" onClick={() => void rpc("retryRun", { runId: run.id })}>Retry</button>
-            <button className="ac-btn ac-btn-sm secondary" onClick={() => confirm("Skip this run?") && rpc("skipRun", { runId: run.id })}>Skip</button>
+            <button className="ac-btn ghost ac-btn-sm" onClick={() => void rpc("retryRun", { runId: run.id })}>Retry</button>
+            <button className="ac-btn ghost ac-btn-sm" onClick={async () => {
+              if (await confirm("Skip this run?", { detail: "It is marked SKIPPED and the batch continues without it.", confirmLabel: "Skip run" })) {
+                void rpc("skipRun", { runId: run.id });
+              }
+            }}>Skip</button>
           </>
         )}
         {["RUNNING", "STARTING", "PREPARING"].includes(run.state) && (
           <button className="ac-btn ac-btn-sm danger" onClick={() => void rpc("cancelRun", { runId: run.id })}>Cancel</button>
         )}
-        <button className="ac-btn ac-btn-sm secondary" onClick={() => setShowTimeline(!showTimeline)} aria-expanded={showTimeline}>
+        <button className="ac-btn ghost ac-btn-sm" onClick={() => setShowTimeline(!showTimeline)} aria-expanded={showTimeline}>
           Timeline ({events.length})
         </button>
       </div>
       {showTimeline && (
-        <ul className="ac-timeline" style={{ marginTop: 8 }}>
+        <ul className="ac-timeline ac-mt-2">
           {events.map((e: any) => (
             <li key={e.id}>
               <time>{new Date(e.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time>

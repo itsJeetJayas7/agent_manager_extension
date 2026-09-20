@@ -1,20 +1,57 @@
-/* Agent Conductor — premium minimal design system on VS Code theme vars. */
+/* ============================================================================
+   Agent Conductor — design system
+   ----------------------------------------------------------------------------
+   Five rules this file holds to:
+     1. Depth comes from type, weight, tracking and opacity. Not from borders,
+        shadows, gradients or rounded cards everywhere.
+     2. One accent, used rarely. Colour is information, never ornament.
+     3. A 4px rhythm, never broken. Every spacing value is a token.
+     4. Motion means something. One pulse for "working", one 160ms ease for
+        progress width. Nothing else moves.
+     5. Numbers are typeset: tabular figures everywhere a value changes.
+   Everything inherits the user's VS Code theme, so the panel belongs to their
+   editor rather than looking like a foreign app.
+   ========================================================================== */
+
 :root {
+  /* rhythm — 4px base, never break it */
   --ac-rhythm-1: 4px;
   --ac-rhythm-2: 8px;
   --ac-rhythm-3: 12px;
+  --ac-rhythm-4: 16px;
+  --ac-rhythm-5: 24px;
+  --ac-rhythm-6: 32px;
+
+  /* type scale */
+  --ac-text-xs: 11px;
+  --ac-text-sm: 12px;
+  --ac-text-base: 13px;
+  --ac-text-lg: 15px;
+  --ac-text-display: 18px;
+  --ac-leading-tight: 1.3;
+  --ac-leading: 1.5;
+
   --ac-radius: 6px;
-  --ac-radius-lg: 8px;
+  --ac-radius-lg: 10px;
+
   --ac-border: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.25));
+  --ac-border-strong: var(--vscode-panel-border, var(--ac-border));
   --ac-fg: var(--vscode-sideBar-foreground, var(--vscode-foreground));
-  --ac-fg-muted: var(--vscode-descriptionForeground, rgba(128, 128, 128, 0.9));
+  /* Fallback intentionally darker than the old rgba(128,128,128,.9), which was
+     borderline on light themes. */
+  --ac-fg-muted: var(--vscode-descriptionForeground, rgba(90, 90, 90, 0.95));
   --ac-bg: var(--vscode-sideBar-background, var(--vscode-editor-background));
-  --ac-bg-alt: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.06));
+  --ac-bg-alt: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.07));
+  --ac-bg-raised: var(--vscode-editorHoverWidget-background, var(--ac-bg-alt));
+
+  /* the one accent */
   --ac-accent: var(--vscode-focusBorder, #4a9eff);
   --ac-success: var(--vscode-testing-iconPassed, #73c991);
   --ac-warn: var(--vscode-editorWarning-foreground, #cca700);
   --ac-error: var(--vscode-testing-iconFailed, #f14c4c);
-  --ac-focus-ring: 0 0 0 1px var(--vscode-focusBorder);
+  --ac-focus-ring: 0 0 0 2px var(--vscode-focusBorder, #4a9eff);
+
+  --ac-shadow-popover: 0 8px 28px rgba(0, 0, 0, 0.28);
 }
 
 * { box-sizing: border-box; }
@@ -24,143 +61,423 @@ html, body, #root {
   margin: 0;
   padding: 0;
   font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, system-ui, sans-serif);
-  font-size: var(--vscode-font-size, 13px);
+  font-size: var(--ac-text-base);
+  line-height: var(--ac-leading);
   color: var(--ac-fg);
   background: transparent;
 }
 
 .ac-scroll { overflow-y: auto; height: 100%; }
 
-.ac-num { font-variant-numeric: tabular-nums; }
+/* ---------------------------------------------------------------- typography */
 
-/* header */
+/* The one section-label treatment, defined once. */
+.ac-eyebrow {
+  font-size: var(--ac-text-xs);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ac-fg-muted);
+  font-weight: 500;
+}
+.ac-display { font-size: var(--ac-text-display); font-weight: 500; letter-spacing: -0.01em; line-height: var(--ac-leading-tight); }
+.ac-lg { font-size: var(--ac-text-lg); }
+.ac-small { font-size: var(--ac-text-sm); }
+.ac-xs { font-size: var(--ac-text-xs); }
+.ac-muted { color: var(--ac-fg-muted); }
+.ac-mono { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); }
+.ac-trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ac-wrap { overflow-wrap: anywhere; }
+
+/* Every changing number is tabular so nothing jitters. */
+.ac-num, .ac-countdown, time, .ac-bar-label {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* ------------------------------------------------------------------ layout */
+
+.ac-row { display: flex; align-items: center; gap: var(--ac-rhythm-2); }
+.ac-row.between { justify-content: space-between; }
+.ac-row.wrap { flex-wrap: wrap; }
+.ac-row.top { align-items: flex-start; }
+.ac-col { display: flex; flex-direction: column; }
+.ac-grow { flex: 1; min-width: 0; }
+.ac-fill { flex: 1; }
+
+/* Rhythm utilities replace the inline style={{ marginTop: 8 }} overrides that
+   were scattered across every view. */
+.ac-stack-1 > * + * { margin-top: var(--ac-rhythm-1); }
+.ac-stack-2 > * + * { margin-top: var(--ac-rhythm-2); }
+.ac-stack-3 > * + * { margin-top: var(--ac-rhythm-3); }
+.ac-stack-4 > * + * { margin-top: var(--ac-rhythm-4); }
+.ac-mt-1 { margin-top: var(--ac-rhythm-1); }
+.ac-mt-2 { margin-top: var(--ac-rhythm-2); }
+.ac-mt-3 { margin-top: var(--ac-rhythm-3); }
+.ac-mt-4 { margin-top: var(--ac-rhythm-4); }
+.ac-mb-2 { margin-bottom: var(--ac-rhythm-2); }
+.ac-mb-3 { margin-bottom: var(--ac-rhythm-3); }
+.ac-gap-1 { gap: var(--ac-rhythm-1); }
+.ac-gap-3 { gap: var(--ac-rhythm-3); }
+.ac-gap-4 { gap: var(--ac-rhythm-4); }
+.ac-pad-3 { padding: var(--ac-rhythm-3); }
+.ac-cap { text-transform: capitalize; }
+
+.ac-app { display: flex; flex-direction: column; height: 100%; }
+
+/* ------------------------------------------------------------------ header */
+
 .ac-header {
-  padding: var(--ac-rhythm-3) var(--ac-rhythm-3) var(--ac-rhythm-2);
+  padding: var(--ac-rhythm-4) var(--ac-rhythm-3) var(--ac-rhythm-3);
   border-bottom: 1px solid var(--ac-border);
 }
-.ac-title { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ac-fg-muted); }
-.ac-subrow { display: flex; align-items: center; gap: var(--ac-rhythm-2); margin-top: 2px; color: var(--ac-fg-muted); font-size: 11px; }
-.ac-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+.ac-header-top { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--ac-rhythm-2); }
+.ac-title { font-size: var(--ac-text-base); font-weight: 600; letter-spacing: -0.005em; }
+.ac-subrow {
+  display: flex; align-items: center; gap: var(--ac-rhythm-2);
+  margin-top: var(--ac-rhythm-1);
+  color: var(--ac-fg-muted); font-size: var(--ac-text-xs);
+}
+.ac-sep { opacity: 0.5; }
+.ac-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; flex: none; }
 .ac-dot.ok { background: var(--ac-success); }
 .ac-dot.warn { background: var(--ac-warn); }
 .ac-dot.err { background: var(--ac-error); }
 
-/* tabs */
-.ac-tabs { display: flex; border-bottom: 1px solid var(--ac-border); padding: 0 var(--ac-rhythm-1); }
-.ac-tab {
-  flex: 1; background: none; border: none; border-bottom: 1px solid transparent;
-  color: var(--ac-fg-muted); padding: var(--ac-rhythm-2) var(--ac-rhythm-1);
-  font-size: 11px; letter-spacing: 0.05em; cursor: pointer; text-transform: uppercase;
-}
-.ac-tab[aria-selected="true"] { color: var(--ac-fg); border-bottom-color: var(--ac-accent); }
-.ac-tab:focus-visible { outline: none; box-shadow: var(--ac-focus-ring); border-radius: var(--ac-radius); }
+/* -------------------------------------------------------------------- tabs */
 
-/* sections & cards */
-.ac-section { padding: var(--ac-rhythm-3); }
-.ac-section-title { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ac-fg-muted); margin-bottom: var(--ac-rhythm-2); }
+.ac-tabs { display: flex; border-bottom: 1px solid var(--ac-border); padding: 0 var(--ac-rhythm-2); flex: none; }
+.ac-tab {
+  flex: 1; background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--ac-fg-muted); padding: var(--ac-rhythm-2) var(--ac-rhythm-1);
+  font-size: var(--ac-text-xs); letter-spacing: 0.08em; cursor: pointer;
+  text-transform: uppercase; font-weight: 500;
+}
+.ac-tab:hover { color: var(--ac-fg); }
+.ac-tab[aria-selected="true"] { color: var(--ac-fg); border-bottom-color: var(--ac-accent); }
+
+/* ------------------------------------------------------------ sections */
+
+.ac-section { padding: var(--ac-rhythm-4) var(--ac-rhythm-3); }
+.ac-section + .ac-section { padding-top: 0; }
+.ac-section-title { composes: ac-eyebrow; }
+.ac-section-title,
+.ac-section > .ac-eyebrow { margin-bottom: var(--ac-rhythm-2); }
+.ac-section-title {
+  font-size: var(--ac-text-xs); letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ac-fg-muted); font-weight: 500;
+}
+.ac-rule { height: 1px; background: var(--ac-border); border: 0; margin: var(--ac-rhythm-4) 0; }
+
 .ac-card {
   border: 1px solid var(--ac-border); border-radius: var(--ac-radius);
-  padding: var(--ac-rhythm-2) var(--ac-rhythm-3); margin-bottom: var(--ac-rhythm-2);
-  background: var(--ac-bg);
+  padding: var(--ac-rhythm-3); background: var(--ac-bg);
 }
-.ac-card.active { border-color: var(--vscode-inputValidation-infoBorder, var(--ac-accent)); }
-.ac-row { display: flex; align-items: center; gap: var(--ac-rhythm-2); }
-.ac-row.between { justify-content: space-between; }
-.ac-grow { flex: 1; min-width: 0; }
-.ac-trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ac-muted { color: var(--ac-fg-muted); }
-.ac-small { font-size: 11px; }
-.ac-mono { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); }
+.ac-card + .ac-card { margin-top: var(--ac-rhythm-2); }
 
-/* buttons */
+/* ------------------------------------------------------- the hero: active run */
+
+/* The active run is the visual anchor of the queue. Everything else recedes. */
+.ac-hero {
+  border: 1px solid var(--ac-border-strong);
+  border-left: 2px solid var(--ac-accent);
+  border-radius: var(--ac-radius-lg);
+  padding: var(--ac-rhythm-3) var(--ac-rhythm-4);
+  background: var(--ac-bg-alt);
+}
+.ac-hero-title { font-size: var(--ac-text-lg); font-weight: 500; line-height: var(--ac-leading-tight); }
+.ac-hero-meta {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--ac-rhythm-3);
+  margin-top: var(--ac-rhythm-2); color: var(--ac-fg-muted); font-size: var(--ac-text-xs);
+}
+.ac-hero-elapsed { font-size: var(--ac-text-sm); color: var(--ac-fg); }
+.ac-stage { display: inline-flex; align-items: center; gap: var(--ac-rhythm-1); }
+.ac-stage b { font-weight: 500; color: var(--ac-fg); }
+
+/* ------------------------------------------------------------- queue list */
+
+/* A list, not a stack of cards. */
+.ac-qlist { display: flex; flex-direction: column; }
+.ac-qrow {
+  display: grid;
+  grid-template-columns: 22px 1fr 64px auto;
+  gap: var(--ac-rhythm-2);
+  align-items: center;
+  padding: var(--ac-rhythm-2) var(--ac-rhythm-3);
+  border-bottom: 1px solid var(--ac-border);
+  border-left: 2px solid transparent;
+}
+.ac-qrow:hover, .ac-qrow:focus-within { background: var(--ac-bg-alt); }
+/* The next run to start gets a hairline rule on its leading edge. Nothing more. */
+.ac-qrow.next { border-left-color: var(--ac-accent); }
+.ac-qrow.dimmed { opacity: 0.55; }
+.ac-qrow-index { color: var(--ac-fg-muted); font-size: var(--ac-text-xs); text-align: right; }
+.ac-qrow-title { min-width: 0; }
+.ac-qrow-sub { color: var(--ac-fg-muted); font-size: var(--ac-text-xs); }
+.ac-qrow-when { text-align: right; color: var(--ac-fg-muted); font-size: var(--ac-text-xs); }
+.ac-qrow-actions { display: flex; gap: var(--ac-rhythm-1); opacity: 0; transition: opacity 120ms ease; }
+.ac-qrow:hover .ac-qrow-actions,
+.ac-qrow:focus-within .ac-qrow-actions { opacity: 1; }
+.ac-qrow[data-dragging="true"] { opacity: 0.4; }
+.ac-qrow[data-dropbefore="true"] { box-shadow: inset 0 2px 0 0 var(--ac-accent); }
+.ac-drag { cursor: grab; color: var(--ac-fg-muted); }
+.ac-drag:active { cursor: grabbing; }
+
+/* ------------------------------------------------------------------ pause */
+
+/* Amber, not red. Pausing is a normal, intentional act — not an error. */
+.ac-pause-band {
+  border-left: 2px solid var(--ac-warn);
+  background: var(--ac-bg-alt);
+  padding: var(--ac-rhythm-3) var(--ac-rhythm-3) var(--ac-rhythm-3) var(--ac-rhythm-3);
+  border-radius: 0 var(--ac-radius) var(--ac-radius) 0;
+  margin: var(--ac-rhythm-3);
+}
+.ac-pause-head { display: flex; align-items: baseline; gap: var(--ac-rhythm-2); flex-wrap: wrap; }
+.ac-pause-title { font-weight: 500; }
+.ac-countdown { font-variant-numeric: tabular-nums; }
+.ac-pause-sub { color: var(--ac-fg-muted); font-size: var(--ac-text-xs); margin-top: var(--ac-rhythm-1); }
+.ac-pause-actions { display: flex; gap: var(--ac-rhythm-1); margin-top: var(--ac-rhythm-2); flex-wrap: wrap; }
+
+.ac-popover-anchor { position: relative; }
+.ac-popover {
+  position: absolute; right: 0; top: calc(100% + var(--ac-rhythm-1)); z-index: 40;
+  min-width: 268px; max-width: min(320px, calc(100vw - var(--ac-rhythm-4)));
+  background: var(--vscode-editorWidget-background, var(--ac-bg));
+  border: 1px solid var(--ac-border-strong); border-radius: var(--ac-radius-lg);
+  box-shadow: var(--ac-shadow-popover);
+  padding: var(--ac-rhythm-3);
+}
+.ac-popover-title { font-weight: 500; margin-bottom: var(--ac-rhythm-2); }
+.ac-radio { display: flex; align-items: flex-start; gap: var(--ac-rhythm-2); padding: var(--ac-rhythm-1) 0; cursor: pointer; }
+.ac-radio input { margin-top: 3px; accent-color: var(--ac-accent); }
+.ac-chips { display: flex; flex-wrap: wrap; gap: var(--ac-rhythm-1); margin: var(--ac-rhythm-2) 0; }
+.ac-chip {
+  background: none; border: 1px solid var(--ac-border); border-radius: 999px;
+  color: var(--ac-fg-muted); padding: 2px 10px; font-size: var(--ac-text-xs); cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.ac-chip:hover { color: var(--ac-fg); border-color: var(--ac-border-strong); }
+.ac-chip[aria-pressed="true"] { border-color: var(--ac-accent); color: var(--ac-fg); }
+
+/* ---------------------------------------------------------------- controls */
+
 .ac-btn {
-  background: var(--vscode-button-background, #0e639c); color: var(--vscode-button-foreground, #fff);
-  border: none; border-radius: var(--ac-radius); padding: 6px 12px; font-size: 12px; cursor: pointer;
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  border: none; border-radius: var(--ac-radius);
+  padding: 6px var(--ac-rhythm-3); font-size: var(--ac-text-sm);
+  font-family: inherit; cursor: pointer;
 }
 .ac-btn:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
-.ac-btn.secondary { background: var(--vscode-button-secondaryBackground, #3a3d41); color: var(--vscode-button-secondaryForeground, #fff); }
-.ac-btn.danger { background: var(--ac-error); }
-.ac-btn:focus-visible { outline: none; box-shadow: var(--ac-focus-ring); }
-.ac-btn:disabled { opacity: 0.5; cursor: default; }
-.ac-btn-sm { padding: 2px 8px; font-size: 11px; }
-.ac-icon-btn { background: none; border: none; color: var(--ac-fg-muted); cursor: pointer; padding: 2px 4px; border-radius: 4px; }
-.ac-icon-btn:hover { color: var(--ac-fg); background: var(--ac-bg-alt); }
-.ac-icon-btn:focus-visible { outline: none; box-shadow: var(--ac-focus-ring); }
-
-/* inputs */
-.ac-input, .ac-select, .ac-textarea {
-  width: 100%; background: var(--vscode-input-background, #1e1e1e); color: var(--vscode-input-foreground, var(--ac-fg));
-  border: 1px solid var(--ac-border); border-radius: var(--ac-radius); padding: 6px 8px; font-size: 12px;
-  font-family: inherit;
+.ac-btn.secondary {
+  background: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.16));
+  color: var(--vscode-button-secondaryForeground, var(--ac-fg));
 }
-.ac-textarea { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); min-height: 160px; resize: vertical; line-height: 1.5; }
-.ac-input:focus, .ac-select:focus, .ac-textarea:focus { outline: none; border-color: var(--vscode-focusBorder, var(--ac-accent)); }
-.ac-label { display: block; font-size: 11px; color: var(--ac-fg-muted); margin: var(--ac-rhythm-2) 0 2px; }
-.ac-check { display: flex; align-items: center; gap: 6px; margin: 6px 0; font-size: 12px; cursor: pointer; }
-.ac-check input { accent-color: var(--ac-accent); }
+.ac-btn.secondary:hover { background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.26)); }
+/* Quiet: the default weight for anything that is not the primary action. */
+.ac-btn.ghost { background: none; color: var(--ac-fg-muted); border: 1px solid var(--ac-border); }
+.ac-btn.ghost:hover { color: var(--ac-fg); border-color: var(--ac-border-strong); background: var(--ac-bg-alt); }
+.ac-btn.danger { background: var(--ac-error); color: #fff; }
+.ac-btn:disabled { opacity: 0.45; cursor: default; }
+.ac-btn-sm { padding: 3px var(--ac-rhythm-2); font-size: var(--ac-text-xs); }
+.ac-icon-btn {
+  background: none; border: none; color: var(--ac-fg-muted);
+  cursor: pointer; padding: 2px var(--ac-rhythm-1); border-radius: var(--ac-radius);
+  font-size: var(--ac-text-sm);
+}
+.ac-icon-btn:hover { color: var(--ac-fg); background: var(--ac-bg-alt); }
+
+/* One focus treatment, applied to everything focusable. */
+.ac-btn:focus-visible,
+.ac-chip:focus-visible,
+.ac-icon-btn:focus-visible,
+.ac-tab:focus-visible,
+.ac-seg button:focus-visible,
+.ac-input:focus-visible,
+.ac-select:focus-visible,
+.ac-textarea:focus-visible,
+.ac-qrow:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible {
+  outline: none;
+  box-shadow: var(--ac-focus-ring);
+  border-radius: var(--ac-radius);
+}
 .ac-check:focus-within { outline: none; box-shadow: var(--ac-focus-ring); border-radius: var(--ac-radius); }
 
-/* segmented provider toggle */
-.ac-seg { display: inline-flex; border: 1px solid var(--ac-border); border-radius: var(--ac-radius); overflow: hidden; }
-.ac-seg button { background: none; border: none; color: var(--ac-fg-muted); padding: 4px 12px; cursor: pointer; font-size: 12px; }
-.ac-seg button[aria-pressed="true"] { background: var(--vscode-button-background, #0e639c); color: var(--vscode-button-foreground, #fff); }
-.ac-seg button:focus-visible { outline: none; box-shadow: var(--ac-focus-ring); }
+/* ----------------------------------------------------------------- inputs */
 
-/* status glyphs (never color-only) */
-.ac-glyph { font-size: 11px; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
-.ac-glyph.running { color: var(--vscode-charts-lines, var(--ac-accent)); }
+.ac-input, .ac-select, .ac-textarea {
+  width: 100%;
+  background: var(--vscode-input-background, rgba(128, 128, 128, 0.08));
+  color: var(--vscode-input-foreground, var(--ac-fg));
+  border: 1px solid var(--ac-border); border-radius: var(--ac-radius);
+  padding: 6px var(--ac-rhythm-2); font-size: var(--ac-text-sm); font-family: inherit;
+}
+.ac-textarea {
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  min-height: 168px; resize: vertical; line-height: var(--ac-leading);
+}
+.ac-input:focus, .ac-select:focus, .ac-textarea:focus {
+  outline: none; border-color: var(--vscode-focusBorder, var(--ac-accent));
+}
+.ac-input-sm { width: auto; padding: 3px var(--ac-rhythm-2); }
+.ac-label { display: block; font-size: var(--ac-text-xs); color: var(--ac-fg-muted); margin-bottom: 2px; }
+.ac-check { display: flex; align-items: center; gap: var(--ac-rhythm-2); font-size: var(--ac-text-sm); cursor: pointer; padding: 3px 0; }
+.ac-check input { accent-color: var(--ac-accent); flex: none; }
+
+/* A quiet line of controls that must not compete with the prompt. */
+.ac-affordance { display: flex; align-items: center; gap: var(--ac-rhythm-2); color: var(--ac-fg-muted); font-size: var(--ac-text-xs); }
+.ac-kbd {
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  border: 1px solid var(--ac-border); border-radius: 4px; padding: 0 4px; font-size: 10px;
+}
+.ac-inline-controls { display: flex; gap: var(--ac-rhythm-2); align-items: flex-end; flex-wrap: wrap; }
+.ac-inline-controls > * { flex: 1 1 96px; min-width: 88px; }
+
+.ac-seg { display: inline-flex; border: 1px solid var(--ac-border); border-radius: var(--ac-radius); overflow: hidden; flex: none; }
+.ac-seg button { background: none; border: none; color: var(--ac-fg-muted); padding: 3px var(--ac-rhythm-3); cursor: pointer; font-size: var(--ac-text-sm); font-family: inherit; }
+.ac-seg button[aria-pressed="true"] { background: var(--vscode-button-background, #0e639c); color: var(--vscode-button-foreground, #fff); }
+
+/* --------------------------------------------------------- status glyphs */
+
+/* Never colour-only: every glyph carries a distinct shape and a label. */
+.ac-glyph { font-size: var(--ac-text-xs); display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.ac-glyph.running { color: var(--ac-accent); }
 .ac-glyph.complete { color: var(--ac-success); }
 .ac-glyph.wait { color: var(--ac-warn); }
 .ac-glyph.failed { color: var(--ac-error); }
+.ac-glyph.paused { color: var(--ac-warn); }
 
-/* subtle activity pulse — the only animation */
-@keyframes ac-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+/* -------------------------------------------------------------- motion */
+
+@keyframes ac-pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
 .ac-pulse { animation: ac-pulse 1.8s ease-in-out infinite; }
+
 @media (prefers-reduced-motion: reduce) {
   .ac-pulse { animation: none; }
-  * { transition: none !important; animation: none !important; }
+  *, *::before, *::after { transition: none !important; animation: none !important; }
 }
 
-/* progress line */
-.ac-progress { height: 3px; border-radius: 2px; background: var(--ac-bg-alt); overflow: hidden; margin: 6px 0; }
+/* ------------------------------------------------------------ indicators */
+
+.ac-progress { height: 2px; border-radius: 1px; background: var(--ac-bg-alt); overflow: hidden; margin: var(--ac-rhythm-2) 0 0; }
 .ac-progress > div { height: 100%; background: var(--ac-accent); transition: width 160ms ease; }
 
-/* quota bars */
-.ac-quota { display: grid; grid-template-columns: 34px 1fr auto; gap: var(--ac-rhythm-2); align-items: center; margin: 4px 0; }
+.ac-quota { display: grid; grid-template-columns: 62px 1fr auto; gap: var(--ac-rhythm-2); align-items: center; padding: 3px 0; }
 .ac-bar { height: 4px; border-radius: 2px; background: var(--ac-bg-alt); overflow: hidden; }
 .ac-bar > div { height: 100%; background: var(--ac-accent); }
 .ac-bar.warn > div { background: var(--ac-warn); }
 .ac-bar.full > div { background: var(--ac-error); }
+/* Unknown is unknown: a hatched track, never a fabricated value. */
+.ac-bar.unknown {
+  background-image: repeating-linear-gradient(135deg, var(--ac-border) 0 3px, transparent 3px 6px);
+}
 
-/* queue rows */
-.ac-qrow { display: grid; grid-template-columns: 20px 52px 68px 1fr auto; gap: var(--ac-rhythm-2); align-items: center; padding: 6px var(--ac-rhythm-3); border-bottom: 1px solid var(--ac-border); }
-.ac-qrow:hover, .ac-qrow:focus-within { background: var(--ac-bg-alt); }
+/* --------------------------------------------------------------- footer */
 
-/* sticky footer */
-.ac-footer { position: sticky; bottom: 0; background: var(--ac-bg); border-top: 1px solid var(--ac-border); padding: var(--ac-rhythm-2) var(--ac-rhythm-3); display: flex; gap: var(--ac-rhythm-2); }
+.ac-footer {
+  position: sticky; bottom: 0; background: var(--ac-bg);
+  border-top: 1px solid var(--ac-border);
+  padding: var(--ac-rhythm-2) var(--ac-rhythm-3);
+  display: flex; gap: var(--ac-rhythm-2);
+}
 .ac-footer .ac-btn { flex: 1; }
 
-/* planner */
-.ac-planner { max-width: 1080px; margin: 0 auto; padding: var(--ac-rhythm-3); }
-.ac-planner-grid { display: grid; gap: var(--ac-rhythm-2); }
-.ac-cards { display: flex; gap: var(--ac-rhythm-2); flex-wrap: wrap; }
-.ac-card-edit { border: 1px dashed var(--ac-border); border-radius: var(--ac-radius); padding: var(--ac-rhythm-2); flex: 1 1 300px; min-width: 280px; }
-.ac-rownum { color: var(--ac-fg-muted); font-size: 11px; width: 22px; padding-top: 6px; }
+/* -------------------------------------------------------------- planner */
 
-/* detail */
-.ac-kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px var(--ac-rhythm-2); font-size: 12px; }
+.ac-planner { max-width: 1080px; margin: 0 auto; padding: var(--ac-rhythm-4); }
+.ac-planner-grid { display: grid; gap: var(--ac-rhythm-3); }
+.ac-plan-row { display: grid; grid-template-columns: 28px 1fr; gap: var(--ac-rhythm-3); align-items: start; }
+.ac-rownum { color: var(--ac-fg-muted); font-size: var(--ac-text-xs); padding-top: var(--ac-rhythm-2); text-align: right; }
+.ac-cards { display: flex; gap: var(--ac-rhythm-3); flex-wrap: wrap; }
+.ac-card-edit {
+  border: 1px solid var(--ac-border); border-radius: var(--ac-radius);
+  padding: var(--ac-rhythm-3); flex: 1 1 320px; min-width: 280px; background: var(--ac-bg);
+}
+.ac-plan-summary {
+  border-top: 1px solid var(--ac-border); padding-top: var(--ac-rhythm-3);
+  color: var(--ac-fg-muted); font-size: var(--ac-text-sm);
+}
+
+/* --------------------------------------------------------------- detail */
+
+.ac-kv { display: grid; grid-template-columns: 140px 1fr; gap: var(--ac-rhythm-1) var(--ac-rhythm-3); font-size: var(--ac-text-sm); margin: 0; }
 .ac-kv dt { color: var(--ac-fg-muted); }
 .ac-kv dd { margin: 0; overflow-wrap: anywhere; }
-.ac-timeline { list-style: none; margin: 0; padding: 0; font-size: 11px; }
-.ac-timeline li { display: grid; grid-template-columns: 64px 1fr; gap: var(--ac-rhythm-2); padding: 2px 0; }
-.ac-timeline time { color: var(--ac-fg-muted); font-variant-numeric: tabular-nums; }
+.ac-timeline { list-style: none; margin: 0; padding: 0; font-size: var(--ac-text-xs); }
+.ac-timeline li { display: grid; grid-template-columns: 68px 1fr; gap: var(--ac-rhythm-2); padding: 2px 0; }
+.ac-timeline time { color: var(--ac-fg-muted); }
 
-/* checklist */
 .ac-checklist { list-style: none; padding: 0; margin: 0; }
-.ac-checklist li { display: flex; gap: var(--ac-rhythm-2); padding: 4px 0; align-items: baseline; }
+.ac-checklist li { display: flex; gap: var(--ac-rhythm-2); padding: var(--ac-rhythm-1) 0; align-items: baseline; }
 
-/* utility */
-.ac-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-.ac-empty { color: var(--ac-fg-muted); font-size: 12px; padding: var(--ac-rhythm-3); text-align: center; }
-.ac-banner { border-left: 2px solid var(--ac-warn); padding: var(--ac-rhythm-2) var(--ac-rhythm-3); margin: var(--ac-rhythm-2) 0; background: var(--ac-bg-alt); border-radius: 0 var(--ac-radius) var(--ac-radius) 0; font-size: 12px; }
+/* --------------------------------------------------------------- utility */
+
+.ac-sr {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+.ac-reset-list { list-style: none; margin: 0; padding: 0; }
+
+/* An empty queue should look composed and deliberate, not broken. */
+.ac-empty { padding: var(--ac-rhythm-5) var(--ac-rhythm-3); text-align: center; }
+.ac-empty-title { color: var(--ac-fg); font-size: var(--ac-text-sm); }
+.ac-empty-hint { color: var(--ac-fg-muted); font-size: var(--ac-text-xs); margin-top: var(--ac-rhythm-1); }
+
+.ac-banner {
+  border-left: 2px solid var(--ac-warn);
+  padding: var(--ac-rhythm-2) var(--ac-rhythm-3);
+  background: var(--ac-bg-alt); border-radius: 0 var(--ac-radius) var(--ac-radius) 0;
+  font-size: var(--ac-text-sm);
+}
 .ac-banner.err { border-left-color: var(--ac-error); }
+.ac-banner.info { border-left-color: var(--ac-accent); }
+.ac-banner + .ac-banner { margin-top: var(--ac-rhythm-2); }
+
+.ac-disclosure { border-top: 1px solid var(--ac-border); }
+.ac-disclosure > summary {
+  cursor: pointer; list-style: none; padding: var(--ac-rhythm-3) var(--ac-rhythm-3);
+  display: flex; align-items: center; justify-content: space-between; gap: var(--ac-rhythm-2);
+  font-size: var(--ac-text-xs); letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ac-fg-muted); font-weight: 500;
+}
+.ac-disclosure > summary::-webkit-details-marker { display: none; }
+.ac-disclosure > summary:hover { color: var(--ac-fg); }
+.ac-disclosure > summary::after { content: "+"; font-size: var(--ac-text-base); opacity: 0.7; }
+.ac-disclosure[open] > summary::after { content: "−"; }
+.ac-disclosure-body { padding: 0 var(--ac-rhythm-3) var(--ac-rhythm-4); }
+
+/* ------------------------------------------------------- high contrast */
+
+@media (forced-colors: active) {
+  .ac-card, .ac-hero, .ac-popover, .ac-card-edit { border: 1px solid CanvasText; }
+  .ac-qrow { border-bottom: 1px solid CanvasText; }
+  .ac-dot { outline: 1px solid CanvasText; }
+  .ac-bar, .ac-progress { border: 1px solid CanvasText; }
+  .ac-btn:focus-visible, .ac-chip:focus-visible { outline: 2px solid Highlight; }
+}
+
+/* A card that is also a button: the whole row is the target. */
+.ac-batch-button {
+  display: block; width: 100%; text-align: left; cursor: pointer;
+  font: inherit; color: inherit;
+}
+.ac-batch-button:hover { background: var(--ac-bg-alt); }
+
+/* Planner drag affordances. */
+.ac-planner-grid > article[data-dragging="true"] { opacity: 0.45; }
+.ac-planner-grid > article[data-dropbefore="true"] { box-shadow: inset 0 2px 0 0 var(--ac-accent); }
+
+/* The last few one-off treatments, as classes rather than inline styles. */
+.ac-h1 { margin: 0; }
+.ac-textarea-sm { min-height: 96px; }
+.ac-textarea-md { min-height: 120px; }
+.ac-pre { white-space: pre-wrap; }
+.ac-block { display: block; }
+.ac-w-full { width: 100%; }
+.ac-end { justify-content: flex-end; }
+.ac-clickable { cursor: pointer; }
+.ac-band-pad { margin: var(--ac-rhythm-3); }
+.ac-list-head { padding: 0 var(--ac-rhythm-3) var(--ac-rhythm-2); }

@@ -98,7 +98,7 @@ func (c *Conductor) EnqueueRun(in EnqueueRunInput) (batchID, runID string, err e
 		c.store.UpdateRun(run)
 	}
 	c.store.AddRunEvent(run.ID, model.EventQueued, quoteJSON("enqueued"))
-	c.emit("batchUpdated", batch.ID)
+	c.emitBatch(batch.ID)
 	c.emitRun(run.ID)
 	c.Poke()
 	return batch.ID, run.ID, nil
@@ -226,7 +226,7 @@ func (c *Conductor) ApplyBatch(spec BatchSpecInput) (batchID string, err error) 
 	}); err != nil {
 		return "", err
 	}
-	c.emit("batchUpdated", batch.ID)
+	c.emitBatch(batch.ID)
 	c.Poke()
 	return batch.ID, nil
 }
@@ -317,7 +317,7 @@ func (c *Conductor) reviveBatch(batchID string) {
 	if b.Status == model.BatchAttention {
 		b.Status = model.BatchRunning
 		c.store.UpdateBatch(b)
-		c.emit("batchUpdated", b.ID)
+		c.emitBatch(b.ID)
 	}
 }
 
@@ -599,7 +599,7 @@ func (c *Conductor) ApplyBatchToBranch(batchID string) (string, error) {
 	}
 	b.Applied = true
 	c.store.UpdateBatch(b)
-	c.emit("batchUpdated", b.ID)
+	c.emitBatch(b.ID)
 	return out, nil
 }
 

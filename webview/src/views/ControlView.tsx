@@ -1,59 +1,156 @@
-// Control tab: runtime, providers, usage, anchor, secrets, staged,
-// parallel, verification, maintenance.
-import React, { useEffect, useState } from "react";
+// Control tab: a short always-visible status summary, then progressive
+// disclosure. It used to be seven stacked accordions, all collapsed — a filing
+// cabinet rather than a control surface. Pause has moved to the queue header.
+import React, { useState } from "react";
 import type { ConductorState } from "../state/store";
-import { rpc } from "../api/client";
-import { vscodeApi } from "../api/client";
+import { rpc, confirm, notify, vscodeApi } from "../api/client";
 
-function Section({ title, children, defaultOpen = false }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
+/**
+ * Every settings write is a server-side patch.
+ *
+ * The old code did `const s = await getSettings(); updateSettings({...s, x})`,
+ * so two concurrent edits silently lost one, and a component that snapshotted
+ * settings on mount wrote stale values back over everything else.
+ */
+function patch(settings: Record<string, unknown>): Promise<unknown> {
+  return rpc("patchSettings", settings);
+}
+
+function Disclosure({
+  title,
+  children,
+  defaultOpen = false,
+}: {
+  title: string;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
   return (
-    <section className="ac-section" style={{ paddingTop: 8, paddingBottom: 8 }}>
-      <button
-        className="ac-tab"
-        style={{ width: "100%", textAlign: "left", borderBottom: "none", padding: "4px 0" }}
-        aria-expanded={open}
-        onClick={() => setOpen(!open)}
-      >
-        {title}
-      </button>
-      {open && <div style={{ paddingTop: 8 }}>{children}</div>}
+    <details className="ac-disclosure" open={defaultOpen}>
+      <summary>{title}</summary>
+      <div className="ac-disclosure-body">{children}</div>
+    </details>
+  );
+}
+
+// ---- always-visible summary ------------------------------------------------
+
+function QuotaBars({ state, provider }: { state: ConductorState; provider: string }) {
+  const q = state.snapshot?.quota?.[provider];
+  const windows = q?.windows ?? [];
+  if (windows.length === 0) {
+    return <div className="ac-xs ac-muted">No usage data yet — learned from the first run.</div>;
+  }
+  return (
+    <>
+      {windows.map((w) => {
+        const pct = w.hasPercent ? Math.min(100, Math.round(w.usedPercent)) : null;
+        const cls = w.exhausted ? "full" : pct !== null && pct > 80 ? "warn" : "";
+        const reset = w.hasReset
+          ? `resets ${new Date(w.resetsAt).toLocaleString([], {
+              weekday: "short",
+              hour: "numeric",
+              minute: "2-digit",
+            })}`
+          : "reset time unknown";
+        return (
+          <div key={w.id} className="ac-quota" title={`${w.source} · confidence: ${w.confidence}`}>
+            <span className="ac-xs ac-muted ac-trunc">{w.name || w.id}</span>
+            {/* Honesty over polish: an unknown percentage is hatched, never
+                rendered as a plausible-looking bar. */}
+            <div
+              className={`ac-bar ${pct === null ? "unknown" : cls}`}
+              role={pct === null ? undefined : "progressbar"}
+              aria-valuenow={pct ?? undefined}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label={`${provider} ${w.name || w.id} usage`}
+            >
+              {pct !== null && <div style={{ width: `${pct}%` }} />}
+            </div>
+            <span className="ac-xs ac-num ac-muted">
+              {pct === null ? (w.exhausted ? "exhausted" : "unavailable") : `${pct}%`} · {reset}
+            </span>
+          </div>
+        );
+      })}
+      {q?.missingReset && (
+        <div className="ac-xs ac-muted ac-mt-1">
+          A reset time is unknown. Set the weekly override below if you know it.
+        </div>
+      )}
+    </>
+  );
+}
+
+function Summary({ state }: { state: ConductorState }) {
+  const d = state.snapshot?.daemon;
+  return (
+    <section className="ac-section" aria-label="Status">
+      <div className="ac-card">
+        <div className="ac-row between">
+          <span className="ac-row ac-gap-1">
+            <span className={`ac-dot ${state.daemonHealthy ? "ok" : "err"}`} aria-hidden="true" />
+            <strong>{state.daemonHealthy ? "Daemon running" : "Daemon offline"}</strong>
+          </span>
+          <span className="ac-xs ac-muted ac-num">
+            {d ? `v${d.version} · pid ${d.pid} · up ${d.uptime}` : "—"}
+          </span>
+        </div>
+        <div className="ac-xs ac-muted ac-mt-1">
+          {state.host || "Local"} · {state.snapshot?.host?.platform ?? "unknown platform"}
+        </div>
+      </div>
+
+      {(["claude", "codex"] as const).map((p) => {
+        const caps = state.snapshot?.providers?.[p];
+        return (
+          <div key={p} className="ac-card">
+            <div className="ac-row between">
+              <span className="ac-row ac-gap-1">
+                <span className={`ac-dot ${caps?.installed ? "ok" : "err"}`} aria-hidden="true" />
+                <strong className="ac-cap">{p}</strong>
+              </span>
+              <span className="ac-xs ac-muted">
+                {caps?.installed ? caps.version || "installed" : "runtime not found"}
+              </span>
+            </div>
+            <div className="ac-mt-2">
+              <QuotaBars state={state} provider={p} />
+            </div>
+          </div>
+        );
+      })}
+
+      <div className="ac-row ac-gap-1 wrap ac-mt-3">
+        <button
+          className="ac-btn ghost ac-btn-sm"
+          onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.diagnostics" })}
+        >
+          Diagnostics
+        </button>
+        <button
+          className="ac-btn ghost ac-btn-sm"
+          onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.openLogs" })}
+        >
+          Logs
+        </button>
+        <button
+          className="ac-btn ghost ac-btn-sm"
+          onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.installService" })}
+        >
+          Install background service
+        </button>
+      </div>
     </section>
   );
 }
 
-function Runtime({ state }: { state: ConductorState }) {
-  const d = state.snapshot?.daemon;
-  return (
-    <Section title="Runtime" defaultOpen>
-      <dl className="ac-kv">
-        <dt>Daemon</dt>
-        <dd>{state.daemonHealthy ? `Running · v${d?.version ?? "?"}` : "Offline"}</dd>
-        <dt>PID</dt><dd className="ac-num">{d?.pid ?? "—"}</dd>
-        <dt>Uptime</dt><dd>{d?.uptime ?? "—"}</dd>
-        <dt>Host</dt><dd>{state.host || "Local"}</dd>
-        <dt>Platform</dt><dd>{state.snapshot?.host?.platform ?? "—"}</dd>
-      </dl>
-      <div className="ac-row" style={{ marginTop: 8, flexWrap: "wrap", gap: 6 }}>
-        <button className="ac-btn ac-btn-sm" onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.openLogs" })}>View Logs</button>
-        <button className="ac-btn ac-btn-sm secondary" onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.diagnostics" })}>Run Diagnostics</button>
-        <button className="ac-btn ac-btn-sm secondary" onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.installService" })}>Install Service</button>
-        <button className="ac-btn ac-btn-sm danger" onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.uninstallService" })}>Uninstall Service</button>
-      </div>
-      <div className="ac-row" style={{ marginTop: 8, gap: 6 }}>
-        {state.snapshot?.paused ? (
-          <button className="ac-btn ac-btn-sm" onClick={() => void rpc("resumeScheduler", {})}>Resume Queue</button>
-        ) : (
-          <button className="ac-btn ac-btn-sm secondary" onClick={() => void rpc("pauseScheduler", {})}>Pause Queue</button>
-        )}
-      </div>
-    </Section>
-  );
-}
+// ---- disclosures -----------------------------------------------------------
 
-function Providers({ state }: { state: ConductorState }) {
+function ProvidersDetail({ state }: { state: ConductorState }) {
   return (
-    <Section title="Providers">
+    <Disclosure title="Providers">
       {(["claude", "codex"] as const).map((p) => {
         const caps = state.snapshot?.providers?.[p];
         const ext = (state.snapshot?.external?.[p] ?? []).find(
@@ -61,237 +158,385 @@ function Providers({ state }: { state: ConductorState }) {
         );
         return (
           <div key={p} className="ac-card">
-            <div className="ac-row between">
-              <strong style={{ textTransform: "capitalize" }}>{p}</strong>
-              <span className={`ac-dot ${caps?.installed ? "ok" : "err"}`} aria-hidden="true" />
-            </div>
-            <dl className="ac-kv" style={{ marginTop: 4 }}>
-              <dt>Installed</dt><dd>{caps?.installed ? caps.version || "yes" : "runtime not found"}</dd>
-              <dt>Auth</dt><dd>{caps?.authState ?? "unknown"}{caps?.planLabel ? ` · ${caps.planLabel}` : ""}</dd>
-              <dt>Models</dt><dd>{caps?.models?.length ?? 0} discovered</dd>
+            <strong className="ac-cap">{p}</strong>
+            <dl className="ac-kv ac-mt-2">
+              <dt>Runtime</dt>
+              <dd>{caps?.installed ? caps.version || "installed" : "not found"}</dd>
+              <dt>Auth</dt>
+              <dd>
+                {caps?.authState ?? "unknown"}
+                {caps?.planLabel ? ` · ${caps.planLabel}` : ""}
+              </dd>
+              <dt>Models</dt>
+              <dd>{caps?.models?.length ?? 0} available</dd>
+              <dt>External session</dt>
+              <dd>{ext ? `running in ${ext.cwd || ext.nativeId.slice(0, 10)}` : "idle"}</dd>
             </dl>
-            {caps?.notes?.map((n, i) => <div key={i} className="ac-small ac-muted">{n}</div>)}
+            {caps?.notes?.map((n, i) => (
+              <div key={i} className="ac-xs ac-muted ac-mt-1">
+                {n}
+              </div>
+            ))}
             {p === "codex" && caps?.authState === "api_key" && (
-              <div className="ac-banner err">API-key billing detected. Managed runs may spend beyond your ChatGPT plan limits.</div>
+              <div className="ac-banner err ac-mt-2">
+                API-key billing detected. Managed runs may spend beyond your ChatGPT plan.
+              </div>
             )}
-            <div className="ac-small ac-muted" style={{ marginTop: 4 }}>
-              External session: {ext ? `● Running (${ext.nativeId.slice(0, 10)}… ${ext.cwd ?? ""})` : "Idle"}
-              {ext && (
-                <>
-                  {" · "}
-                  <button className="ac-btn ac-btn-sm secondary" onClick={() => void rpc("clearStaleExternalSession", { provider: p, nativeId: ext.nativeId })}>
-                    Clear stale busy state
-                  </button>
-                </>
-              )}
-            </div>
+            {ext && (
+              <button
+                className="ac-btn ghost ac-btn-sm ac-mt-2"
+                onClick={() => void rpc("clearStaleExternalSession", { provider: p, nativeId: ext.nativeId })}
+              >
+                Clear stale busy state
+              </button>
+            )}
           </div>
         );
       })}
-      <button className="ac-btn ac-btn-sm secondary" onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.repairRuntime" })}>
-        Repair Hook Integration
+      <button
+        className="ac-btn ghost ac-btn-sm ac-mt-2"
+        onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.repairRuntime" })}
+      >
+        Repair hook integration
       </button>
-    </Section>
+    </Disclosure>
   );
 }
 
-function Usage({ state }: { state: ConductorState }) {
+function Scheduling({ state }: { state: ConductorState }) {
+  const s = state.snapshot?.settings;
+  const [weekly, setWeekly] = useState("");
   return (
-    <Section title="Usage & Limits">
-      {(["claude", "codex"] as const).map((p) => {
-        const q = state.snapshot?.quota?.[p];
-        return (
-          <div key={p} style={{ marginBottom: 10 }} aria-label={`${p} usage`}>
-            <div className="ac-small" style={{ textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 2 }}>{p}</div>
-            {(q?.windows ?? []).length === 0 && <div className="ac-small ac-muted">No provider usage data yet.</div>}
-            {(q?.windows ?? []).map((w) => {
-              const pct = w.hasPercent ? Math.min(100, Math.round(w.usedPercent)) : null;
-              const cls = w.exhausted ? "full" : pct !== null && pct > 80 ? "warn" : "";
-              const reset = w.hasReset ? `resets ${new Date(w.resetsAt).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}` : "reset time unknown";
-              return (
-                <div key={w.id} className="ac-quota" title={`${w.source} · confidence: ${w.confidence}`}>
-                  <span className="ac-small ac-muted ac-num">{w.id}</span>
-                  <div className={`ac-bar ${cls}`} role="progressbar" aria-valuenow={pct ?? undefined} aria-label={`${p} ${w.name} usage`}>
-                    <div style={{ width: `${pct ?? 100}%`, opacity: pct === null ? 0.25 : 1 }} />
-                  </div>
-                  <span className="ac-small ac-num ac-muted">
-                    {pct === null ? (w.exhausted ? "exhausted" : "% unavailable") : `${pct}%`}
-                    {" · "}{reset}
-                  </span>
-                </div>
-              );
-            })}
-            {q?.missingReset && <div className="ac-small ac-muted">Reset time unknown — configure weekly reset override below.</div>}
-          </div>
-        );
-      })}
-      <WeeklyOverride />
-    </Section>
-  );
-}
-
-function WeeklyOverride() {
-  const [val, setVal] = useState("");
-  return (
-    <div>
-      <label className="ac-label" htmlFor="ac-weekly">Claude weekly reset override (RFC3339, optional)</label>
-      <div className="ac-row">
-        <input id="ac-weekly" className="ac-input" placeholder="2026-09-21T02:00:00Z" value={val}
-          onChange={(e) => setVal(e.target.value)} />
-        <button className="ac-btn ac-btn-sm" onClick={async () => {
-          const s = await rpc<any>("getSettings", {});
-          await rpc("updateSettings", { ...s, claudeWeeklyResetUtc: val });
-        }}>Save</button>
+    <Disclosure title="Scheduling &amp; limits">
+      <div className="ac-inline-controls">
+        <div>
+          <label className="ac-label" htmlFor="ac-max-total">
+            Concurrent runs
+          </label>
+          <input
+            id="ac-max-total"
+            className="ac-input"
+            type="number"
+            min={1}
+            max={8}
+            value={s?.maxTotalRuns ?? 2}
+            onChange={(e) => void patch({ maxTotalRuns: Number(e.target.value) || 1 })}
+          />
+        </div>
+        <div>
+          <label className="ac-label" htmlFor="ac-verify-timeout">
+            Verification timeout (s)
+          </label>
+          <input
+            id="ac-verify-timeout"
+            className="ac-input"
+            type="number"
+            min={30}
+            step={30}
+            value={s?.verificationTimeoutSec ?? 1800}
+            onChange={(e) => void patch({ verificationTimeoutSec: Number(e.target.value) || 1800 })}
+          />
+        </div>
       </div>
-    </div>
+      <label className="ac-check ac-mt-2">
+        <input
+          type="checkbox"
+          checked={!!s?.fifoBlockOnExternal}
+          onChange={(e) => void patch({ fifoBlockOnExternal: e.target.checked })}
+        />
+        <span>Hold the queue while an agent runs outside Agent Conductor</span>
+      </label>
+
+      <label className="ac-label ac-mt-3" htmlFor="ac-weekly">
+        Claude weekly reset override (RFC3339, optional)
+      </label>
+      <div className="ac-row">
+        <input
+          id="ac-weekly"
+          className="ac-input"
+          placeholder={s?.claudeWeeklyResetUtc || "2026-09-21T02:00:00Z"}
+          value={weekly}
+          onChange={(e) => setWeekly(e.target.value)}
+        />
+        <button
+          className="ac-btn ghost ac-btn-sm"
+          onClick={() => {
+            void patch({ claudeWeeklyResetUtc: weekly }).then(() => notify("Weekly reset override saved."));
+          }}
+        >
+          Save
+        </button>
+      </div>
+      <div className="ac-xs ac-muted ac-mt-1">
+        Used only when the provider does not report a reset time. Provider data always wins.
+      </div>
+    </Disclosure>
   );
 }
 
 function AnchorSection({ state }: { state: ConductorState }) {
   const s = state.snapshot?.settings;
-
-  const set = async (patch: any) => {
-    const cur = await rpc<any>("getSettings", {});
-    await rpc("updateSettings", { ...cur, ...patch });
-  };
+  const codexModels = state.snapshot?.providers?.codex?.models ?? [];
+  const claudeModels = state.snapshot?.providers?.claude?.models ?? [];
   return (
-    <Section title="Window Anchor">
+    <Disclosure title="Window anchor">
       <div className="ac-small ac-muted">
-        Opens each new quota window with one tiny request while idle overnight, so the clock runs without wasting real work.
+        Opens each new quota window with one tiny request while the machine is idle, so the clock starts without
+        spending real work on it.
       </div>
-      <label className="ac-check">
-        <input type="checkbox" checked={!!s?.anchorCodexEnabled} onChange={(e) => void set({ anchorCodexEnabled: e.target.checked })} />
-        Codex Window Anchor (structured rate limits)
+      <label className="ac-check ac-mt-2">
+        <input
+          type="checkbox"
+          checked={!!s?.anchorCodexEnabled}
+          onChange={(e) => void patch({ anchorCodexEnabled: e.target.checked })}
+        />
+        <span>Codex window anchor</span>
       </label>
       <label className="ac-check">
-        <input type="checkbox" checked={!!s?.anchorClaudeEnabled} onChange={(e) => void set({ anchorClaudeEnabled: e.target.checked })} />
-        Claude Window Anchor — <span className="ac-glyph wait">Experimental</span>
+        <input
+          type="checkbox"
+          checked={!!s?.anchorClaudeEnabled}
+          onChange={(e) => void patch({ anchorClaudeEnabled: e.target.checked })}
+        />
+        <span>
+          Claude window anchor <span className="ac-glyph wait">experimental</span>
+        </span>
       </label>
-      <div className="ac-row" style={{ marginTop: 4 }}>
-        <div className="ac-grow">
-          <label className="ac-label" htmlFor="ac-anchor-codex">Codex anchor model</label>
-          <select id="ac-anchor-codex" className="ac-select" value={s?.anchorModelCodex ?? "auto"} onChange={(e) => void set({ anchorModelCodex: e.target.value })}>
-            <option value="auto">Auto (lightest available)</option>
-            {(state.snapshot?.providers?.codex?.models ?? []).map((m) => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
+      <div className="ac-inline-controls ac-mt-2">
+        <div>
+          <label className="ac-label" htmlFor="ac-anchor-codex">
+            Codex anchor model
+          </label>
+          <select
+            id="ac-anchor-codex"
+            className="ac-select"
+            value={s?.anchorModelCodex ?? "auto"}
+            onChange={(e) => void patch({ anchorModelCodex: e.target.value })}
+          >
+            <option value="auto">Auto — lightest available</option>
+            {codexModels.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name || m.id}
+              </option>
+            ))}
           </select>
         </div>
-        <div className="ac-grow">
-          <label className="ac-label" htmlFor="ac-anchor-claude">Claude anchor model</label>
-          <select id="ac-anchor-claude" className="ac-select" value={s?.anchorModelClaude ?? "auto"} onChange={(e) => void set({ anchorModelClaude: e.target.value })}>
-            <option value="auto">Auto (lightest available)</option>
-            {(state.snapshot?.providers?.claude?.models ?? []).map((m) => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
+        <div>
+          <label className="ac-label" htmlFor="ac-anchor-claude">
+            Claude anchor model
+          </label>
+          <select
+            id="ac-anchor-claude"
+            className="ac-select"
+            value={s?.anchorModelClaude ?? "auto"}
+            onChange={(e) => void patch({ anchorModelClaude: e.target.value })}
+          >
+            <option value="auto">Auto — lightest available</option>
+            {claudeModels.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name || m.id}
+              </option>
+            ))}
           </select>
         </div>
       </div>
-    </Section>
+    </Disclosure>
   );
 }
 
-function SecretBlock() {
+function SecretBlock({ state }: { state: ConductorState }) {
   const [text, setText] = useState("");
   const [revealed, setRevealed] = useState<string | null>(null);
   const [ack, setAck] = useState(false);
+  const exists = !!state.snapshot?.hasSecretBlock;
   return (
-    <Section title="Shared Testing & Sudo Block">
-      {!ack && (
-        <div className="ac-banner" role="alert">
-          The block is sent literally to Claude/Codex and becomes part of that provider conversation history.
-          It is encrypted at rest by the daemon and never written to logs.
-          <div style={{ marginTop: 6 }}>
-            <button className="ac-btn ac-btn-sm" onClick={() => setAck(true)}>I understand</button>
-          </div>
-        </div>
-      )}
-      {ack && (
+    <Disclosure title="Shared testing &amp; sudo block">
+      <div className="ac-banner">
+        This block is sent literally to Claude or Codex and becomes part of that provider's conversation history.
+        It is encrypted at rest by the daemon and never written to logs.
+      </div>
+      <div className="ac-xs ac-muted ac-mt-2">
+        {exists ? "A block is stored." : "No block stored."}
+      </div>
+      {!ack ? (
+        <button className="ac-btn ghost ac-btn-sm ac-mt-2" onClick={() => setAck(true)}>
+          I understand — let me edit it
+        </button>
+      ) : (
         <>
-          <label className="ac-sr" htmlFor="ac-secret">Shared testing and sudo block</label>
-          <textarea id="ac-secret" className="ac-textarea" style={{ minHeight: 120 }} value={text}
+          <label className="ac-sr" htmlFor="ac-secret">
+            Shared testing and sudo block
+          </label>
+          <textarea
+            id="ac-secret"
+            className="ac-textarea ac-textarea-md ac-mt-2"
+            value={text}
             placeholder="Testing credentials, sudo password, usage instructions…"
-            onChange={(e) => setText(e.target.value)} />
-          <div className="ac-row" style={{ marginTop: 6, flexWrap: "wrap" }}>
-            <button className="ac-btn ac-btn-sm" onClick={() => void rpc("updateSecretBlock", { text }).then(() => setText(""))}>Save</button>
-            <button className="ac-btn ac-btn-sm secondary" onClick={async () => {
-              const r = await rpc<any>("revealSecretBlock", {}).catch(() => null);
-              setRevealed(r?.text ?? "(none stored)");
-            }}>Reveal</button>
+            onChange={(e) => setText(e.target.value)}
+          />
+          <div className="ac-row ac-gap-1 wrap ac-mt-2">
+            <button
+              className="ac-btn ac-btn-sm"
+              disabled={text.trim() === ""}
+              onClick={() =>
+                void rpc("updateSecretBlock", { text }).then(() => {
+                  setText("");
+                  notify("Shared block saved.");
+                })
+              }
+            >
+              Save
+            </button>
+            <button
+              className="ac-btn ghost ac-btn-sm"
+              onClick={async () => {
+                const r = await rpc<any>("revealSecretBlock", {}).catch(() => null);
+                setRevealed(r?.text ?? "(nothing stored)");
+              }}
+            >
+              Reveal
+            </button>
             {revealed !== null && (
-              <button className="ac-btn ac-btn-sm secondary" onClick={() => setRevealed(null)}>Hide</button>
+              <button className="ac-btn ghost ac-btn-sm" onClick={() => setRevealed(null)}>
+                Hide
+              </button>
             )}
-            <button className="ac-btn ac-btn-sm danger" onClick={() => void rpc("deleteSecretBlock", {})}>Delete</button>
+            <button
+              className="ac-btn danger ac-btn-sm"
+              disabled={!exists}
+              onClick={async () => {
+                if (
+                  await confirm("Delete the shared testing & sudo block?", {
+                    detail:
+                      "It is removed from the database permanently and detached from every queued run. This cannot be undone.",
+                    confirmLabel: "Delete permanently",
+                  })
+                ) {
+                  await rpc("deleteSecretBlock", {});
+                  setRevealed(null);
+                  notify("Shared block deleted.");
+                }
+              }}
+            >
+              Delete
+            </button>
           </div>
           {revealed !== null && (
-            <pre className="ac-card ac-mono ac-small" style={{ whiteSpace: "pre-wrap", marginTop: 8 }} aria-label="Revealed secret block">{revealed}</pre>
+            <pre className="ac-card ac-mono ac-small ac-pre ac-mt-2" aria-label="Revealed block">
+              {revealed}
+            </pre>
           )}
         </>
       )}
-    </Section>
+    </Disclosure>
   );
 }
 
-function Staged() {
-  const [s, setS] = useState<any>(null);
-  useEffect(() => {
-    void rpc("getSettings", {}).then(setS);
-  }, []);
-  if (!s) {
-    return <Section title="Staged Intelligence"><div className="ac-small ac-muted">loading…</div></Section>;
-  }
-  const upd = (patch: any) => {
-    const next = { ...s, ...patch };
-    setS(next);
-    void rpc("updateSettings", next);
-  };
-  const field = (label: string, key: string, options: string[], value: string) => (
-    <div className="ac-grow">
-      <label className="ac-label">{label}</label>
-      <select className="ac-select" value={value} onChange={(e) => upd({ [key]: e.target.value })}>
-        <option value="">(default)</option>
-        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+function Staged({ state }: { state: ConductorState }) {
+  const s = state.snapshot?.settings;
+  // Sourced from the live provider capabilities. The old code read
+  // `s._codexModels`, a field that exists nowhere, so both Codex dropdowns
+  // were permanently empty.
+  const claudeIds = (state.snapshot?.providers?.claude?.models ?? []).map((m) => m.id);
+  const codexIds = (state.snapshot?.providers?.codex?.models ?? []).map((m) => m.id);
+
+  const field = (label: string, key: string, options: string[], value: string | undefined) => (
+    <div>
+      <label className="ac-label" htmlFor={`ac-${key}`}>
+        {label}
+      </label>
+      <select
+        id={`ac-${key}`}
+        className="ac-select"
+        value={value ?? ""}
+        onChange={(e) => void patch({ [key]: e.target.value })}
+      >
+        <option value="">Provider default</option>
+        {options.map((o) => (
+          <option key={o} value={o}>
+            {o}
+          </option>
+        ))}
       </select>
     </div>
   );
+
   return (
-    <Section title="Staged Intelligence">
+    <Disclosure title="Staged intelligence">
       <div className="ac-small ac-muted">Plan with a strong model, build with a cheaper one — same native conversation.</div>
-      <label className="ac-check">
-        <input type="checkbox" checked={!!s.auditEnabled} onChange={(e) => upd({ auditEnabled: e.target.checked })} />
-        Final smart audit (one fix cycle)
+      <label className="ac-check ac-mt-2">
+        <input
+          type="checkbox"
+          checked={!!s?.auditEnabled}
+          onChange={(e) => void patch({ auditEnabled: e.target.checked })}
+        />
+        <span>Final smart audit, one fix cycle</span>
       </label>
-      <div className="ac-row" style={{ alignItems: "flex-start" }}>
-        {field("Claude plan model", "claudePlanModel", ["opus", "sonnet", "haiku"], s.claudePlanModel)}
-        {field("Claude build model", "claudeBuildModel", ["opus", "sonnet", "haiku"], s.claudeBuildModel)}
+      <div className="ac-inline-controls ac-mt-2">
+        {field("Claude plan model", "claudePlanModel", claudeIds, s?.claudePlanModel)}
+        {field("Claude build model", "claudeBuildModel", claudeIds, s?.claudeBuildModel)}
       </div>
-      <div className="ac-row" style={{ alignItems: "flex-start" }}>
-        {field("Codex plan model", "codexPlanModel", ["", ...(s._codexModels ?? [])], s.codexPlanModel)}
-        {field("Codex build model", "codexBuildModel", ["", ...(s._codexModels ?? [])], s.codexBuildModel)}
+      <div className="ac-inline-controls ac-mt-2">
+        {field("Codex plan model", "codexPlanModel", codexIds, s?.codexPlanModel)}
+        {field("Codex build model", "codexBuildModel", codexIds, s?.codexBuildModel)}
       </div>
-    </Section>
+      {codexIds.length === 0 && (
+        <div className="ac-xs ac-muted ac-mt-1">Codex models appear once the Codex runtime is reachable.</div>
+      )}
+    </Disclosure>
   );
 }
 
-function Parallel() {
+function Maintenance() {
+  const [busy, setBusy] = useState(false);
   return (
-    <Section title="Parallel Execution">
+    <Disclosure title="Maintenance">
       <div className="ac-small ac-muted">
-        Parallel rows require a clean Git repository; Agent Conductor never stashes or discards your changes.
-        Runs execute in isolated worktrees and merge into an internal integration branch. Your original branch
-        changes only when you explicitly apply the batch.
+        Parallel rows require a clean Git repository. Agent Conductor never stashes or discards your changes: runs
+        execute in isolated worktrees and merge into an internal integration branch, and your branch changes only when
+        you explicitly apply a batch.
       </div>
-    </Section>
+      <button
+        className="ac-btn ghost ac-btn-sm ac-mt-3"
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          try {
+            const r = await rpc<{ prunedEvents: number }>("compact", {});
+            notify(`Database compacted — ${r.prunedEvents} old event(s) removed.`);
+          } catch (e: any) {
+            notify(String(e?.message ?? e), "error");
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        Compact database
+      </button>
+      <button
+        className="ac-btn danger ac-btn-sm ac-mt-2"
+        onClick={() => vscodeApi.postMessage({ type: "cmd", command: "agent-conductor.uninstallService" })}
+      >
+        Uninstall background service &amp; hooks
+      </button>
+    </Disclosure>
   );
 }
 
 export default function ControlView({ state }: { state: ConductorState }) {
   return (
     <div>
-      <header className="ac-header"><div className="ac-title">Control</div></header>
-      <Runtime state={state} />
-      <Providers state={state} />
-      <Usage state={state} />
+      <header className="ac-header">
+        <div className="ac-title">Control</div>
+        <div className="ac-subrow">Everything Agent Conductor knows about this machine.</div>
+      </header>
+      <Summary state={state} />
+      <ProvidersDetail state={state} />
+      <Scheduling state={state} />
       <AnchorSection state={state} />
-      <SecretBlock />
-      <Staged />
-      <Parallel />
+      <SecretBlock state={state} />
+      <Staged state={state} />
+      <Maintenance />
     </div>
   );
 }
