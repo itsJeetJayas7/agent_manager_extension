@@ -196,6 +196,9 @@ func (f *Fake) classErr(s Script) *ProviderError {
 	return &ProviderError{Class: s.Class, Message: "fake error"}
 }
 
+// CanResumeSession mirrors the real adapters so restart-recovery is exercised.
+func (f *Fake) CanResumeSession() bool { return true }
+
 func (f *Fake) Cancel(runID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

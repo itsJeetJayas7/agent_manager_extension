@@ -13,6 +13,8 @@ import {
   verificationCommands,
 } from "./configuration";
 import { openClaudeSession, openCodexThread, openWorktreeWindow } from "./sessionOpeners";
+import { computeSetupStatus } from "./setup";
+import { Notifier } from "./notifications";
 import { WEBVIEW_DIR, WEBVIEW_BUNDLE } from "../../shared/artifacts.cjs";
 import { webviewHtml } from "./webviewHtml";
 import { spawn, ChildProcess } from "child_process";
@@ -72,11 +74,14 @@ class ConductorExtension implements vscode.Disposable {
   private sidebar?: WebviewTarget;
   private lastSnapshot: Snapshot | null = null;
   private binaryProblemShown = false;
+  private notifier: Notifier;
+  private reportedAway = false;
 
   constructor(private context: vscode.ExtensionContext) {
     this.statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
     this.statusItem.command = "agent-conductor.open";
     context.subscriptions.push(this.statusItem);
+    this.notifier = new Notifier(context.globalState);
   }
 
   dispose() {
@@ -204,6 +209,7 @@ class ConductorExtension implements vscode.Disposable {
         return;
       }
       this.client = null;
+      this.reportedAway = false;
       this.setStatus("offline", "Agent Conductor: daemon offline");
       this.pushToWebviews({ type: "daemonOffline", reason: "disconnected" });
       this.scheduleReconnect();
@@ -298,6 +304,20 @@ class ConductorExtension implements vscode.Disposable {
     this.lastSnapshot = snap;
     this.pushToWebviews({ type: "snapshot", snapshot: snap });
     void this.refreshStatus();
+    this.pushSetupStatus();
+    // Tell the user once per connection what finished while they were away.
+    if (!this.reportedAway) {
+      this.reportedAway = true;
+      void this.notifier.reportAway(snap);
+    }
+  }
+
+  private pushSetupStatus(): void {
+    const status = computeSetupStatus(this.context, {
+      daemonConnected: !!this.client,
+      workspace: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "",
+    });
+    this.pushToWebviews({ type: "setupStatus", status });
   }
 
   private async sendSnapshot(): Promise<void> {
@@ -416,11 +436,15 @@ class ConductorExtension implements vscode.Disposable {
           if (this.lastSnapshot) {
             source.post({ type: "snapshot", snapshot: this.lastSnapshot });
           }
+          this.pushSetupStatus();
           await this.sendSnapshot();
           return;
         }
         case "requestSnapshot":
           await this.sendSnapshot();
+          return;
+        case "requestSetupStatus":
+          this.pushSetupStatus();
           return;
         case "hostInfo": {
           source.post({
@@ -551,6 +575,35 @@ class ConductorExtension implements vscode.Disposable {
     reg("agent-conductor.pauseQueue", () => void this.pauseQueueInteractive());
     reg("agent-conductor.resumeQueue", () => void this.resumeQueue());
     reg("agent-conductor.extendPause", () => void this.extendPause(15 * 60_000));
+    reg("agent-conductor.trustWorkspace", () => void this.trustWorkspace());
+  }
+
+  /** Trust the open folder for Claude Code — explicit user action only. */
+  private async trustWorkspace(): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!folder) {
+      void vscode.window.showWarningMessage("Open the folder you want agents to work in first.");
+      return;
+    }
+    if (!this.client) {
+      void vscode.window.showWarningMessage("Agent Conductor daemon is not connected.");
+      return;
+    }
+    const ok = await vscode.window.showWarningMessage(
+      `Let Claude Code work in ${folder}?`,
+      { modal: true, detail: "This records the folder as trusted in ~/.claude.json, exactly as answering Claude Code's own prompt would. A backup is taken first." },
+      "Trust folder"
+    );
+    if (ok !== "Trust folder") {
+      return;
+    }
+    try {
+      await this.client.request("trustWorkspace", { path: folder });
+      void vscode.window.showInformationMessage("Folder trusted.");
+      this.pushSetupStatus();
+    } catch (e: any) {
+      void vscode.window.showErrorMessage(`Could not trust the folder: ${e?.message ?? e}`);
+    }
   }
 
   // ---- pause commands (§5.6) ----

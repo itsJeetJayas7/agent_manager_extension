@@ -596,7 +596,10 @@ func TestWeeklyExhaustionSuppressesAnchor(t *testing.T) {
 
 // ---- crash recovery ----
 
-func TestRestartDoesNotDuplicateAndContinueResumes(t *testing.T) {
+// §7.8 — recoverOnStartup used to dump every active run into NEEDS_ATTENTION.
+// A run whose native session is known is reattached instead, in the SAME
+// session, so a daemon restart is survivable rather than merely survived.
+func TestRestartReattachesToTheSameSession(t *testing.T) {
 	h := newHarness(t)
 	h.fakeClaude.SetScripts([]providers.Script{{Match: "*", Duration: 60 * time.Minute}}) // long run
 	_, runID, _ := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "long task", Provider: model.ProviderClaude, Cwd: t.TempDir()})
@@ -604,16 +607,76 @@ func TestRestartDoesNotDuplicateAndContinueResumes(t *testing.T) {
 		t.Fatal("run should be active")
 	}
 	sess := h.run(runID).ProviderSessionID
-	// simulate daemon restart: stop conductor, run recovery on a fresh one sharing store
+	if sess == "" {
+		t.Fatal("precondition: the native session id must be known")
+	}
+
+	// The run finishes promptly once it is resumed.
+	h.fakeClaude.SetScripts(nil)
+	h.restart()
+
+	if !h.waitState(runID, 5*time.Second, model.StateCompleted) {
+		t.Fatalf("run was not reattached after the restart: %s (%s)", h.run(runID).State, h.run(runID).ErrorMsg)
+	}
+	if got := h.run(runID).ProviderSessionID; got != sess {
+		t.Fatalf("reattach used a different session: %s, want %s", got, sess)
+	}
+	if h.run(runID).Attempt < 2 {
+		t.Fatal("the resume should be recorded as a further attempt, not a duplicate run")
+	}
+}
+
+// A run that never reached the provider has nothing to reattach to, so it must
+// still be handed to the user rather than silently restarted.
+func TestRestartWithoutASessionNeedsAttention(t *testing.T) {
+	h := newHarness(t)
+	_, runID, _ := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "x", Provider: model.ProviderClaude, Cwd: t.TempDir()})
+	// Force the pathological shape: active, but no session was ever created.
+	if err := h.store.TransitionRun(runID, model.StatePreparing, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	r := h.run(runID)
+	r.ProviderSessionID = ""
+	h.store.UpdateRun(r)
+
+	h.conductor.recoverOnStartup()
+
+	if st := h.run(runID).State; st != model.StateNeedsAttention {
+		t.Fatalf("a run with no session must need attention, got %s", st)
+	}
+}
+
+// A cancellation in flight when the daemon stopped must not hold a slot.
+func TestRestartCompletesAnInFlightCancellation(t *testing.T) {
+	h := newHarness(t)
+	_, runID, _ := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "x", Provider: model.ProviderClaude, Cwd: t.TempDir()})
+	if err := h.store.TransitionRun(runID, model.StateCancelRequested, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	h.conductor.recoverOnStartup()
+
+	if st := h.run(runID).State; st != model.StateCancelled {
+		t.Fatalf("an interrupted cancellation must settle as CANCELLED, got %s", st)
+	}
+}
+
+// A user-driven continue still reuses the native session.
+func TestContinueReusesTheNativeSession(t *testing.T) {
+	h := newHarness(t)
+	h.fakeClaude.SetScripts([]providers.Script{{Match: "*", Duration: 60 * time.Minute}})
+	_, runID, _ := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "long task", Provider: model.ProviderClaude, Cwd: t.TempDir()})
+	if !h.waitState(runID, 3*time.Second, model.StateRunning) {
+		t.Fatal("run should be active")
+	}
+	sess := h.run(runID).ProviderSessionID
 	h.stopFn()
 	h.conductor.Stop()
 	time.Sleep(50 * time.Millisecond)
-	h.conductor.recoverOnStartup()
-	r := h.run(runID)
-	if r.State != model.StateNeedsAttention {
-		t.Fatalf("active run at restart must be NEEDS_ATTENTION, got %s", r.State)
+	if err := h.store.TransitionRun(runID, model.StateNeedsAttention, nil, nil); err != nil {
+		t.Fatal(err)
 	}
-	// user-driven continue must resume the SAME native session
+
 	h.fakeClaude.SetScripts(nil)
 	if err := h.conductor.ContinueRun(runID, model.ContinueAfterQuota); err != nil {
 		t.Fatal(err)

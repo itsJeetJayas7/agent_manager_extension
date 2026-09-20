@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"agent-conductor/internal/model"
@@ -466,6 +468,11 @@ func (c *Conductor) updateSystemHolds(s Settings, now time.Time, busyExt map[str
 	if p := c.PauseState(); p.Paused && p.Source == PauseSourceUser {
 		return
 	}
+	// Quiet hours outrank the other system holds: they are a standing
+	// instruction, not a transient condition.
+	if c.applyQuietHours(s, now) {
+		return
+	}
 	waiting, err := c.store.ListRunsByStates(queueWaitingStates()...)
 	if err != nil {
 		return
@@ -536,4 +543,80 @@ func queueWaitingStates() []model.RunState {
 		model.StateQueued, model.StateWaitingForSlot,
 		model.StateWaitingForExternal, model.StateWaitingForQuota,
 	}
+}
+
+// ---- quiet hours (§7.4) ----
+
+// parseHHMM reads a local "HH:MM" clock time.
+func parseHHMM(v string) (h, m int, ok bool) {
+	parts := strings.Split(strings.TrimSpace(v), ":")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	h, err1 := strconv.Atoi(parts[0])
+	m, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, 0, false
+	}
+	return h, m, true
+}
+
+// withinWorkingHours reports whether now falls inside [start, end), handling a
+// window that wraps past midnight (e.g. 22:00 → 08:00 means "work overnight").
+func withinWorkingHours(now time.Time, start, end string) (inside bool, nextChange time.Time, ok bool) {
+	sh, sm, ok1 := parseHHMM(start)
+	eh, em, ok2 := parseHHMM(end)
+	if !ok1 || !ok2 {
+		return true, time.Time{}, false
+	}
+	local := now.Local()
+	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, local.Location())
+	s := day.Add(time.Duration(sh)*time.Hour + time.Duration(sm)*time.Minute)
+	e := day.Add(time.Duration(eh)*time.Hour + time.Duration(em)*time.Minute)
+	if s.Equal(e) {
+		return true, time.Time{}, false // a zero-length window means "no limit"
+	}
+	if s.Before(e) {
+		switch {
+		case local.Before(s):
+			return false, s, true
+		case local.Before(e):
+			return true, e, true
+		default:
+			return false, s.AddDate(0, 0, 1), true
+		}
+	}
+	// Wrapping window: working hours run from s to midnight and midnight to e.
+	if local.Before(e) {
+		return true, e, true
+	}
+	if local.Before(s) {
+		return false, s, true
+	}
+	return true, e.AddDate(0, 0, 1), true
+}
+
+// applyQuietHours holds the queue outside the configured working window.
+func (c *Conductor) applyQuietHours(s Settings, now time.Time) bool {
+	if !s.QuietHoursEnabled {
+		c.ClearSystemPause(PauseSourceSchedule)
+		return false
+	}
+	inside, nextChange, ok := withinWorkingHours(now, s.QuietHoursStart, s.QuietHoursEnd)
+	if !ok {
+		c.ClearSystemPause(PauseSourceSchedule)
+		return false
+	}
+	if inside {
+		c.ClearSystemPause(PauseSourceSchedule)
+		return false
+	}
+	var resumeAt *time.Time
+	if !nextChange.IsZero() {
+		t := nextChange.UTC()
+		resumeAt = &t
+	}
+	reason := fmt.Sprintf("outside your working hours (%s–%s)", s.QuietHoursStart, s.QuietHoursEnd)
+	c.SetSystemPause(PauseSourceSchedule, reason, resumeAt)
+	return true
 }

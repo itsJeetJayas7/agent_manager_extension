@@ -732,6 +732,10 @@ func (cr *claudeRun) interrupt() {
 	}
 }
 
+// CanResumeSession: `claude --resume <session-id>` reattaches to a session,
+// on both the headless and the PTY path.
+func (c *Claude) CanResumeSession() bool { return true }
+
 // ActiveRuns lists run ids currently executing.
 func (c *Claude) ActiveRuns() []string {
 	c.mu.Lock()

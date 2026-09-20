@@ -126,6 +126,19 @@ type Adapter interface {
 	Close() error
 }
 
+// SessionResumer is implemented by adapters that can reattach to a native
+// session by id. Adapters that cannot must not implement it: the scheduler
+// treats "cannot resume" as "needs a human", never as "start over".
+type SessionResumer interface {
+	CanResumeSession() bool
+}
+
+// CanResume reports whether this adapter can continue an existing session.
+func CanResume(a Adapter) bool {
+	r, ok := a.(SessionResumer)
+	return ok && r.CanResumeSession()
+}
+
 // Registry maps provider names to adapters.
 type Registry struct {
 	mu       sync.RWMutex

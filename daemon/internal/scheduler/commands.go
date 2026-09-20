@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -734,4 +735,123 @@ func newID(prefix string) string {
 		return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 	}
 	return fmt.Sprintf("%s_%s", prefix, idEncoding.EncodeToString(b[:]))
+}
+
+// ---- usage & diffs (§7.6, §7.7) ----
+
+// RunUsage is one run's measured cost in time and continuations.
+type RunUsage struct {
+	RunID         string `json:"runId"`
+	Title         string `json:"title"`
+	Provider      string `json:"provider"`
+	Model         string `json:"model"`
+	State         string `json:"state"`
+	ActiveMs      int64  `json:"activeMs"`
+	QuotaWaitMs   int64  `json:"quotaWaitMs"`
+	Continuations int    `json:"continuations"`
+	FinishedAt    string `json:"finishedAt,omitempty"`
+}
+
+// UsageSummary aggregates what was actually measured.
+//
+// Deliberately no dollar figures: the daemon does not know token prices or
+// which plan a run billed against, and inventing a number would be worse than
+// showing none.
+type UsageSummary struct {
+	Since         string           `json:"since"`
+	Runs          int              `json:"runs"`
+	Completed     int              `json:"completed"`
+	Failed        int              `json:"failed"`
+	ActiveMs      int64            `json:"activeMs"`
+	QuotaWaitMs   int64            `json:"quotaWaitMs"`
+	Continuations int              `json:"continuations"`
+	ByProvider    map[string]int64 `json:"byProviderActiveMs"`
+	Recent        []RunUsage       `json:"recent"`
+	ByDay         map[string]int64 `json:"byDayActiveMs"`
+	Note          string           `json:"note"`
+}
+
+// UsageSince summarises runs created in the given window.
+func (c *Conductor) UsageSince(window time.Duration) (*UsageSummary, error) {
+	runs, err := c.store.ListRunsByStates(allStatesList()...)
+	if err != nil {
+		return nil, err
+	}
+	cutoff := c.Now().Add(-window)
+	out := &UsageSummary{
+		Since:      cutoff.UTC().Format(time.RFC3339),
+		ByProvider: map[string]int64{},
+		ByDay:      map[string]int64{},
+		Note:       "Measured wall-clock time only. Agent Conductor does not estimate spend.",
+	}
+	for _, r := range runs {
+		if r.CreatedAt.Before(cutoff) {
+			continue
+		}
+		activeMs := r.ActiveNS / int64(time.Millisecond)
+		out.Runs++
+		out.ActiveMs += activeMs
+		out.QuotaWaitMs += r.QuotaWaitNS / int64(time.Millisecond)
+		out.Continuations += r.ContinuationCount
+		out.ByProvider[r.Provider] += activeMs
+		out.ByDay[r.CreatedAt.UTC().Format("2006-01-02")] += activeMs
+		switch r.State {
+		case model.StateCompleted:
+			out.Completed++
+		case model.StateFailed, model.StateNeedsAttention, model.StateOrphaned:
+			out.Failed++
+		}
+		u := RunUsage{
+			RunID: r.ID, Title: r.Title, Provider: r.Provider, Model: r.Model,
+			State: string(r.State), ActiveMs: activeMs,
+			QuotaWaitMs: r.QuotaWaitNS / int64(time.Millisecond), Continuations: r.ContinuationCount,
+		}
+		if !r.FinishedAt.IsZero() {
+			u.FinishedAt = r.FinishedAt.UTC().Format(time.RFC3339)
+		}
+		out.Recent = append(out.Recent, u)
+	}
+	sort.Slice(out.Recent, func(i, j int) bool { return out.Recent[i].ActiveMs > out.Recent[j].ActiveMs })
+	if len(out.Recent) > 10 {
+		out.Recent = out.Recent[:10]
+	}
+	return out, nil
+}
+
+// RunDiff describes what a run changed on disk.
+type RunDiff struct {
+	RunID   string `json:"runId"`
+	Summary string `json:"summary"`
+	Files   int    `json:"files"`
+	Branch  string `json:"branch,omitempty"`
+	Path    string `json:"path,omitempty"`
+}
+
+// RunDiffStat summarises a run's worktree against the batch's base.
+//
+// worktrees.DiffStat existed and was never called from anywhere.
+func (c *Conductor) RunDiffStat(runID string) (*RunDiff, error) {
+	r, err := c.store.GetRun(runID)
+	if err != nil || r == nil {
+		return nil, fmt.Errorf("run not found")
+	}
+	if r.WorktreePath == "" {
+		return nil, fmt.Errorf("this run did not use an isolated worktree")
+	}
+	b, err := c.store.GetBatch(r.BatchID)
+	if err != nil || b == nil {
+		return nil, fmt.Errorf("batch not found")
+	}
+	base := b.BaseCommit
+	if base == "" {
+		base = b.BaseBranch
+	}
+	if base == "" {
+		return nil, fmt.Errorf("the batch recorded no base to compare against")
+	}
+	summary, files, err := c.wt.DiffStat(r.WorktreePath, base)
+	if err != nil {
+		return nil, err
+	}
+	return &RunDiff{RunID: runID, Summary: summary, Files: files, Branch: r.Branch, Path: r.WorktreePath}, nil
 }

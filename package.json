@@ -68,6 +68,22 @@
       {
         "command": "agent-conductor.uninstallService",
         "title": "Agent Conductor: Uninstall Background Service & Hooks"
+      },
+      {
+        "command": "agent-conductor.pauseQueue",
+        "title": "Agent Conductor: Pause Queue\u2026"
+      },
+      {
+        "command": "agent-conductor.resumeQueue",
+        "title": "Agent Conductor: Resume Queue"
+      },
+      {
+        "command": "agent-conductor.extendPause",
+        "title": "Agent Conductor: Extend Pause by 15 Minutes"
+      },
+      {
+        "command": "agent-conductor.trustWorkspace",
+        "title": "Agent Conductor: Trust This Folder for Claude Code"
       }
     ],
     "configuration": {
@@ -97,7 +113,19 @@
           "description": "Maximum automatic verify -> agent-fix -> re-verify cycles before NEEDS_ATTENTION."
         }
       }
-    }
+    },
+    "keybindings": [
+      {
+        "command": "agent-conductor.pauseQueue",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p"
+      },
+      {
+        "command": "agent-conductor.resumeQueue",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r"
+      }
+    ]
   },
   "scripts": {
     "build": "node scripts/build.mjs",

@@ -51,7 +51,12 @@ type Settings struct {
 	VerificationTimeoutSec int  `json:"verificationTimeoutSec"`
 	ClaudeAPIMode          bool `json:"claudeApiMode"`
 	FIFOBlockOnExternal    bool `json:"fifoBlockOnExternal"`
-	Paused                 bool `json:"paused"`
+	// Quiet hours (§7.4): outside [QuietHoursStart, QuietHoursEnd) the queue is
+	// held with source "schedule", on the same PauseState machinery.
+	QuietHoursEnabled bool   `json:"quietHoursEnabled"`
+	QuietHoursStart   string `json:"quietHoursStart"` // local "HH:MM" — work may start
+	QuietHoursEnd     string `json:"quietHoursEnd"`   // local "HH:MM" — work must stop
+	Paused            bool   `json:"paused"`
 }
 
 // DefaultSettings returns production defaults.
@@ -68,6 +73,8 @@ func DefaultSettings() Settings {
 		MaxAuditCycles: 1, MaxVerifyFixCycles: 2,
 		VerificationTimeoutSec: int(defaultVerificationTimeout / time.Second),
 		FIFOBlockOnExternal:    true,
+		QuietHoursStart:        "09:00",
+		QuietHoursEnd:          "18:00",
 	}
 }
 

@@ -172,6 +172,14 @@ func (s *Server) Close() {
 
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
+
+	// Defence in depth on top of the 0600 socket and the token: refuse a peer
+	// running as a different user, where the platform can tell us.
+	if uid, ok := peerUID(conn); ok && uid != os.Getuid() {
+		s.log.Errorf("rejected connection from uid %d (daemon runs as %d)", uid, os.Getuid())
+		return
+	}
+
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 	out := make(chan any, 256)
@@ -554,9 +562,16 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		if !ok {
 			return nil, e("TRUST", "unexpected adapter")
 		}
+		// Only trust a folder Agent Conductor is actually about to run in:
+		// accepting an arbitrary path from the webview would let a stray
+		// message mark anything on disk as trusted.
+		if !s.isKnownRunCwd(in.Path) {
+			return nil, e("TRUST", "refusing to trust a folder that no queued run uses")
+		}
 		if err := cl.TrustWorkspace(in.Path); err != nil {
 			return nil, e("TRUST", err.Error())
 		}
+		s.log.Infof("workspace trusted for Claude Code: %s", in.Path)
 		return map[string]any{"ok": true}, nil
 	case "revealEffectivePrompt":
 		var in struct {
@@ -639,6 +654,29 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		s.hookBus.Publish(p)
 		return map[string]any{"ok": true}, nil
+	case "usageSummary":
+		var in struct {
+			WindowDays int `json:"windowDays"`
+		}
+		json.Unmarshal(params, &in)
+		if in.WindowDays <= 0 {
+			in.WindowDays = 7
+		}
+		sum, err := s.conductor.UsageSince(time.Duration(in.WindowDays) * 24 * time.Hour)
+		if err != nil {
+			return nil, e("USAGE", err.Error())
+		}
+		return sum, nil
+	case "runDiff":
+		var in struct {
+			RunID string `json:"runId"`
+		}
+		json.Unmarshal(params, &in)
+		d, err := s.conductor.RunDiffStat(in.RunID)
+		if err != nil {
+			return nil, e("DIFF", err.Error())
+		}
+		return d, nil
 	case "compact":
 		n, err := s.store.Compact(db.DefaultRetention(), time.Now().UTC())
 		if err != nil {
@@ -703,6 +741,33 @@ func (s *Server) snapshot() map[string]any {
 		"hasSecretBlock": s.conductor.HasSecretBlock(),
 		"host":           hostInfo(),
 	}
+}
+
+// isKnownRunCwd reports whether path is the working directory (or worktree) of
+// a run this daemon knows about.
+func (s *Server) isKnownRunCwd(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	runs, err := s.store.ListRunsByStates(model.StateQueued, model.StateWaitingForSlot,
+		model.StateWaitingForExternal, model.StateWaitingForQuota, model.StatePreparing,
+		model.StateStarting, model.StateRunning, model.StateNeedsAttention, model.StatePaused,
+		model.StateFailed, model.StateBlocked, model.StateOrphaned)
+	if err != nil {
+		return false
+	}
+	for _, r := range runs {
+		for _, candidate := range []string{r.Cwd, r.WorktreePath} {
+			if candidate == "" {
+				continue
+			}
+			if c, err := filepath.Abs(candidate); err == nil && c == abs {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hostInfo() map[string]any {

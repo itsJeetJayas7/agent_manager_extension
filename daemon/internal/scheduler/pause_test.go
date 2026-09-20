@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -255,5 +256,113 @@ func TestPauseValidation(t *testing.T) {
 	st := mustPause(t, h, PauseRequest{DurationMs: 120_000})
 	if st.ResumeAt == nil || st.ResumeAt.Sub(h.conductor.Now()) < 110*time.Second {
 		t.Fatal("a second pause must replace the timer")
+	}
+}
+
+// §7.4 — quiet hours are the same machinery, labelled honestly.
+func TestQuietHoursWindows(t *testing.T) {
+	at := func(h, m int) time.Time {
+		return time.Date(2026, 3, 4, h, m, 0, 0, time.Local)
+	}
+	cases := []struct {
+		name         string
+		now          time.Time
+		start, end   string
+		wantInside   bool
+		wantNextHour int
+	}{
+		{"before the day starts", at(7, 0), "09:00", "18:00", false, 9},
+		{"during the day", at(12, 0), "09:00", "18:00", true, 18},
+		{"after the day ends", at(20, 0), "09:00", "18:00", false, 9},
+		{"overnight window, late evening", at(23, 0), "22:00", "08:00", true, 8},
+		{"overnight window, early morning", at(3, 0), "22:00", "08:00", true, 8},
+		{"overnight window, midday", at(12, 0), "22:00", "08:00", false, 22},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inside, next, ok := withinWorkingHours(tc.now, tc.start, tc.end)
+			if !ok {
+				t.Fatal("window should parse")
+			}
+			if inside != tc.wantInside {
+				t.Fatalf("inside=%v, want %v", inside, tc.wantInside)
+			}
+			if next.Hour() != tc.wantNextHour {
+				t.Fatalf("next change at %s, want hour %d", next.Format(time.RFC3339), tc.wantNextHour)
+			}
+			if !next.After(tc.now) {
+				t.Fatalf("next change %s is not in the future", next)
+			}
+		})
+	}
+}
+
+func TestQuietHoursIgnoresUnparseableOrEmptyWindows(t *testing.T) {
+	now := time.Date(2026, 3, 4, 12, 0, 0, 0, time.Local)
+	for _, tc := range [][2]string{{"", ""}, {"nine", "six"}, {"09:00", "09:00"}, {"25:00", "18:00"}} {
+		inside, _, ok := withinWorkingHours(now, tc[0], tc[1])
+		if ok {
+			t.Fatalf("window %v should be rejected, not enforced", tc)
+		}
+		if !inside {
+			t.Fatalf("a rejected window must never hold the queue")
+		}
+	}
+}
+
+func TestQuietHoursHoldsTheQueueAndSaysWhy(t *testing.T) {
+	h := newHarness(t)
+	now := h.conductor.Now().Local()
+	// A window that definitely excludes "now".
+	start := now.Add(2 * time.Hour).Format("15:04")
+	end := now.Add(4 * time.Hour).Format("15:04")
+	s := h.conductor.Settings()
+	s.QuietHoursEnabled = true
+	s.QuietHoursStart = start
+	s.QuietHoursEnd = end
+	if err := h.conductor.UpdateSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	_, runID, _ := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "later", Provider: model.ProviderClaude, Cwd: t.TempDir()})
+
+	if !h.tickUntil(time.Second, func() bool { return h.conductor.PauseState().Source == PauseSourceSchedule }) {
+		t.Fatalf("quiet hours did not hold the queue: %+v", h.conductor.PauseState())
+	}
+	p := h.conductor.PauseState()
+	if p.ResumeAt == nil {
+		t.Fatal("a scheduled hold must say when it lifts")
+	}
+	if !strings.Contains(p.Reason, start) {
+		t.Fatalf("the hold does not explain itself: %q", p.Reason)
+	}
+	if st := h.run(runID).State; st == model.StateRunning || st == model.StateCompleted {
+		t.Fatalf("a run started during quiet hours: %s", st)
+	}
+
+	// Turning them off releases the queue.
+	s.QuietHoursEnabled = false
+	if err := h.conductor.UpdateSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	if !h.waitState(runID, 3*time.Second, model.StateCompleted) {
+		t.Fatalf("queue did not resume once quiet hours were off: %s", h.run(runID).State)
+	}
+}
+
+// A user pause still outranks a scheduled hold.
+func TestUserPauseOutranksQuietHours(t *testing.T) {
+	h := newHarness(t)
+	mustPause(t, h, PauseRequest{Source: PauseSourceUser, Reason: "mine"})
+	s := h.conductor.Settings()
+	s.QuietHoursEnabled = true
+	s.QuietHoursStart = "00:00"
+	s.QuietHoursEnd = "00:01"
+	if err := h.conductor.UpdateSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "x", Provider: model.ProviderClaude, Cwd: t.TempDir()})
+	h.tickUntil(300*time.Millisecond, func() bool { return false })
+	if p := h.conductor.PauseState(); p.Source != PauseSourceUser || p.Reason != "mine" {
+		t.Fatalf("a scheduled hold overwrote the user pause: %+v", p)
 	}
 }

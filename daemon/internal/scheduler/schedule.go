@@ -8,6 +8,7 @@ import (
 
 	"agent-conductor/internal/db"
 	"agent-conductor/internal/model"
+	"agent-conductor/internal/providers"
 )
 
 // schedule is the single decision function. It is pure with respect to DB
@@ -252,9 +253,13 @@ func (c *Conductor) continueRun(runID, why string) {
 	if err != nil || r == nil {
 		return
 	}
-	if !model.CanTransition(r.State, model.StateAutoResuming) {
-		// e.g. NEEDS_ATTENTION -> RUNNING allowed via table
-		if !model.CanTransition(r.State, model.StateRunning) {
+	// Pick a legal target rather than asking for one and giving up when the
+	// transition is refused: that left runs wedged in their previous state.
+	target := model.StateAutoResuming
+	if !model.CanTransition(r.State, target) {
+		target = model.StateRunning
+		if !model.CanTransition(r.State, target) {
+			c.log.Errorf("continue %s: no legal transition out of %s", runID, r.State)
 			return
 		}
 	}
@@ -267,13 +272,18 @@ func (c *Conductor) continueRun(runID, why string) {
 		}
 	}
 	c.store.AddRunEvent(r.ID, model.EventAutoResumeStarted, quoteJSON(why))
-	if err := c.store.TransitionRun(r.ID, model.StateAutoResuming, nil, func(x *model.Run) {
+	if err := c.store.TransitionRun(r.ID, target, nil, func(x *model.Run) {
 		x.ActiveNS = r.ActiveNS
 	}); err != nil {
 		c.log.Errorf("continue %s: %v", runID, err)
 		return
 	}
-	c.launchExecution(r, prompt, true)
+	// Re-read: launchExecution derives the dispatch state from what it is given.
+	fresh, err := c.store.GetRun(runID)
+	if err != nil || fresh == nil {
+		return
+	}
+	c.launchExecution(fresh, prompt, true)
 	c.emitRun(r.ID)
 }
 
@@ -285,6 +295,35 @@ func (c *Conductor) recoverOnStartup() {
 		return
 	}
 	for _, r := range runs {
+		// A cancellation that was in flight when the daemon stopped has no
+		// execution to interrupt any more.
+		if r.State == model.StateCancelRequested {
+			c.store.AddRunEvent(r.ID, model.EventRunCancelled, quoteJSON("daemon restarted during cancellation"))
+			c.transition(r.ID, model.StateCancelled, nil, func(x *model.Run) {
+				x.FinalOutcome = "CANCELLED"
+				x.FinishedAt = c.Now()
+			})
+			c.emitRun(r.ID)
+			continue
+		}
+
+		// "Survives restarts" should be a fact, not a marketing claim: when the
+		// native session is known and the adapter can reattach, continue it
+		// instead of dumping the run on the user.
+		if r.ProviderSessionID != "" {
+			if adapter, ok := c.registry.Get(r.Provider); ok && providers.CanResume(adapter) {
+				c.log.Infof("run %s: reconnecting to %s session %s after daemon restart", r.ID, r.Provider, r.ProviderSessionID)
+				c.store.AddRunEvent(r.ID, model.EventOrphaned, quoteJSON("daemon restarted; reattaching to the existing session"))
+				// ORPHANED is the truthful intermediate state, and the one the
+				// resume path transitions out of.
+				if c.transition(r.ID, model.StateOrphaned, nil, nil) {
+					c.emitRun(r.ID)
+					c.continueRun(r.ID, "daemon restarted")
+					continue
+				}
+			}
+		}
+
 		reason := "daemon restarted while run was active"
 		c.store.AddRunEvent(r.ID, model.EventOrphaned, quoteJSON(reason))
 		c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {

@@ -69,19 +69,21 @@ func (s RunState) Active() bool {
 }
 
 // transitions is the legal transition table. Anything not listed is illegal.
+// ORPHANED is reachable from every dispatched state: it is what a run IS
+// after the daemon dies under it, and the recovery path resumes from there.
 var transitions = map[RunState][]RunState{
 	StateDraft:               {StateQueued, StateCancelled, StateSkipped},
 	StateQueued:              {StateWaitingForSlot, StateWaitingForExternal, StatePreparing, StateCancelRequested, StateCancelled, StateSkipped, StateFailed, StateNeedsAttention},
 	StateWaitingForSlot:      {StatePreparing, StateWaitingForExternal, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
 	StateWaitingForExternal:  {StatePreparing, StateWaitingForSlot, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
-	StatePreparing:           {StateStarting, StateFailed, StateNeedsAttention, StateCancelRequested, StateBlocked, StatePaused},
-	StateStarting:            {StateRunning, StateFailed, StateNeedsAttention, StateCancelRequested, StateWaitingForQuota, StatePaused},
+	StatePreparing:           {StateStarting, StateFailed, StateNeedsAttention, StateCancelRequested, StateBlocked, StatePaused, StateOrphaned},
+	StateStarting:            {StateRunning, StateFailed, StateNeedsAttention, StateCancelRequested, StateWaitingForQuota, StatePaused, StateOrphaned},
 	StateRunning:             {StateWaitingForQuota, StateVerifying, StateCompleted, StateBlocked, StateNeedsAttention, StateFailed, StateCancelRequested, StateWaitingForProvider, StateIntegrating, StateOrphaned, StatePaused},
 	StateWaitingForProvider:  {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StateOrphaned, StatePaused},
 	StateWaitingForQuota:     {StateAutoResuming, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
-	StateAutoResuming:        {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StatePaused},
-	StateVerifying:           {StateCompleted, StateRunning, StateNeedsAttention, StateFailed, StateCancelRequested, StateBlocked},
-	StateIntegrating:         {StateCompleted, StateAwaitingIntegration, StateNeedsAttention, StateFailed, StateCancelRequested},
+	StateAutoResuming:        {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StatePaused, StateOrphaned},
+	StateVerifying:           {StateCompleted, StateRunning, StateNeedsAttention, StateFailed, StateCancelRequested, StateBlocked, StateOrphaned},
+	StateIntegrating:         {StateCompleted, StateAwaitingIntegration, StateNeedsAttention, StateFailed, StateCancelRequested, StateOrphaned},
 	StateAwaitingIntegration: {StateIntegrating, StateCompleted, StateNeedsAttention, StateFailed, StateCancelled},
 	StateCancelRequested:     {StateCancelled, StateFailed, StateCompleted},
 	// A run parked by an INCLUDE_ACTIVE pause: stopped at a safe point, its

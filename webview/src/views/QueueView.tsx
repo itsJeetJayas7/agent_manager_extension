@@ -6,6 +6,7 @@ import type { RunLike } from "../../../src/extension/protocol";
 import StatusGlyph from "../components/StatusGlyph";
 import { PauseButton, PauseBand } from "../components/PauseControl";
 import { useNow } from "../components/ticker";
+import Onboarding, { useSetupStatus } from "../components/Onboarding";
 import { fmtDuration, elapsedSince, fmtRelative } from "../components/format";
 import {
   rpc,
@@ -472,6 +473,7 @@ export default function QueueView({ state }: { state: ConductorState }) {
   const parked = pausedRuns(state);
   const pause = state.snapshot?.pause ?? null;
   const paused = !!pause?.paused;
+  const setup = useSetupStatus();
   const [drag, setDrag] = useState<{ dragging: string | null; over: string | null }>({
     dragging: null,
     over: null,
@@ -536,6 +538,8 @@ export default function QueueView({ state }: { state: ConductorState }) {
           <PauseButton pause={pause} />
         </div>
       </header>
+
+      {setup && <Onboarding status={setup} />}
 
       {paused && pause && <PauseBand pause={pause} waitingCount={waiting.length} />}
 

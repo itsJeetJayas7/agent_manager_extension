@@ -129,6 +129,10 @@ export interface SettingsLike {
   verificationTimeoutSec: number;
   claudeApiMode: boolean;
   fifoBlockOnExternal: boolean;
+  quietHoursEnabled: boolean;
+  quietHoursStart: string;
+  quietHoursEnd: string;
+  /** Legacy mirror of pause.paused. */
   paused: boolean;
 }
 

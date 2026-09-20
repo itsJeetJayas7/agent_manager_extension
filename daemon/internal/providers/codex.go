@@ -713,6 +713,9 @@ func (c *Codex) Cancel(runID string) error {
 	return nil
 }
 
+// CanResumeSession: the app-server exposes thread/resume.
+func (c *Codex) CanResumeSession() bool { return true }
+
 // InterruptThread sends turn/interrupt for a thread's active turn.
 func (c *Codex) InterruptThread(ctx context.Context, threadID string) error {
 	if err := c.ensureStarted(ctx); err != nil {
