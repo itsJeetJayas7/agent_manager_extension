@@ -554,7 +554,20 @@ export default function QueueView({ state }: { state: ConductorState }) {
 
       {setup && <Onboarding status={setup} />}
 
-      {paused && pause && <PauseBand pause={pause} waitingCount={waiting.length} />}
+      {paused && pause && (
+        <PauseBand
+          pause={pause}
+          waitingCount={waiting.length}
+          availableProvider={
+            pause.source === "quota"
+              ? ["claude", "codex"].find(
+                  (p) =>
+                    state.snapshot?.providers?.[p]?.installed && !state.snapshot?.quota?.[p]?.blocked
+                )
+              : undefined
+          }
+        />
+      )}
 
       {!state.daemonHealthy && (
         <div className="ac-banner err ac-band-pad" role="status">

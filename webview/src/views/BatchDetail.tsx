@@ -1,5 +1,6 @@
 // Batch detail: deterministic analysis, run cards, timeline, report.
-import { useEffect, useState } from "react";
+// §7.7 — worktrees.DiffStat existed and was never called from anywhere.
+import { useCallback, useEffect, useState } from "react";
 import { detailBatchId } from "../state/store";
 import { rpc, confirm, notify, openClaudeSession, openCodexThread, openWorktree, copyText } from "../api/client";
 import StatusGlyph from "../components/StatusGlyph";
@@ -179,6 +180,7 @@ function RunCard({ run, events }: { run: any; events: any[] }) {
           </button>
         )}
         {run.worktreePath && <button className="ac-btn ghost ac-btn-sm" onClick={() => openWorktree(run.worktreePath)}>Open worktree</button>}
+        <DiffStat run={run} />
         <button className="ac-btn ghost ac-btn-sm" onClick={() => rpc("revealEffectivePrompt", { runId: run.id }).then((r: any) => {
           copyText(r.text, !!r.containsSecrets);
         })}>Copy effective prompt</button>
@@ -225,5 +227,38 @@ function RunCard({ run, events }: { run: any; events: any[] }) {
         </ul>
       )}
     </article>
+  );
+}
+
+/** "+142 −18 across 7 files" for a run that worked in its own worktree. */
+function DiffStat({ run }: { run: any }) {
+  const [stat, setStat] = useState<{ summary: string; files: number } | null>(null);
+  const [error, setError] = useState("");
+  const [asked, setAsked] = useState(false);
+
+  const load = useCallback(() => {
+    setAsked(true);
+    rpc<{ summary: string; files: number }>("runDiff", { runId: run.id })
+      .then(setStat)
+      .catch((e: any) => setError(String(e?.message ?? e)));
+  }, [run.id]);
+
+  if (!run.worktreePath) {
+    return null;
+  }
+  if (stat) {
+    return (
+      <span className="ac-xs ac-muted ac-num" title={`${run.branch ?? ""} vs the batch base`}>
+        {stat.summary} · {stat.files} file{stat.files === 1 ? "" : "s"}
+      </span>
+    );
+  }
+  if (error) {
+    return <span className="ac-xs ac-muted">{error}</span>;
+  }
+  return (
+    <button className="ac-btn ghost ac-btn-sm" disabled={asked} onClick={load}>
+      {asked ? "…" : "Show changes"}
+    </button>
   );
 }

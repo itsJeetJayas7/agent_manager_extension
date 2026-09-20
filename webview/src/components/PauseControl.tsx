@@ -212,11 +212,12 @@ export function PauseButton({ pause }: { pause: PauseStateLike | null }) {
 export function PauseBand({
   pause,
   waitingCount,
-  onQuotaEscape,
+  availableProvider,
 }: {
   pause: PauseStateLike;
   waitingCount: number;
-  onQuotaEscape?: () => void;
+  /** A provider that still has quota, when the hold is a quota hold. */
+  availableProvider?: string;
 }) {
   const now = useNow();
   const [busy, setBusy] = useState(false);
@@ -286,10 +287,10 @@ export function PauseBand({
         <button className="ac-btn ac-btn-sm" disabled={busy} onClick={() => void call("resumeQueue")}>
           Resume now
         </button>
-        {pause.source === "quota" && onQuotaEscape && (
-          <button className="ac-btn ghost ac-btn-sm" onClick={onQuotaEscape}>
-            Queue on the other provider
-          </button>
+        {pause.source === "quota" && availableProvider && (
+          <span className="ac-xs ac-muted">
+            {availableProvider} still has quota — queue there instead.
+          </span>
         )}
       </div>
     </div>

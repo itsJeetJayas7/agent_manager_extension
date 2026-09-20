@@ -1,7 +1,7 @@
 // Control tab: a short always-visible status summary, then progressive
 // disclosure. It used to be seven stacked accordions, all collapsed — a filing
 // cabinet rather than a control surface. Pause has moved to the queue header.
-import React, { useState } from "react";
+import React, { Fragment, useCallback, useEffect, useState } from "react";
 import type { ConductorState } from "../state/store";
 import { rpc, confirm, notify, vscodeApi } from "../api/client";
 
@@ -487,6 +487,84 @@ function Staged({ state }: { state: ConductorState }) {
   );
 }
 
+interface UsageSummary {
+  runs: number;
+  completed: number;
+  failed: number;
+  activeMs: number;
+  quotaWaitMs: number;
+  continuations: number;
+  byProviderActiveMs: Record<string, number>;
+  recent: { runId: string; title: string; provider: string; activeMs: number; continuations: number }[];
+  note: string;
+}
+
+function fmtHours(ms: number): string {
+  if (ms < 60_000) {
+    return `${Math.round(ms / 1000)}s`;
+  }
+  const m = Math.round(ms / 60_000);
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+/** §7.6 — only what is measured. No invented spend. */
+function Usage() {
+  const [data, setData] = useState<UsageSummary | null>(null);
+  const [error, setError] = useState("");
+  const load = useCallback(() => {
+    rpc<UsageSummary>("usageSummary", { windowDays: 7 })
+      .then(setData)
+      .catch((e: any) => setError(String(e?.message ?? e)));
+  }, []);
+  useEffect(load, [load]);
+
+  return (
+    <Disclosure title="This week">
+      {error && <div className="ac-banner err">{error}</div>}
+      {!data && !error && <div className="ac-xs ac-muted">loading…</div>}
+      {data && (
+        <>
+          <dl className="ac-kv">
+            <dt>Runs</dt>
+            <dd className="ac-num">
+              {data.runs} · {data.completed} completed · {data.failed} needed you
+            </dd>
+            <dt>Agent time</dt>
+            <dd className="ac-num">{fmtHours(data.activeMs)}</dd>
+            <dt>Waiting on quota</dt>
+            <dd className="ac-num">{fmtHours(data.quotaWaitMs)}</dd>
+            <dt>Continuations</dt>
+            <dd className="ac-num">{data.continuations}</dd>
+            {Object.entries(data.byProviderActiveMs ?? {}).map(([p, ms]) => (
+              <Fragment key={p}>
+                <dt className="ac-cap">{p}</dt>
+                <dd className="ac-num">{fmtHours(ms)}</dd>
+              </Fragment>
+            ))}
+          </dl>
+          {data.recent.length > 0 && (
+            <>
+              <div className="ac-eyebrow ac-mt-3 ac-mb-2">Longest runs</div>
+              <ul className="ac-checklist">
+                {data.recent.slice(0, 5).map((r) => (
+                  <li key={r.runId}>
+                    <span className="ac-grow ac-trunc">{r.title || r.runId}</span>
+                    <span className="ac-xs ac-muted ac-num">{fmtHours(r.activeMs)}</span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          <div className="ac-xs ac-muted ac-mt-3">{data.note}</div>
+          <button className="ac-btn ghost ac-btn-sm ac-mt-2" onClick={load}>
+            Refresh
+          </button>
+        </>
+      )}
+    </Disclosure>
+  );
+}
+
 function Maintenance() {
   const [busy, setBusy] = useState(false);
   return (
@@ -536,6 +614,7 @@ export default function ControlView({ state }: { state: ConductorState }) {
       <AnchorSection state={state} />
       <SecretBlock state={state} />
       <Staged state={state} />
+      <Usage />
       <Maintenance />
     </div>
   );
