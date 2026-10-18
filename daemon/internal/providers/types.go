@@ -19,6 +19,8 @@ const (
 	EvMessageDelta   EventKind = "message_delta"
 	EvTurnCompleted  EventKind = "turn_completed" // terminal for the turn
 	EvProcessExited  EventKind = "process_exited"
+	EvProcessStarted EventKind = "process_started"
+	EvActivity       EventKind = "activity" // observable work, without assistant text
 	EvQuotaUpdate    EventKind = "quota_update"
 	EvAccountUpdate  EventKind = "account_update"
 )
@@ -55,6 +57,7 @@ type Event struct {
 	Progress   bool // meaningful progress evidence
 	Quota      []QuotaWindow
 	Model      string
+	ProcessID  int
 	At         time.Time
 }
 

@@ -2,7 +2,7 @@
   "name": "agent-conductor",
   "displayName": "Agent Conductor",
   "description": "Queue, supervise, and orchestrate Claude Code and Codex coding-agent runs from one quiet sidebar. Survives VS Code shutdown via a persistent daemon.",
-  "version": "0.1.0",
+  "version": "0.3.2",
   "publisher": "agent-conductor-local",
   "license": "MIT",
   "private": true,
@@ -48,6 +48,10 @@
         "title": "Agent Conductor: Build Batch"
       },
       {
+        "command": "agent-conductor.importPromptsFromFolder",
+        "title": "Agent Conductor: Import Prompts from Folder"
+      },
+      {
         "command": "agent-conductor.diagnostics",
         "title": "Agent Conductor: Diagnostics"
       },
@@ -66,6 +70,14 @@
       {
         "command": "agent-conductor.installService",
         "title": "Agent Conductor: Install Background Service"
+      },
+      {
+        "command": "agent-conductor.enableClaudeLiveView",
+        "title": "Agent Conductor: Enable Live View in Claude Code"
+      },
+      {
+        "command": "agent-conductor.disableClaudeLiveView",
+        "title": "Agent Conductor: Disable Live View in Claude Code"
       },
       {
         "command": "agent-conductor.uninstallService",
@@ -91,6 +103,11 @@
     "configuration": {
       "title": "Agent Conductor",
       "properties": {
+        "agentConductor.notifyOnExternalOverlap": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a VS Code notification when you start an external agent while Agent Conductor work is running. External agents never pause the queue."
+        },
         "agentConductor.daemonPath": {
           "type": "string",
           "default": "",
@@ -145,10 +162,13 @@
     "dev": "node esbuild.mjs --watch",
     "test:node": "vitest run",
     "build:fast": "node scripts/build.mjs --host-only",
-    "ci": "npm run lint && npm run test && npm run test:boot && node tests/integration/daemon-e2e.mjs",
+    "ci": "npm run lint && npm run test && npm run test:boot && node tests/integration/daemon-e2e.mjs && node tests/integration/daemon-stress.mjs && node tests/integration/prompt-sequence-e2e.mjs",
     "test:e2e": "node scripts/build.mjs --host-only && node tests/integration/daemon-e2e.mjs",
     "test:boot": "node scripts/build.mjs --host-only && node tests/integration/webview-boot.mjs",
-    "test:live": "node scripts/build.mjs --host-only && node tests/integration/providers-live.mjs"
+    "test:live": "node scripts/build.mjs --host-only && node tests/integration/providers-live.mjs",
+    "test:stress": "node scripts/build.mjs --host-only && node tests/integration/daemon-stress.mjs",
+    "test:sequence": "node scripts/build.mjs --host-only && node tests/integration/prompt-sequence-e2e.mjs",
+    "test:browser": "node scripts/build.mjs --host-only && node tests/integration/webview-browser.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -162,13 +182,14 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@types/vscode": "^1.85.0",
-    "@vitejs/plugin-react": "^4.3.1",
-    "@vscode/vsce": "^3.1.0",
-    "esbuild": "^0.23.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
     "jsdom": "^25.0.0",
+    "playwright-core": "^1.63.0",
     "typescript": "^5.5.4",
-    "vite": "^5.4.0",
-    "vitest": "^2.0.5"
+    "vite": "^7.3.6",
+    "vitest": "^4.1.11"
   },
   "icon": "assets/icon.png",
   "repository": {
@@ -190,8 +211,8 @@
   ],
   "capabilities": {
     "untrustedWorkspaces": {
-      "supported": false,
-      "description": "Agent Conductor runs coding agents that read and modify files in this folder."
+      "supported": true,
+      "description": "Personal installation: all queued working folders are trusted."
     }
   }
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"agent-conductor/internal/api"
+	"agent-conductor/internal/claudewrap"
 	"agent-conductor/internal/db"
 	"agent-conductor/internal/hooks"
 	"agent-conductor/internal/hooksbridge"
@@ -50,6 +51,13 @@ func main() {
 			die("usage: agent-conductor hook <claude|codex> [--gate]")
 		}
 		os.Exit(hooksbridge.Run(args[1], args[2:]...))
+	case "claude-wrapper":
+		os.Exit(runClaudeWrapper(args[1:]))
+	case "install-claude-wrapper":
+		var path string
+		if path, err = claudewrap.Install(root()); err == nil {
+			fmt.Println(path)
+		}
 	case "completion-gate":
 		// Explicit alias that always enables the managed completion gate.
 		if len(args) < 2 {
@@ -151,6 +159,8 @@ func serve(mock bool) error {
 	// restore persisted quota observations
 	restoreQuota(store, guardian)
 
+	claudewrap.Refresh(paths.Root)
+
 	srv := api.NewServer(paths, store, conductor, registry, guardian, hookBus, log, Version)
 	if err := srv.Listen(); err != nil {
 		return err
@@ -171,6 +181,9 @@ func serve(mock bool) error {
 	<-sig
 	log.Infof("shutting down")
 	conductor.Stop()
+	for _, a := range registry.All() {
+		_ = a.Close()
+	}
 	srv.Close()
 	return nil
 }
@@ -218,7 +231,7 @@ func installService() error {
 		fmt.Printf("\n%s\n", res.LingerNote)
 	}
 	// install provider awareness hooks (non-destructive)
-	if err := repairHooks(); err != nil {
+	if err := repairHooksAt(inst.StablePath()); err != nil {
 		fmt.Printf("warning: provider hooks not installed: %v\n", err)
 	}
 	return nil
@@ -247,8 +260,12 @@ func uninstallService() error {
 }
 
 func repairHooks() error {
+	return repairHooksAt(mustSelf())
+}
+
+func repairHooksAt(binary string) error {
 	home, _ := os.UserHomeDir()
-	hm := hooks.New(mustSelf(), home)
+	hm := hooks.New(binary, home)
 	r1, err := hm.InstallClaude()
 	if err != nil {
 		fmt.Printf("claude hooks: %v\n", err)

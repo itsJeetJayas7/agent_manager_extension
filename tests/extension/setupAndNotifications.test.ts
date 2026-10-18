@@ -7,6 +7,11 @@ import { Notifier, inQuietHours } from "../../src/extension/notifications";
 import { __reset } from "../support/vscode";
 import { createRequire } from "module";
 
+vi.mock("fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("fs")>();
+  return { ...actual, existsSync: vi.fn(actual.existsSync) };
+});
+
 const require = createRequire(import.meta.url);
 const { DAEMON_BIN_DIR, DAEMON_BIN_NAME } = require("../../shared/artifacts.cjs");
 
@@ -17,6 +22,7 @@ beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ac-setup-"));
 });
 afterEach(() => {
+  vi.mocked(fs.existsSync).mockReset();
   fs.rmSync(tmp, { recursive: true, force: true });
   __reset();
 });
@@ -32,6 +38,7 @@ function withDaemon(): string {
 // §7.1 — every check carries the thing that fixes it.
 describe("setup checks", () => {
   it("fails loudly when no daemon binary exists and offers the command", () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
     const status = computeSetupStatus({ extensionPath: tmp }, { daemonConnected: false, workspace: "" });
     const bin = status.checks.find((c) => c.id === "binary")!;
     expect(bin.state).toBe("fail");

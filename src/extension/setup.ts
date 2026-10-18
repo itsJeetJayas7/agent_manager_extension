@@ -40,17 +40,6 @@ export function serviceInstalled(): boolean {
   return candidates.some((p) => fs.existsSync(p));
 }
 
-/** Whether Claude Code has recorded this folder as trusted. */
-export function workspaceTrusted(cwd: string): boolean {
-  try {
-    const raw = fs.readFileSync(path.join(os.homedir(), ".claude.json"), "utf8");
-    const cfg = JSON.parse(raw) as { projects?: Record<string, { hasTrustDialogAccepted?: boolean }> };
-    return !!cfg.projects?.[path.resolve(cwd)]?.hasTrustDialogAccepted;
-  } catch {
-    return false;
-  }
-}
-
 export function computeSetupStatus(
   context: Pick<vscode.ExtensionContext, "extensionPath">,
   opts: { daemonConnected: boolean; workspace: string }
@@ -120,14 +109,11 @@ export function computeSetupStatus(
   });
 
   if (opts.workspace && runtimes.claude.installed) {
-    const trusted = workspaceTrusted(opts.workspace);
     checks.push({
       id: "trust",
-      label: "Claude Code trusts this folder",
-      state: trusted ? "ok" : "warn",
-      detail: trusted ? "trusted" : "Claude Code asks once before working in a new folder",
-      fixCommand: trusted ? undefined : "agent-conductor.trustWorkspace",
-      fixLabel: "Trust it",
+      label: "Workspace trust",
+      state: "ok",
+      detail: "All queued working folders are trusted in this personal installation",
     });
   }
 

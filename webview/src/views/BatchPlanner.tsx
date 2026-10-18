@@ -1,5 +1,5 @@
 // Wide batch planner: rows of LINEAR/PARALLEL cards with keyboard reordering.
-import { useState } from "react";
+import { useState, useEffect, useId } from "react";
 import type { ConductorState } from "../state/store";
 import { useConductor } from "../state/store";
 import { rpc, confirm, notify } from "../api/client";
@@ -22,7 +22,7 @@ interface RowDraft {
 
 let uid = 1;
 const newCard = (provider = "claude"): CardDraft => ({
-  prompt: "", provider, model: "", effort: "high", permission: "bypass",
+  prompt: "", provider, model: provider === "claude" ? "claude-opus-5-5" : "", effort: "high", permission: "bypass",
   attachSecrets: false, staged: false, title: "",
 });
 const newRow = (mode: "LINEAR" | "PARALLEL"): RowDraft => ({
@@ -36,6 +36,7 @@ export default function BatchPlanner() {
   const [title, setTitle] = useState("");
   const [rows, setRows] = useState<RowDraft[]>([newRow("LINEAR")]);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
   const [ok, setOk] = useState("");
   const [dragRow, setDragRow] = useState<string | null>(null);
   const [overRow, setOverRow] = useState<string | null>(null);
@@ -86,6 +87,8 @@ export default function BatchPlanner() {
   };
 
   const queueBatch = async () => {
+    if (busy) return;
+    setBusy(true);
     setError("");
     setOk("");
     const spec = {
@@ -105,6 +108,8 @@ export default function BatchPlanner() {
       notify("Batch queued.");
     } catch (e: any) {
       setError(String(e.message ?? e));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -112,7 +117,7 @@ export default function BatchPlanner() {
     <div className="ac-planner">
       <div className="ac-row between ac-mb-3">
         <h1 className="ac-display ac-h1">Batch planner</h1>
-        <button className="ac-btn" onClick={() => void queueBatch()}>Queue batch</button>
+        <button className="ac-btn" disabled={busy} onClick={() => void queueBatch()}>Queue batch</button>
       </div>
       <div className="ac-row ac-gap-3">
         <div className="ac-grow">
@@ -247,7 +252,7 @@ export default function BatchPlanner() {
           d.push(r);
         })}>Add parallel row</button>
         <div className="ac-grow" />
-        <button className="ac-btn" onClick={() => void queueBatch()}>Queue batch</button>
+        <button className="ac-btn" disabled={busy} onClick={() => void queueBatch()}>Queue batch</button>
       </div>
       <p className="ac-small ac-muted ac-mt-4">
         Linear rows run one run at a time; parallel rows run concurrently in isolated Git worktrees
@@ -293,13 +298,17 @@ function CardEditor({
   onPatch: (patch: Partial<CardDraft>) => void;
 }) {
   const models = (state.snapshot?.providers?.[card.provider]?.models ?? []).filter((m) => !m.hidden);
-  const efforts = models.find((m) => m.id === card.model)?.efforts ?? ["low", "medium", "high", "max"];
+  const efforts = models.find((m) => m.id === card.model)?.efforts ?? [];
+  const controlId = useId();
+  useEffect(() => {
+    if (models.length && card.effort && !efforts.includes(card.effort)) onPatch({ effort: "" });
+  }, [models, card.effort, efforts, onPatch]);
   return (
     <div className="ac-card-edit">
       <div className="ac-row between ac-mb-2">
         <div className="ac-seg" role="group" aria-label="Card provider">
           {["claude", "codex"].map((p) => (
-            <button key={p} aria-pressed={card.provider === p} onClick={() => onPatch({ provider: p, model: "" })}>
+            <button key={p} aria-pressed={card.provider === p} onClick={() => onPatch({ provider: p, model: p === "claude" ? "claude-opus-5-5" : "", effort: "" })}>
               {p === "claude" ? "Claude" : "Codex"}
             </button>
           ))}
@@ -315,20 +324,21 @@ function CardEditor({
           {onRemove && <button className="ac-icon-btn" aria-label="Remove card" onClick={onRemove}>✕</button>}
         </div>
       </div>
-      <label className="ac-sr">Prompt</label>
-      <textarea className="ac-textarea ac-textarea-sm" value={card.prompt}
+      <label className="ac-sr" htmlFor={`${controlId}-prompt`}>Prompt</label>
+      <textarea id={`${controlId}-prompt`} className="ac-textarea ac-textarea-sm" value={card.prompt}
         placeholder="Paste this card's task…" onChange={(e) => onPrompt(e.target.value)} />
       <div className="ac-inline-controls ac-mt-2">
         <div>
-          <label className="ac-label">Model</label>
-          <select className="ac-select" value={card.model} onChange={(e) => onPatch({ model: e.target.value })}>
+          <label className="ac-label" htmlFor={`${controlId}-model`}>Model</label>
+          <select id={`${controlId}-model`} className="ac-select" value={card.model} onChange={(e) => onPatch({ model: e.target.value })}>
             <option value="">(provider default)</option>
             {models.map((m) => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
           </select>
         </div>
         <div>
-          <label className="ac-label">Effort</label>
-          <select className="ac-select" value={card.effort} onChange={(e) => onPatch({ effort: e.target.value })}>
+          <label className="ac-label" htmlFor={`${controlId}-effort`}>Effort</label>
+          <select id={`${controlId}-effort`} className="ac-select" value={card.effort} onChange={(e) => onPatch({ effort: e.target.value })}>
+            <option value="">{efforts.length ? "Model default" : "Not supported"}</option>
             {efforts.map((f) => <option key={f} value={f}>{f}</option>)}
           </select>
         </div>

@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"agent-conductor/internal/model"
@@ -37,12 +38,14 @@ type streamMessage struct {
 	Model     string `json:"model"`
 	// assistant / user
 	Message json.RawMessage `json:"message"`
+	Event   json.RawMessage `json:"event"` // partial stream event
 	// result
 	IsError        bool            `json:"is_error"`
 	Result         string          `json:"result"`
 	StopReason     string          `json:"stop_reason"`
 	TerminalReason string          `json:"terminal_reason"`
 	APIErrorStatus json.RawMessage `json:"api_error_status"`
+	Errors         []string        `json:"errors"`
 	NumTurns       int             `json:"num_turns"`
 	// rate_limit_event
 	RateLimitInfo *claudeRateLimitInfo `json:"rate_limit_info"`
@@ -84,7 +87,7 @@ func quotaFromRateLimitEvent(info *claudeRateLimitInfo) []QuotaWindow {
 		return nil
 	}
 	blockedType := ""
-	if !strings.EqualFold(info.Status, "allowed") && info.Status != "" {
+	if strings.EqualFold(info.Status, "rejected") {
 		blockedType = info.RateLimitType
 	}
 	var out []QuotaWindow
@@ -144,20 +147,50 @@ func (c *Claude) supportsStreamJSON(ctx context.Context) bool {
 	if cached != nil {
 		return *cached
 	}
-	ok := false
+	ok, partial := false, false
 	if bin := c.bin(); bin != "" {
 		ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		out, _ := exec.CommandContext(ctx2, bin, "--help").CombinedOutput()
 		h := string(out)
 		ok = strings.Contains(h, "--output-format") && strings.Contains(h, "stream-json") && strings.Contains(h, "--print")
+		partial = slices.Contains(strings.Fields(h), "--include-partial-messages")
 	}
 	c.mu.Lock()
 	c.streamOK = &ok
+	c.partialOK = &partial
 	c.mu.Unlock()
 	if !ok {
 		c.log.Infof("claude: stream-json unavailable; falling back to the interactive PTY path")
 	}
+	return ok
+}
+
+// supportsPermissionPrompts probes this optional flag independently of the
+// stream-json protocol: older CLIs support headless turns but reject the flag.
+func (c *Claude) supportsPermissionPrompts(ctx context.Context) bool {
+	c.mu.Lock()
+	cached := c.permissionPromptsOK
+	c.mu.Unlock()
+	if cached != nil {
+		return *cached
+	}
+	bin := c.bin()
+	if bin == "" {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, bin, "--help").Output()
+	if err != nil {
+		// A failed or cancelled probe is not evidence of support. Retry the
+		// probe on a later turn instead of caching a transient failure.
+		return false
+	}
+	ok := slices.Contains(strings.Fields(string(out)), "--permission-prompts")
+	c.mu.Lock()
+	c.permissionPromptsOK = &ok
+	c.mu.Unlock()
 	return ok
 }
 
@@ -168,8 +201,17 @@ func (c *Claude) headlessArgs(ctx context.Context, spec ExecSpec, sessionID stri
 		"--output-format", "stream-json",
 		// Required for the full message stream in print mode.
 		"--verbose",
-		// Nobody is here to answer a permission prompt: deny rather than hang.
-		"--permission-prompts", "none",
+	}
+	c.mu.Lock()
+	partial := c.partialOK != nil && *c.partialOK
+	c.mu.Unlock()
+	if partial {
+		args = append(args, "--include-partial-messages")
+	}
+	if c.supportsPermissionPrompts(ctx) {
+		// Nobody is here to answer a permission prompt. Older CLIs omit this
+		// optional flag and use print mode without a permission host.
+		args = append(args, "--permission-prompts", "none")
 	}
 	if spec.SessionID != "" {
 		args = append(args, "--resume", spec.SessionID)
@@ -212,7 +254,11 @@ func (c *Claude) executeHeadless(ctx context.Context, spec ExecSpec, sink Sink) 
 
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Cwd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	extraEnv := map[string]string{"AGENT_CONDUCTOR_RUN_ID": spec.RunID}
+	if spec.Effort != "" {
+		extraEnv["CLAUDE_CODE_EFFORT_LEVEL"] = spec.Effort
+	}
 	if c.socketPath != "" {
 		extraEnv["AC_SOCKET"] = c.socketPath
 	}
@@ -263,12 +309,14 @@ func (c *Claude) executeHeadless(ctx context.Context, spec ExecSpec, sink Sink) 
 	go func() {
 		select {
 		case <-runCtx.Done():
-			gracefulStop(cmd)
+			gracefulStop(cmd, cr.exited, stdout)
 		case <-cr.exited:
 		}
 	}()
 
-	sink(Event{Kind: EvSessionStarted, RunID: spec.RunID, SessionID: sessionID, Model: spec.Model, At: time.Now().UTC()})
+	// A spawned process is not yet a resumable session. Publish the native
+	// session only after Claude confirms it in system/init.
+	sink(Event{Kind: EvProcessStarted, RunID: spec.RunID, ProcessID: cmd.Process.Pid, At: time.Now().UTC()})
 
 	st := &headlessState{spec: spec, sink: sink, sessionID: sessionID}
 	scanner := bufio.NewScanner(stdout)
@@ -285,11 +333,14 @@ func (c *Claude) executeHeadless(ctx context.Context, spec ExecSpec, sink Sink) 
 		c.handleStreamMessage(st, msg)
 	}
 	scanErr := scanner.Err()
-	close(cr.exited)
+	if scanErr != nil {
+		cancel()
+	}
 
 	// Reap the child. Nothing reaped it before, so every managed Claude run
 	// left a zombie until the daemon exited.
 	waitErr := cmd.Wait()
+	close(cr.exited)
 	exitCode := cmd.ProcessState.ExitCode()
 
 	if st.completed {
@@ -297,6 +348,9 @@ func (c *Claude) executeHeadless(ctx context.Context, spec ExecSpec, sink Sink) 
 	}
 	// The stream ended without a result event.
 	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		sink(Event{Kind: EvTurnCompleted, RunID: spec.RunID, SessionID: st.sessionID, Status: TurnFailed,
+			Progress: st.meaningful, Error: &ProviderError{Class: model.ErrNetwork, Message: "provider turn deadline exceeded"}})
 	case runCtx.Err() != nil:
 		sink(Event{Kind: EvTurnCompleted, RunID: spec.RunID, SessionID: st.sessionID, Status: TurnInterrupted,
 			Progress: st.meaningful, At: time.Now().UTC()})
@@ -323,18 +377,52 @@ func (c *Claude) executeHeadless(ctx context.Context, spec ExecSpec, sink Sink) 
 
 // headlessState accumulates per-turn observations.
 type headlessState struct {
-	spec       ExecSpec
-	sink       Sink
-	sessionID  string
-	turnOpened bool
-	meaningful bool
-	completed  bool
-	finalText  strings.Builder
+	spec         ExecSpec
+	sink         Sink
+	sessionID    string
+	turnOpened   bool
+	meaningful   bool
+	completed    bool
+	finalText    strings.Builder
+	partialText  bool
+	lastThinking time.Time
 }
 
 func (c *Claude) handleStreamMessage(st *headlessState, msg streamMessage) {
 	now := time.Now().UTC()
 	switch msg.Type {
+	case "stream_event":
+		var partial struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+		}
+		if json.Unmarshal(msg.Event, &partial) != nil {
+			return
+		}
+		if partial.Type == "message_start" {
+			st.partialText = false
+		}
+		if partial.Type == "content_block_delta" {
+			switch partial.Delta.Type {
+			case "text_delta":
+				if partial.Delta.Text != "" {
+					st.partialText, st.meaningful = true, true
+					st.sink(Event{Kind: EvMessageDelta, RunID: st.spec.RunID, Text: partial.Delta.Text, Progress: true, At: now})
+				}
+			case "thinking_delta", "input_json_delta":
+				if now.Sub(st.lastThinking) >= time.Second {
+					st.lastThinking = now
+					text := "Thinking"
+					if partial.Delta.Type == "input_json_delta" {
+						text = "Preparing a tool call"
+					}
+					st.sink(Event{Kind: EvActivity, RunID: st.spec.RunID, Text: text, At: now})
+				}
+			}
+		}
 	case "system":
 		if msg.Subtype == "init" {
 			if msg.SessionID != "" {
@@ -366,8 +454,12 @@ func (c *Claude) handleStreamMessage(st *headlessState, msg streamMessage) {
 					st.finalText.Reset()
 					st.finalText.WriteString(block.Text)
 					st.meaningful = true
+					text := block.Text
+					if st.partialText {
+						text = ""
+					} // already streamed; still report the resolved model
 					st.sink(Event{Kind: EvMessageDelta, RunID: st.spec.RunID, SessionID: st.sessionID,
-						Text: block.Text, Progress: true, Model: am.Model, At: now})
+						Text: text, Progress: true, Model: am.Model, At: now})
 				}
 			case "tool_use":
 				// Real evidence that the agent began work. This is what drives
@@ -375,15 +467,19 @@ func (c *Claude) handleStreamMessage(st *headlessState, msg streamMessage) {
 				// be derived from hooks that were never registered.
 				st.meaningful = true
 				st.sink(Event{Kind: EvMessageDelta, RunID: st.spec.RunID, SessionID: st.sessionID,
-					Text: "tool:" + block.Name, Progress: true, At: now})
+					Text: "tool:" + block.Name, Progress: true, Model: am.Model, At: now})
 			}
 		}
 
 	case "user":
 		// Tool results flowing back: the agent is working.
 		st.meaningful = true
+		st.sink(Event{Kind: EvActivity, RunID: st.spec.RunID, Text: "Tool result received", Progress: true, At: now})
 
 	case "result":
+		if st.completed {
+			return
+		}
 		st.completed = true
 		final := msg.Result
 		if strings.TrimSpace(final) == "" {
@@ -400,7 +496,7 @@ func (c *Claude) handleStreamMessage(st *headlessState, msg streamMessage) {
 			st.sink(Event{Kind: EvTurnCompleted, RunID: st.spec.RunID, SessionID: st.sessionID,
 				Status: TurnInterrupted, FinalMsg: final, Progress: st.meaningful, At: now})
 		default:
-			detail := strings.TrimSpace(final)
+			detail := strings.TrimSpace(strings.Join(append([]string{final}, msg.Errors...), "\n"))
 			if detail == "" {
 				detail = msg.Subtype
 			}
@@ -430,15 +526,15 @@ func isInterruptedResult(msg streamMessage) bool {
 func classifyClaudeText(s string) model.ErrorClass {
 	l := strings.ToLower(s)
 	switch {
-	case strings.Contains(l, "rate limit") || strings.Contains(l, "usage limit") || strings.Contains(l, "rate_limit"):
+	case strings.Contains(l, "rate limit") || strings.Contains(l, "usage limit") || strings.Contains(l, "rate_limit") || strings.Contains(l, "429"):
 		return model.ErrRateLimit
-	case strings.Contains(l, "overloaded"):
+	case strings.Contains(l, "overloaded") || strings.Contains(l, "529") || strings.Contains(l, "503") || strings.Contains(l, "server_error"):
 		return model.ErrProviderOverloaded
 	case strings.Contains(l, "authentication") || strings.Contains(l, "unauthorized") || strings.Contains(l, "login"):
 		return model.ErrAuth
 	case strings.Contains(l, "billing") || strings.Contains(l, "payment") || strings.Contains(l, "credit"):
 		return model.ErrBilling
-	case strings.Contains(l, "model") && strings.Contains(l, "not found"):
+	case strings.Contains(l, "model") && (strings.Contains(l, "not found") || strings.Contains(l, "not support") || strings.Contains(l, "selected model") || strings.Contains(l, "not available")):
 		return model.ErrModelUnavailable
 	case strings.Contains(l, "context") && (strings.Contains(l, "limit") || strings.Contains(l, "too long")):
 		return model.ErrContextLimit
@@ -454,16 +550,25 @@ func classifyClaudeText(s string) model.ErrorClass {
 }
 
 // gracefulStop interrupts the child, escalating only if it ignores SIGINT.
-func gracefulStop(cmd *exec.Cmd) {
+func gracefulStop(cmd *exec.Cmd, exited <-chan struct{}, stdout io.Closer) {
+	select {
+	case <-exited:
+		return
+	default:
+	}
 	if cmd.Process == nil {
 		return
 	}
-	cmd.Process.Signal(os.Interrupt)
-	time.AfterFunc(5*time.Second, func() {
-		if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
-			cmd.Process.Kill()
-		}
-	})
+	// Signal the process group so tool subprocesses cannot hold pipes open.
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-exited:
+	case <-timer.C:
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = stdout.Close()
+	}
 }
 
 // tailBuffer keeps only the last `limit` bytes written to it.

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Developer setup: install npm deps, build daemon + extension, install the
-# VSIX into the local VS Code.
+# Use the same platform-aware build and package path as a release.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-npm install
-bash scripts/build-daemon.sh
-npm run build:ext
-npm run build:webview
-mkdir -p dist/bin
-cp "dist-bin/agent-conductor-"* dist/bin/agent-conductor
-chmod +x dist/bin/agent-conductor
-echo "dev build ready — press F5 in VS Code for the Extension Development Host"
+npm ci
+npm run package
+VERSION=$(node -p 'require("./package.json").version')
+CODE_BIN="$(command -v code || true)"
+if [[ -z "$CODE_BIN" && -x "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" ]]; then
+  CODE_BIN="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+fi
+if [[ -z "$CODE_BIN" ]]; then
+  echo "VSIX ready: agent-conductor-$VERSION.vsix; install with Extensions: Install from VSIX…"
+else
+  "$CODE_BIN" --install-extension "agent-conductor-$VERSION.vsix" --force
+fi

@@ -4,6 +4,8 @@
 import React, { Fragment, useCallback, useEffect, useState } from "react";
 import type { ConductorState } from "../state/store";
 import { rpc, confirm, notify, vscodeApi } from "../api/client";
+import { useNow } from "../components/ticker";
+import { isExternalSessionBusy } from "../state/externalActivity";
 
 /**
  * Every settings write is a server-side patch.
@@ -149,12 +151,13 @@ function Summary({ state }: { state: ConductorState }) {
 // ---- disclosures -----------------------------------------------------------
 
 function ProvidersDetail({ state }: { state: ConductorState }) {
+  const now = useNow();
   return (
     <Disclosure title="Providers">
       {(["claude", "codex"] as const).map((p) => {
         const caps = state.snapshot?.providers?.[p];
         const ext = (state.snapshot?.external?.[p] ?? []).find(
-          (s) => s.kind === "external" && ["SessionStart", "UserPromptSubmit"].includes(s.lastEvent)
+          (s) => isExternalSessionBusy(s, now)
         );
         return (
           <div key={p} className="ac-card">
@@ -238,14 +241,20 @@ function Scheduling({ state }: { state: ConductorState }) {
           />
         </div>
       </div>
-      <label className="ac-check ac-mt-2">
-        <input
-          type="checkbox"
-          checked={!!s?.fifoBlockOnExternal}
-          onChange={(e) => void patch({ fifoBlockOnExternal: e.target.checked })}
-        />
-        <span>Hold the queue while an agent runs outside Agent Conductor</span>
-      </label>
+      <div className="ac-inline-controls ac-mt-2">
+        <div>
+          <label className="ac-label" htmlFor="ac-retries">Temporary failure retries</label>
+          <input id="ac-retries" className="ac-input" type="number" min={0} max={30}
+            value={s?.maxTransientRetries ?? 8} onChange={(e) => void patch({ maxTransientRetries: Number(e.target.value) })} />
+        </div>
+        <div>
+          <label className="ac-label" htmlFor="ac-continuations">Incomplete-task continuations</label>
+          <input id="ac-continuations" className="ac-input" type="number" min={0} max={30}
+            value={s?.maxCompletionContinuations ?? 3} onChange={(e) => void patch({ maxCompletionContinuations: Number(e.target.value) })} />
+        </div>
+      </div>
+      <p className="ac-xs ac-muted">Temporary network, overload and process failures retry with increasing delays, up to five minutes. Quota waits resume after reset. Authentication, permission and explicit BLOCKED results need your attention.</p>
+      <p className="ac-xs ac-muted">External agents can run alongside the queue, including on the same provider. VS Code notifies you when you start an external agent while Conductor work is running. Pause the queue yourself whenever you need to.</p>
 
       <label className="ac-label ac-mt-3" htmlFor="ac-weekly">
         Claude weekly reset override (RFC3339, optional)
@@ -434,55 +443,43 @@ function SecretBlock({ state }: { state: ConductorState }) {
 
 function Staged({ state }: { state: ConductorState }) {
   const s = state.snapshot?.settings;
-  // Sourced from the live provider capabilities. The old code read
-  // `s._codexModels`, a field that exists nowhere, so both Codex dropdowns
-  // were permanently empty.
-  const claudeIds = (state.snapshot?.providers?.claude?.models ?? []).map((m) => m.id);
-  const codexIds = (state.snapshot?.providers?.codex?.models ?? []).map((m) => m.id);
-
-  const field = (label: string, key: string, options: string[], value: string | undefined) => (
-    <div>
-      <label className="ac-label" htmlFor={`ac-${key}`}>
-        {label}
-      </label>
-      <select
-        id={`ac-${key}`}
-        className="ac-select"
-        value={value ?? ""}
-        onChange={(e) => void patch({ [key]: e.target.value })}
-      >
-        <option value="">Provider default</option>
-        {options.map((o) => (
-          <option key={o} value={o}>
-            {o}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-
   return (
     <Disclosure title="Staged intelligence">
-      <div className="ac-small ac-muted">Plan with a strong model, build with a cheaper one — same native conversation.</div>
+      <div className="ac-small ac-muted">Each phase uses its own model and effort in the same conversation. These override the queue's model when Staged is on.</div>
       <label className="ac-check ac-mt-2">
-        <input
-          type="checkbox"
-          checked={!!s?.auditEnabled}
-          onChange={(e) => void patch({ auditEnabled: e.target.checked })}
-        />
-        <span>Final smart audit, one fix cycle</span>
+        <input type="checkbox" checked={!!s?.auditEnabled} onChange={(e) => void patch({ auditEnabled: e.target.checked })} />
+        <span>Final read-only audit</span>
       </label>
-      <div className="ac-inline-controls ac-mt-2">
-        {field("Claude plan model", "claudePlanModel", claudeIds, s?.claudePlanModel)}
-        {field("Claude build model", "claudeBuildModel", claudeIds, s?.claudeBuildModel)}
-      </div>
-      <div className="ac-inline-controls ac-mt-2">
-        {field("Codex plan model", "codexPlanModel", codexIds, s?.codexPlanModel)}
-        {field("Codex build model", "codexBuildModel", codexIds, s?.codexBuildModel)}
-      </div>
-      {codexIds.length === 0 && (
-        <div className="ac-xs ac-muted ac-mt-1">Codex models appear once the Codex runtime is reachable.</div>
-      )}
+      {(["claude", "codex"] as const).map((provider) => {
+        const models = (state.snapshot?.providers?.[provider]?.models ?? []).filter((m) => !m.hidden);
+        return (["Plan", "Build", "Audit"] as const).map((stage) => {
+          const modelKey = `${provider}${stage}Model` as const;
+          const effortKey = `${provider}${stage}Effort` as const;
+          const value = s?.[modelKey] ?? "";
+          const efforts = models.find((m) => m.id === value)?.efforts ?? [];
+          const label = `${provider === "claude" ? "Claude" : "Codex"} ${stage.toLowerCase()}`;
+          return <div className="ac-inline-controls ac-mt-2" key={modelKey}>
+            <div>
+              <label className="ac-label" htmlFor={`ac-${modelKey}`}>{label} model</label>
+              <select id={`ac-${modelKey}`} className="ac-select" value={value}
+                onChange={(e) => void patch({ [modelKey]: e.target.value, [effortKey]: "" })}>
+                <option value="">Provider default</option>
+                {value && !models.some((m) => m.id === value) && <option value={value}>{value}</option>}
+                {models.map((m) => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="ac-label" htmlFor={`ac-${effortKey}`}>{label} effort</label>
+              <select id={`ac-${effortKey}`} className="ac-select" value={s?.[effortKey] ?? ""}
+                onChange={(e) => void patch({ [effortKey]: e.target.value })}>
+                <option value="">Model default</option>
+                {s?.[effortKey] && !efforts.includes(s[effortKey]) && <option value={s[effortKey]}>{s[effortKey]} (saved)</option>}
+                {efforts.map((f) => <option key={f} value={f}>{f === "ultracode" ? "Ultracode (xhigh + workflows)" : f}</option>)}
+              </select>
+            </div>
+          </div>;
+        });
+      })}
     </Disclosure>
   );
 }
@@ -495,7 +492,7 @@ interface UsageSummary {
   quotaWaitMs: number;
   continuations: number;
   byProviderActiveMs: Record<string, number>;
-  recent: { runId: string; title: string; provider: string; activeMs: number; continuations: number }[];
+  recent?: { runId: string; title: string; provider: string; activeMs: number; continuations: number }[] | null;
   note: string;
 }
 
@@ -517,6 +514,8 @@ function Usage() {
       .catch((e: any) => setError(String(e?.message ?? e)));
   }, []);
   useEffect(load, [load]);
+  // Older daemons encode an empty recent-run slice as null.
+  const recent = data?.recent ?? [];
 
   return (
     <Disclosure title="This week">
@@ -542,11 +541,11 @@ function Usage() {
               </Fragment>
             ))}
           </dl>
-          {data.recent.length > 0 && (
+          {recent.length > 0 && (
             <>
               <div className="ac-eyebrow ac-mt-3 ac-mb-2">Longest runs</div>
               <ul className="ac-checklist">
-                {data.recent.slice(0, 5).map((r) => (
+                {recent.slice(0, 5).map((r) => (
                   <li key={r.runId}>
                     <span className="ac-grow ac-trunc">{r.title || r.runId}</span>
                     <span className="ac-xs ac-muted ac-num">{fmtHours(r.activeMs)}</span>

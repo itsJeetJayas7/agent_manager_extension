@@ -34,10 +34,13 @@ type Codex struct {
 	nextID  int
 	pending map[int]chan rpcResult
 	started bool
+	processDone chan struct{}
+	processErr error
 	// threads maps a run to the thread its turn is running on, so Cancel can
 	// send turn/interrupt. This map was declared and never written, which made
 	// Cancel a complete no-op.
 	threads map[string]string
+	turns map[string]string // thread -> active turn, required by turn/interrupt
 	cancels map[string]context.CancelFunc
 	// backoff throttles restart attempts after the app-server dies.
 	backoffUntil time.Time
@@ -45,7 +48,7 @@ type Codex struct {
 
 	writeMu sync.Mutex // serialises stdin writes
 	subsMu  sync.Mutex
-	subs    map[string][]chan map[string]any // threadID -> subscribers ("*" = all)
+	subs    map[string][]*codexSubscription
 
 	probeMu sync.Mutex
 	probe   map[string]string // JSON-RPC method -> "ok" | error text
@@ -70,11 +73,12 @@ type rpcError struct {
 func NewCodex(log *logging.Logger, binPath string) *Codex {
 	return &Codex{
 		pending: map[int]chan rpcResult{},
-		subs:    map[string][]chan map[string]any{},
+		subs:    map[string][]*codexSubscription{},
 		log:     log,
 		binPath: binPath,
 		cancels: map[string]context.CancelFunc{},
 		threads: map[string]string{},
+		turns: map[string]string{},
 		probe:   map[string]string{},
 	}
 }
@@ -291,6 +295,8 @@ func (c *Codex) ensureStarted(ctx context.Context) error {
 	c.cmd = cmd
 	c.stdin = stdin
 	c.started = true
+	c.processDone = make(chan struct{})
+	c.processErr = nil
 	c.mu.Unlock()
 
 	reader := bufio.NewReaderSize(stdout, 16*1024*1024)
@@ -300,7 +306,6 @@ func (c *Codex) ensureStarted(ctx context.Context) error {
 	go func() {
 		err := cmd.Wait()
 		c.log.Infof("codex app-server exited: %v", err)
-		c.failAllPending(fmt.Errorf("codex app-server exited: %v", err))
 	}()
 
 	// Handshake with mu released.
@@ -315,6 +320,10 @@ func (c *Codex) ensureStarted(ctx context.Context) error {
 		return fmt.Errorf("initialize: %w", err)
 	}
 	c.recordProbe("initialize", nil)
+	if err := c.writeMessage(stdin, map[string]any{"jsonrpc": "2.0", "method": "initialized"}); err != nil {
+		c.shutdownChild()
+		return fmt.Errorf("initialized: %w", err)
+	}
 	c.mu.Lock()
 	c.backoff = 0
 	c.backoffUntil = time.Time{}
@@ -328,6 +337,10 @@ func (c *Codex) ensureStarted(ctx context.Context) error {
 func (c *Codex) noteFailure() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.noteFailureLocked()
+}
+
+func (c *Codex) noteFailureLocked() {
 	if c.backoff == 0 {
 		c.backoff = time.Second
 	} else if c.backoff < time.Minute {
@@ -341,8 +354,20 @@ func (c *Codex) noteFailure() {
 func (c *Codex) shutdownChild() {
 	c.mu.Lock()
 	cmd, stdin := c.cmd, c.stdin
+	if c.processDone != nil {
+		select {
+		case <-c.processDone:
+		default:
+			c.processErr = fmt.Errorf("codex app-server stopped")
+			close(c.processDone)
+		}
+	}
 	c.cmd, c.stdin, c.started = nil, nil, false
 	c.mu.Unlock()
+	stopCodexChild(cmd, stdin)
+}
+
+func stopCodexChild(cmd *exec.Cmd, stdin io.WriteCloser) {
 	if stdin != nil {
 		stdin.Close()
 	}
@@ -388,14 +413,14 @@ func (c *Codex) readLoop(cmd *exec.Cmd, reader *bufio.Reader) {
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			c.failAllPending(fmt.Errorf("app-server stream closed: %w", err))
+			c.failAllPending(cmd, fmt.Errorf("app-server stream closed: %w", err))
 			return
 		}
 		if len(line) == 0 {
 			continue
 		}
 		var msg struct {
-			ID     *int            `json:"id"`
+			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
 			Params json.RawMessage `json:"params"`
 			Result json.RawMessage `json:"result"`
@@ -404,11 +429,13 @@ func (c *Codex) readLoop(cmd *exec.Cmd, reader *bufio.Reader) {
 		if err := json.Unmarshal(line, &msg); err != nil {
 			continue
 		}
-		if msg.ID != nil && msg.Method == "" {
+		if len(msg.ID) > 0 && msg.Method == "" {
 			// response
+			var id int
+			if json.Unmarshal(msg.ID, &id) != nil { continue }
 			c.mu.Lock()
-			ch, ok := c.pending[*msg.ID]
-			delete(c.pending, *msg.ID)
+			ch, ok := c.pending[id]
+			delete(c.pending, id)
 			c.mu.Unlock()
 			if ok {
 				ch <- rpcResult{Result: msg.Result, Error: msg.Error}
@@ -418,13 +445,19 @@ func (c *Codex) readLoop(cmd *exec.Cmd, reader *bufio.Reader) {
 		if msg.Method != "" {
 			var params map[string]any
 			json.Unmarshal(msg.Params, &params)
+			if len(msg.ID) > 0 {
+				c.handleServerRequest(cmd, msg.ID, msg.Method, params)
+				continue
+			}
 			c.dispatch(msg.Method, params)
 		}
 	}
 }
 
-func (c *Codex) failAllPending(err error) {
+func (c *Codex) failAllPending(cmd *exec.Cmd, err error) {
 	c.mu.Lock()
+	// A late EOF from a replaced child must never kill the replacement.
+	if c.cmd != cmd { c.mu.Unlock(); return }
 	wasStarted := c.started
 	for id, ch := range c.pending {
 		select {
@@ -434,9 +467,13 @@ func (c *Codex) failAllPending(err error) {
 		delete(c.pending, id)
 	}
 	c.started = false
+	c.processErr = err
+	if c.processDone != nil { close(c.processDone) }
+	stdin := c.stdin
+	c.cmd, c.stdin = nil, nil
+	if wasStarted { c.noteFailureLocked() }
 	c.mu.Unlock()
 	if wasStarted {
-		c.noteFailure()
 		c.log.Errorf("codex app-server lost: %v", err)
 		if c.crashed != nil {
 			c.crashed(err.Error())
@@ -444,7 +481,7 @@ func (c *Codex) failAllPending(err error) {
 	}
 	// The dead child is released here; the next ensureStarted spawns a fresh
 	// one after the backoff rather than writing into a closed pipe.
-	c.shutdownChild()
+	stopCodexChild(cmd, stdin)
 }
 
 func (c *Codex) dispatch(method string, params map[string]any) {
@@ -455,28 +492,25 @@ func (c *Codex) dispatch(method string, params map[string]any) {
 		}
 	}
 	c.subsMu.Lock()
-	targets := append([]chan map[string]any{}, c.subs["*"]...)
+	targets := append([]*codexSubscription{}, c.subs["*"]...)
 	if threadID != "" {
 		targets = append(targets, c.subs[threadID]...)
 	}
 	c.subsMu.Unlock()
-	for _, ch := range targets {
-		select {
-		case ch <- map[string]any{"method": method, "params": params}:
-		default:
-		}
+	for _, sub := range targets {
+		sub.push(map[string]any{"method": method, "params": params})
 	}
 }
 
-func (c *Codex) subscribe(threadID string) chan map[string]any {
-	ch := make(chan map[string]any, 256)
+func (c *Codex) subscribe(threadID string) *codexSubscription {
+	ch := &codexSubscription{ready: make(chan struct{}, 1)}
 	c.subsMu.Lock()
 	defer c.subsMu.Unlock()
 	c.subs[threadID] = append(c.subs[threadID], ch)
 	return ch
 }
 
-func (c *Codex) unsubscribe(threadID string, ch chan map[string]any) {
+func (c *Codex) unsubscribe(threadID string, ch *codexSubscription) {
 	c.subsMu.Lock()
 	defer c.subsMu.Unlock()
 	list := c.subs[threadID]
@@ -509,10 +543,7 @@ func (c *Codex) call(ctx context.Context, method string, params any) (json.RawMe
 	c.mu.Unlock()
 
 	payload := map[string]any{"jsonrpc": "2.0", "method": method, "id": id, "params": params}
-	b, _ := json.Marshal(payload)
-	c.writeMu.Lock()
-	_, werr := stdin.Write(append(b, '\n'))
-	c.writeMu.Unlock()
+	werr := c.writeMessage(stdin, payload)
 	if werr != nil {
 		c.mu.Lock()
 		delete(c.pending, id)

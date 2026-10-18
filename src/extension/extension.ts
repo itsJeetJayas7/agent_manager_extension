@@ -4,6 +4,7 @@
 import * as vscode from "vscode";
 import { DaemonClient, ProtocolMismatchError } from "./daemonClient";
 import { Snapshot } from "./protocol";
+import { PromptSequenceImports } from "./promptSequence";
 import {
   resolveDaemonBinary,
   resolveDaemonBinaryDetailed,
@@ -12,7 +13,7 @@ import {
   hostIndicator,
   verificationCommands,
 } from "./configuration";
-import { openClaudeSession, openCodexThread, openWorktreeWindow } from "./sessionOpeners";
+import { ClaudeSessionOpener, openCodexThread, openWorktreeWindow } from "./sessionOpeners";
 import { computeSetupStatus } from "./setup";
 import { Notifier } from "./notifications";
 import { WEBVIEW_DIR, WEBVIEW_BUNDLE } from "../../shared/artifacts.cjs";
@@ -78,12 +79,17 @@ class ConductorExtension implements vscode.Disposable {
   private reportedAway = false;
   private lastSpawnAt = 0;
   private spawnAttempts = 0;
+  private sequenceImports = new PromptSequenceImports();
+  private pendingSequenceImport = false;
+  private claudeSessions: ClaudeSessionOpener;
 
   constructor(private context: vscode.ExtensionContext) {
     this.statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
     this.statusItem.command = "agent-conductor.open";
     context.subscriptions.push(this.statusItem);
     this.notifier = new Notifier(context.globalState);
+    this.claudeSessions = new ClaudeSessionOpener(context.globalState, (method, params) =>
+      this.client ? this.client.request(method, params) : Promise.reject(new Error("Agent Conductor daemon is not connected")));
   }
 
   dispose() {
@@ -98,6 +104,8 @@ class ConductorExtension implements vscode.Disposable {
   }
 
   start() {
+    void this.claudeSessions.repairLiveView().catch(() => undefined);
+    void this.claudeSessions.resumePending().catch(error => vscode.window.showWarningMessage(`Claude session handoff failed: ${error}`));
     this.registerCommands();
     this.registerWebviewView();
     this.registerWatcher();
@@ -252,6 +260,9 @@ class ConductorExtension implements vscode.Disposable {
         this.onSnapshot(ev.payload as Snapshot);
       } else {
         this.pushToWebviews({ type: "daemonEvent", event: ev.event, payload: ev.payload });
+        if (ev.event === "externalRunOverlap") {
+          void this.notifier.reportExternalOverlap(ev.payload).catch((error) => console.error("External activity notification failed", error));
+        }
         if (ev.event === "runUpdated" || ev.event === "pauseUpdated") {
           void this.refreshStatus();
         }
@@ -463,6 +474,10 @@ class ConductorExtension implements vscode.Disposable {
             source.post({ type: "snapshot", snapshot: this.lastSnapshot });
           }
           this.pushSetupStatus();
+          if (source === this.sidebar && this.pendingSequenceImport) {
+            source.post({ type: "showPromptImport" });
+            this.pendingSequenceImport = false;
+          }
           await this.sendSnapshot();
           return;
         }
@@ -481,6 +496,11 @@ class ConductorExtension implements vscode.Disposable {
           return;
         }
         case "rpc": {
+          if (typeof m.method === "string" && m.method.startsWith("promptSequence.")) {
+            const result = await this.promptSequenceRequest(m.method, m.params ?? {});
+            source.post({ type: "rpcResult", requestId: m.requestId, result });
+            return;
+          }
           if (!this.client) {
             source.post({ type: "rpcError", requestId: m.requestId, error: "daemon offline" });
             return;
@@ -515,8 +535,9 @@ class ConductorExtension implements vscode.Disposable {
           return;
         }
         case "openClaude": {
-          const r = await openClaudeSession(m.sessionId);
-          void vscode.window.showInformationMessage(r.how);
+          const r = await this.claudeSessions.open({ sessionId: m.sessionId, cwd: m.cwd });
+          if (!r.opened || r.live === false) void vscode.window.showWarningMessage(r.how);
+          else void vscode.window.showInformationMessage(r.how);
           return;
         }
         case "openCodex": {
@@ -584,6 +605,43 @@ class ConductorExtension implements vscode.Disposable {
 
   // ---- commands ----
 
+  private async promptSequenceRequest(method: string, params: any): Promise<unknown> {
+    if (method === "promptSequence.pick" || method === "promptSequence.pickWorkspace") {
+      const promptFolder = method === "promptSequence.pick";
+      const last = promptFolder ? this.context.workspaceState.get<string>("promptSequence.lastFolder") : undefined;
+      const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+      const selected = await vscode.window.showOpenDialog({
+        title: promptFolder ? "Select the folder containing numbered prompts" : "Select the working folder for agents",
+        openLabel: promptFolder ? "Preview prompts" : "Use working folder",
+        canSelectFolders: true, canSelectFiles: false, canSelectMany: false,
+        defaultUri: last ? (workspaceUri?.with({ path: last }) ?? vscode.Uri.file(last)) : workspaceUri,
+      });
+      if (!selected?.length) return null;
+      const folder = selected[0].fsPath;
+      if (!promptFolder) return folder;
+      const preview = await this.sequenceImports.preview(folder);
+      await this.context.workspaceState.update("promptSequence.lastFolder", folder);
+      return preview;
+    }
+    if (method === "promptSequence.refresh") return this.sequenceImports.refresh(params.id);
+    if (method === "promptSequence.import") {
+      if (!this.client) throw new Error("Daemon offline. Reconnect before importing the sequence.");
+      const result = await this.sequenceImports.import(params.id, String(params.title ?? ""), String(params.cwd ?? ""), params.settings,
+        async (spec) => {
+          try {
+            return await this.client!.request<{ batchId: string }>("enqueuePromptSequence", spec, 60_000);
+          } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            if (/unknown method/i.test(message)) throw new Error("Update and restart the Agent Conductor background service to enable folder imports.");
+            throw new Error(`Import status could not be confirmed: ${message}. Retry this preview to recover the original sequence with its original settings.`);
+          }
+        });
+      await this.sendSnapshot();
+      return result;
+    }
+    throw new Error("Unknown prompt sequence action.");
+  }
+
   private registerCommands(): void {
     const reg = (id: string, fn: (...a: any[]) => any) =>
       this.context.subscriptions.push(vscode.commands.registerCommand(id, fn));
@@ -592,6 +650,14 @@ class ConductorExtension implements vscode.Disposable {
       void vscode.commands.executeCommand("agent-conductor.sidebar.focus");
     });
     reg("agent-conductor.buildBatch", () => this.openPanel("planner", "Batch Planner"));
+    reg("agent-conductor.importPromptsFromFolder", async () => {
+      this.pendingSequenceImport = true;
+      await vscode.commands.executeCommand("agent-conductor.sidebar.focus");
+      if (this.sidebar?.ready && this.pendingSequenceImport) {
+        this.sidebar.post({ type: "showPromptImport" });
+        this.pendingSequenceImport = false;
+      }
+    });
     reg("agent-conductor.diagnostics", () => void this.runDiagnostics());
     reg("agent-conductor.startDevDaemon", () => this.startDevDaemon());
     reg("agent-conductor.repairRuntime", () => void this.repairRuntime());
@@ -602,6 +668,16 @@ class ConductorExtension implements vscode.Disposable {
     reg("agent-conductor.resumeQueue", () => void this.resumeQueue());
     reg("agent-conductor.extendPause", () => void this.extendPause(15 * 60_000));
     reg("agent-conductor.trustWorkspace", () => void this.trustWorkspace());
+    reg("agent-conductor.enableClaudeLiveView", async () => {
+      const r = await this.claudeSessions.enableLiveView();
+      void (r.ok ? vscode.window.showInformationMessage(r.how) : vscode.window.showWarningMessage(r.how));
+    });
+    reg("agent-conductor.disableClaudeLiveView", async () => {
+      const removed = await this.claudeSessions.disableLiveView();
+      void vscode.window.showInformationMessage(removed
+        ? "Live view in Claude Code is off. Claude Code starts conversations directly again; managed runs open as saved conversations."
+        : "Live view in Claude Code was not enabled by Agent Conductor.");
+    });
   }
 
   /** Trust the open folder for Claude Code — explicit user action only. */
@@ -757,7 +833,7 @@ class ConductorExtension implements vscode.Disposable {
   }
 
   private async openLogs(): Promise<void> {
-    const logDir = path.join(require("os").homedir(), ".agent-conductor", "logs");
+    const logDir = path.join(DaemonClient.root(), "logs");
     const logFile = path.join(logDir, "daemon.jsonl");
     if (!fs.existsSync(logFile)) {
       void vscode.window.showWarningMessage("No daemon log yet.");
@@ -800,6 +876,8 @@ class ConductorExtension implements vscode.Disposable {
     if (confirm !== "Uninstall") {
       return;
     }
+    // The Claude Code wrapper must not outlive the daemon it relays to.
+    await this.claudeSessions.disableLiveView();
     const { spawnSync } = require("child_process") as typeof import("child_process");
     const r = spawnSync(bin, ["uninstall-service"], { encoding: "utf8" });
     void vscode.window.showInformationMessage(((r.stdout || "") + (r.stderr || "")).slice(0, 800));

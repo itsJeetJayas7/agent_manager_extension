@@ -12,7 +12,7 @@ import type {
   RowLike,
   PauseStateLike,
 } from "../../../src/extension/protocol";
-import { vscodeApi, requestSnapshot, requestHostInfo } from "../api/client";
+import { vscodeApi, requestSnapshot, requestHostInfo, announceReady } from "../api/client";
 
 /** Why the daemon is unreachable, with the exact command that fixes it. */
 export interface DaemonProblem {
@@ -29,6 +29,7 @@ export interface ConductorState {
   host: string;
   workspace: string;
   detailBatchId: string;
+  showPromptImport?: boolean;
   /** Bumped on every accepted update; lets views cheaply detect staleness. */
   revision: number;
 }
@@ -115,7 +116,7 @@ function mergeRun(run: RunLike): void {
   }
   const runs = snap.runs ?? [];
   const i = runs.findIndex((r) => r.id === run.id);
-  const next = i >= 0 ? [...runs.slice(0, i), run, ...runs.slice(i + 1)] : [run, ...runs];
+  const next = i >= 0 ? [...runs.slice(0, i), run, ...runs.slice(i + 1)] : [...runs, run];
   commit({ snapshot: { ...snap, runs: next } });
 }
 
@@ -175,6 +176,9 @@ export function initStore(): () => void {
       case "detailBatchId":
         commit({ detailBatchId: String(m.batchId ?? "") });
         break;
+      case "showPromptImport":
+        commit({ showPromptImport: true });
+        break;
       case "daemonEvent":
         onDaemonEvent(m.event, m.payload);
         break;
@@ -183,6 +187,9 @@ export function initStore(): () => void {
     }
   };
   window.addEventListener("message", handler);
+  // Announce only after listeners exist, including command-palette actions
+  // queued while the sidebar was still booting.
+  announceReady();
   requestSnapshot();
   requestHostInfo();
   const timer = window.setInterval(requestSnapshot, RECONCILE_MS);
@@ -213,6 +220,7 @@ function onDaemonEvent(event: string, payload: any): void {
         mergePause(payload as PauseStateLike);
       }
       return;
+    case "queueReordered":
     case "quotaUpdated":
     case "settingsUpdated":
     case "externalSessionUpdated":
@@ -229,9 +237,13 @@ export function detailBatchId(): string | undefined {
   return state.detailBatchId || undefined;
 }
 
+export function consumePromptImportRequest(): void {
+  commit({ showPromptImport: false });
+}
+
 // ---- selectors ----
 
-const ACTIVE_STATES = new Set([
+export const ACTIVE_STATES = new Set([
   "PREPARING", "STARTING", "RUNNING", "WAITING_FOR_PROVIDER",
   "VERIFYING", "INTEGRATING", "CANCEL_REQUESTED", "AUTO_RESUMING",
 ]);
@@ -254,7 +266,7 @@ export function pausedRuns(s: ConductorState): RunLike[] {
 export function waitingRuns(s: ConductorState): RunLike[] {
   return (s.snapshot?.runs ?? [])
     .filter((r) => WAITING_STATES.has(r.state))
-    .sort((a, b) => (a.state === "WAITING_FOR_QUOTA" ? 1 : 0) - (b.state === "WAITING_FOR_QUOTA" ? 1 : 0));
+    .sort((a, b) => (a.sortKey ?? 0) - (b.sortKey ?? 0));
 }
 
 export function attentionRuns(s: ConductorState): RunLike[] {

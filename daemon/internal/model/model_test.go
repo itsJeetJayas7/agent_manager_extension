@@ -31,7 +31,7 @@ func TestCanTransitionInvalid(t *testing.T) {
 	cases := []struct{ from, to RunState }{
 		{StateDraft, StateRunning},
 		{StateQueued, StateRunning},
-		{StateCompleted, StateQueued},
+		{StateCancelled, StateQueued},
 		{StateCancelled, StateRunning},
 		{StateSkipped, StateRunning},
 		{StateFailed, StateCompleted},
@@ -142,4 +142,16 @@ func TestDeterministicTitle(t *testing.T) {
 		t.Errorf("got %q", title)
 	}
 	_ = time.Now()
+}
+
+func TestCompletionMarkerMustBeTheFinalDecision(t *testing.T) {
+	for _, text := range []string{"Example: <AC_RESULT>COMPLETE</AC_RESULT>", "<AC_RESULT>COMPLETE</AC_RESULT>\nStill working", "<AC_RESULT>BLOCKED: unfinished"} {
+		if outcome, _ := ParseResultMarker(text); outcome != "" {
+			t.Fatalf("false completion from %q", text)
+		}
+	}
+	outcome, reason := ParseResultMarker("Example: <AC_RESULT>COMPLETE</AC_RESULT>\n<AC_RESULT>BLOCKED: need credentials</AC_RESULT>")
+	if outcome != "BLOCKED" || reason != "need credentials" {
+		t.Fatal("final blocked decision lost")
+	}
 }

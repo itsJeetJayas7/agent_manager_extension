@@ -83,6 +83,10 @@ jobs:
         run: node scripts/build.mjs
       - name: end-to-end protocol test
         run: node tests/integration/daemon-e2e.mjs
+      - name: folder sequence import and restart
+        run: node tests/integration/prompt-sequence-e2e.mjs
+      - name: queue and snapshot load test
+        run: node tests/integration/daemon-stress.mjs
       - name: package
         run: npx vsce package --no-dependencies -o agent-conductor-ci.vsix
       - name: confirm the VSIX carries every platform daemon

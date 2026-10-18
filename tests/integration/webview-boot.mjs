@@ -61,7 +61,21 @@ const { window } = dom;
 
 let posted = [];
 window.acquireVsCodeApi = () => ({
-  postMessage: (m) => posted.push(m),
+  postMessage: (m) => {
+    posted.push(m);
+    if (m.type === "rpc" && m.method === "usageSummary") {
+      window.setTimeout(() => window.dispatchEvent(new window.MessageEvent("message", {
+        data: {
+          type: "rpcResult", requestId: m.requestId,
+          result: {
+            runs: 0, completed: 0, failed: 0, activeMs: 0, quotaWaitMs: 0,
+            continuations: 0, byProviderActiveMs: {}, recent: null,
+            note: "Measured wall-clock time only.",
+          },
+        },
+      })), 0);
+    }
+  },
   getState: () => ({}),
   setState: () => undefined,
 });
@@ -99,6 +113,18 @@ assert(/QUEUE/.test(text), "tab strip missing");
 // Styled, not an unstyled shell: the tokens resolve to real classes.
 assert(window.document.querySelector(".ac-tabs"), "design-system classes are not applied");
 console.log("   header, tabs and design-system classes present");
+
+console.log("6) opening Control with empty usage history…");
+window.document.querySelector('[role="tab"][data-tab="CONTROL"]').click();
+await new Promise((r) => setTimeout(r, 200));
+assert.deepEqual(errors.map((e) => String(e)), [], `errors opening Control: ${errors.join("; ")}`);
+assert(rootEl.textContent.includes("0 · 0 completed · 0 needed you"), "empty usage did not render");
+assert(rootEl.textContent.includes("Measured wall-clock time only."), "usage response was not rendered");
+assert(!rootEl.textContent.includes("Longest runs"), "empty history should not render a run list");
+window.document.querySelector('[role="tab"][data-tab="QUEUE"]').click();
+await new Promise((r) => setTimeout(r, 100));
+assert(window.document.querySelector('[data-tab="QUEUE"][aria-selected="true"]'), "sidebar navigation broke");
+console.log("   null recent history renders safely and tab navigation still works");
 
 console.log("\nWEBVIEW BOOT OK");
 // React's scheduler and the store's reconciliation timer keep the loop alive.

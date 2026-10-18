@@ -64,6 +64,28 @@ func Open(path string) (*Store, error) {
 // Close closes the store.
 func (s *Store) Close() error { return s.db.Close() }
 
+// Completion uses a conditional write: a concurrently queued continuation
+// must not be hidden behind a row/batch completion based on a stale snapshot.
+func (s *Store) CompleteRowIfDone(id string) (bool, error) {
+	r, err := s.db.Exec(`UPDATE batch_rows SET status='COMPLETED' WHERE id=?
+		AND NOT EXISTS (SELECT 1 FROM runs WHERE row_id=? AND state NOT IN ('COMPLETED','SKIPPED'))`, id, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n > 0, err
+}
+
+func (s *Store) CompleteBatchIfDone(id string, at time.Time) (bool, error) {
+	r, err := s.db.Exec(`UPDATE batches SET status='COMPLETED', finished_at=? WHERE id=?
+		AND NOT EXISTS (SELECT 1 FROM runs WHERE batch_id=? AND state NOT IN ('COMPLETED','SKIPPED'))`, fmtTime(at), id, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n > 0, err
+}
+
 // migrations run in order; version = index+1.
 var migrations = []string{
 	// 1: core schema
@@ -239,6 +261,12 @@ var migrations = []string{
 	// 4: when cancellation was requested, so the watchdog can force a stuck
 	// CANCEL_REQUESTED run to CANCELLED instead of leaking its slot forever.
 	`ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT NOT NULL DEFAULT '';`,
+	// 5: durable recovery and the actual provider-reported model.
+	`ALTER TABLE runs ADD COLUMN resolved_model TEXT NOT NULL DEFAULT '';
+    ALTER TABLE runs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE runs ADD COLUMN completion_retries INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE runs ADD COLUMN pending_prompt_cipher TEXT NOT NULL DEFAULT '';
+    ALTER TABLE runs ADD COLUMN effective_effort TEXT NOT NULL DEFAULT '';`,
 }
 
 func (s *Store) migrate() error {
@@ -299,7 +327,7 @@ const runCols = `id,batch_id,row_id,card_index,title,provider,model,effort,permi
 prompt_cipher,prompt_hash,prompt_preview,secret_version_id,worktree_path,branch,provider_session_id,provider_turn_id,
 provider_sub_session,provider_title,continuation_count,audit_cycles,verify_cycles,error_code,error_msg,final_outcome,
 meaningful_progress,created_at,queued_at,started_at,finished_at,next_eligible_at,queue_wait_ns,active_ns,quota_wait_ns,
-dispatch_uuid,attempt,sort_key,cwd,cancel_requested_at`
+dispatch_uuid,attempt,sort_key,cwd,cancel_requested_at,resolved_model,retry_count,completion_retries,pending_prompt_cipher,effective_effort`
 
 func scanRun(sc interface{ Scan(...any) error }) (*model.Run, error) {
 	r := &model.Run{}
@@ -311,7 +339,7 @@ func scanRun(sc interface{ Scan(...any) error }) (*model.Run, error) {
 		&r.ProviderSessionID, &r.ProviderTurnID, &r.ProviderSubSession, &r.ProviderTitle,
 		&r.ContinuationCount, &r.AuditCycles, &r.VerifyCycles, &r.ErrorCode, &r.ErrorMsg, &r.FinalOutcome,
 		&progress, &createdAt, &queuedAt, &startedAt, &finishedAt, &nextElig,
-		&r.QueueWaitNS, &r.ActiveNS, &r.QuotaWaitNS, &r.DispatchUUID, &r.Attempt, &r.SortKey, &r.Cwd, &cancelReq)
+		&r.QueueWaitNS, &r.ActiveNS, &r.QuotaWaitNS, &r.DispatchUUID, &r.Attempt, &r.SortKey, &r.Cwd, &cancelReq, &r.ResolvedModel, &r.RetryCount, &r.CompletionRetries, &r.PendingPromptCipher, &r.EffectiveEffort)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +377,7 @@ func runInsertArgs(r *model.Run) []any {
 		r.ContinuationCount, r.AuditCycles, r.VerifyCycles, r.ErrorCode, r.ErrorMsg, r.FinalOutcome,
 		b2i(r.MeaningfulProgress), fmtTime(r.CreatedAt), fmtTime(r.QueuedAt), fmtTime(r.StartedAt), fmtTime(r.FinishedAt), fmtTimeP(r.NextEligibleAt),
 		r.QueueWaitNS, r.ActiveNS, r.QuotaWaitNS, r.DispatchUUID, r.Attempt, r.SortKey, r.Cwd,
-		fmtTime(r.CancelRequestedAt),
+		fmtTime(r.CancelRequestedAt), r.ResolvedModel, r.RetryCount, r.CompletionRetries, r.PendingPromptCipher, r.EffectiveEffort,
 	}
 }
 
@@ -369,14 +397,14 @@ func (s *Store) UpdateRun(r *model.Run) error {
 		provider_turn_id=?, provider_sub_session=?, provider_title=?, continuation_count=?, audit_cycles=?, verify_cycles=?,
 		error_code=?, error_msg=?, final_outcome=?, meaningful_progress=?, queued_at=?, started_at=?, finished_at=?,
 		next_eligible_at=?, queue_wait_ns=?, active_ns=?, quota_wait_ns=?, dispatch_uuid=?, attempt=?,
-		prompt_cipher=?, prompt_hash=?, prompt_preview=?, secret_version_id=?, cwd=?, cancel_requested_at=?
+		prompt_cipher=?, prompt_hash=?, prompt_preview=?, secret_version_id=?, cwd=?, cancel_requested_at=?, resolved_model=?, retry_count=?, completion_retries=?, pending_prompt_cipher=?, effective_effort=?
 		WHERE id=?`,
 		string(r.State), string(r.Stage), r.Title, r.Provider, r.Model, r.Effort, r.Permission,
 		b2i(r.Staged), b2i(r.AttachSecrets), r.SortKey, r.WorktreePath, r.Branch, r.ProviderSessionID,
 		r.ProviderTurnID, r.ProviderSubSession, r.ProviderTitle, r.ContinuationCount, r.AuditCycles, r.VerifyCycles,
 		r.ErrorCode, r.ErrorMsg, r.FinalOutcome, b2i(r.MeaningfulProgress), fmtTime(r.QueuedAt), fmtTime(r.StartedAt), fmtTime(r.FinishedAt),
 		fmtTimeP(r.NextEligibleAt), r.QueueWaitNS, r.ActiveNS, r.QuotaWaitNS, r.DispatchUUID, r.Attempt,
-		r.PromptCipherStore, r.PromptHash, r.PromptPreview, r.SecretVersionID, r.Cwd, fmtTime(r.CancelRequestedAt),
+		r.PromptCipherStore, r.PromptHash, r.PromptPreview, r.SecretVersionID, r.Cwd, fmtTime(r.CancelRequestedAt), r.ResolvedModel, r.RetryCount, r.CompletionRetries, r.PendingPromptCipher, r.EffectiveEffort,
 		r.ID)
 	return err
 }
@@ -485,10 +513,10 @@ func (s *Store) TransitionRun(runID string, to model.RunState, evt *model.RunEve
 	}
 	if _, err := tx.Exec(`UPDATE runs SET state=?, started_at=?, finished_at=?, queued_at=?, next_eligible_at=?, worktree_path=?, branch=?,
 		provider_session_id=?, provider_turn_id=?, provider_title=?, continuation_count=?, error_code=?, error_msg=?, final_outcome=?,
-		meaningful_progress=?, stage=?, active_ns=?, quota_wait_ns=?, queue_wait_ns=?, dispatch_uuid=?, attempt=?, cancel_requested_at=? WHERE id=?`,
+		meaningful_progress=?, stage=?, active_ns=?, quota_wait_ns=?, queue_wait_ns=?, dispatch_uuid=?, attempt=?, cancel_requested_at=?, resolved_model=?, retry_count=?, completion_retries=?, pending_prompt_cipher=?, effective_effort=?, audit_cycles=?, verify_cycles=?, provider_sub_session=? WHERE id=?`,
 		string(r.State), fmtTime(r.StartedAt), fmtTime(r.FinishedAt), fmtTime(r.QueuedAt), fmtTimeP(r.NextEligibleAt), r.WorktreePath, r.Branch,
 		r.ProviderSessionID, r.ProviderTurnID, r.ProviderTitle, r.ContinuationCount, r.ErrorCode, r.ErrorMsg, r.FinalOutcome,
-		b2i(r.MeaningfulProgress), string(r.Stage), r.ActiveNS, r.QuotaWaitNS, r.QueueWaitNS, r.DispatchUUID, r.Attempt, fmtTime(r.CancelRequestedAt), runID); err != nil {
+		b2i(r.MeaningfulProgress), string(r.Stage), r.ActiveNS, r.QuotaWaitNS, r.QueueWaitNS, r.DispatchUUID, r.Attempt, fmtTime(r.CancelRequestedAt), r.ResolvedModel, r.RetryCount, r.CompletionRetries, r.PendingPromptCipher, r.EffectiveEffort, r.AuditCycles, r.VerifyCycles, r.ProviderSubSession, runID); err != nil {
 		return err
 	}
 	if evt != nil {
@@ -837,7 +865,7 @@ func scanBatches(rows *sql.Rows) ([]*model.Batch, error) {
 // and falling back to insertion order.
 func (s *Store) ListActiveBatches() ([]*model.Batch, error) {
 	rows, err := s.db.Query(`SELECT ` + prefixed(batchCols, "b") + ` FROM batches b
-		LEFT JOIN (SELECT batch_id, MIN(sort_key) AS min_sort FROM runs GROUP BY batch_id) r ON r.batch_id = b.id
+		LEFT JOIN (SELECT batch_id, MIN(sort_key) AS min_sort FROM runs WHERE state IN ('QUEUED','WAITING_FOR_SLOT','WAITING_FOR_EXTERNAL_AGENT','WAITING_FOR_QUOTA') GROUP BY batch_id) r ON r.batch_id = b.id
 		WHERE b.status IN ('QUEUED','RUNNING')
 		ORDER BY COALESCE(r.min_sort, 9223372036854775807) ASC, b.batch_number ASC`)
 	if err != nil {
@@ -917,12 +945,31 @@ func (s *Store) UpsertProviderSession(p *model.ProviderSession) error {
 	_, err := s.db.Exec(`INSERT INTO provider_sessions(provider,native_id,run_id,kind,cwd,model,title,last_event,last_seen_at)
 		VALUES(?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(provider,native_id) DO UPDATE SET run_id=excluded.run_id, kind=excluded.kind, cwd=excluded.cwd,
-		model=excluded.model, title=excluded.title, last_event=excluded.last_event, last_seen_at=excluded.last_seen_at`,
+		model=excluded.model, title=excluded.title,
+		last_event=CASE WHEN excluded.last_event='' THEN provider_sessions.last_event ELSE excluded.last_event END,
+		last_seen_at=excluded.last_seen_at`,
 		p.Provider, p.NativeID, p.RunID, p.Kind, p.Cwd, p.Model, p.Title, p.LastEvent, fmtTime(p.LastSeenAt))
 	return err
 }
 
-// ListProviderSessions returns sessions observed since the given time.
+// GetProviderSession returns the last observation for one native session.
+func (s *Store) GetProviderSession(provider, nativeID string) (*model.ProviderSession, error) {
+	var p model.ProviderSession
+	var ts string
+	err := s.db.QueryRow(`SELECT provider,native_id,run_id,kind,cwd,model,title,last_event,last_seen_at
+		FROM provider_sessions WHERE provider=? AND native_id=?`, provider, nativeID).
+		Scan(&p.Provider, &p.NativeID, &p.RunID, &p.Kind, &p.Cwd, &p.Model, &p.Title, &p.LastEvent, &ts)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.LastSeenAt = parseTime(ts)
+	return &p, nil
+}
+
+// ListProviderSessions returns the most recently observed sessions first.
 func (s *Store) ListProviderSessions(provider string) ([]*model.ProviderSession, error) {
 	rows, err := s.db.Query(`SELECT provider,native_id,run_id,kind,cwd,model,title,last_event,last_seen_at FROM provider_sessions WHERE provider=? ORDER BY last_seen_at DESC`, provider)
 	if err != nil {

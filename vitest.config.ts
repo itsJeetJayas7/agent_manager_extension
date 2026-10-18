@@ -1,10 +1,7 @@
 import { defineConfig } from "vitest/config";
 import { resolve } from "path";
 
-// Shared defaults. The per-environment split lives in vitest.workspace.ts so
-// that a bare `npx vitest` does the right thing for both suites; previously
-// this declared `environment: "node"` globally and only worked because the npm
-// scripts passed --environment explicitly (§9).
+// Extension and webview projects share the VS Code stub and keep their own environments.
 export default defineConfig({
   resolve: {
     alias: {
@@ -15,5 +12,9 @@ export default defineConfig({
   },
   test: {
     globals: false,
+    projects: [
+      { extends: true, test: { name: "extension", include: ["tests/extension/**/*.test.ts"], environment: "node" } },
+      { extends: true, test: { name: "webview", include: ["tests/webview/**/*.test.{ts,tsx}"], environment: "jsdom" } },
+    ],
   },
 });

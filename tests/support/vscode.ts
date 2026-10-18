@@ -37,6 +37,10 @@ export const window = {
   showErrorMessage: async () => undefined,
 };
 
+export const commands = {
+  executeCommand: async (_command: string) => undefined,
+};
+
 export function __reset(): void {
   for (const k of Object.keys(__config)) {
     delete __config[k];

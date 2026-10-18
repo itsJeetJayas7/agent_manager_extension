@@ -199,7 +199,7 @@ html, body, #root {
 .ac-qlist { display: flex; flex-direction: column; }
 .ac-qrow {
   display: grid;
-  grid-template-columns: 22px 1fr 64px auto;
+  grid-template-columns: 22px minmax(0, 1fr) 84px;
   gap: var(--ac-rhythm-2);
   align-items: center;
   padding: var(--ac-rhythm-2) var(--ac-rhythm-3);
@@ -214,9 +214,11 @@ html, body, #root {
 .ac-qrow-title { min-width: 0; }
 .ac-qrow-sub { color: var(--ac-fg-muted); font-size: var(--ac-text-xs); }
 .ac-qrow-when { text-align: right; color: var(--ac-fg-muted); font-size: var(--ac-text-xs); }
-.ac-qrow-actions { display: flex; gap: var(--ac-rhythm-1); opacity: 0; transition: opacity 120ms ease; }
-.ac-qrow:hover .ac-qrow-actions,
-.ac-qrow:focus-within .ac-qrow-actions { opacity: 1; }
+.ac-qrow-actions { grid-column: 2 / -1; display: flex; justify-content: flex-end; gap: var(--ac-rhythm-1); }
+.ac-queue-help, .ac-queue-error { margin: 0; padding: 4px 16px 10px; }
+.ac-queue-error { color: var(--ac-error); }
+.ac-queue-end { padding: 12px 16px; text-align: center; color: var(--ac-fg-muted); font-size: var(--ac-text-xs); border-top: 2px solid transparent; }
+.ac-queue-end[data-dropbefore="true"] { border-top-color: var(--ac-accent); background: var(--ac-bg-alt); }
 .ac-qrow[data-dragging="true"] { opacity: 0.4; }
 .ac-qrow[data-dropbefore="true"] { box-shadow: inset 0 2px 0 0 var(--ac-accent); }
 .ac-drag { cursor: grab; color: var(--ac-fg-muted); }
@@ -285,7 +287,8 @@ html, body, #root {
   cursor: pointer; padding: 2px var(--ac-rhythm-1); border-radius: var(--ac-radius);
   font-size: var(--ac-text-sm);
 }
-.ac-icon-btn:hover { color: var(--ac-fg); background: var(--ac-bg-alt); }
+.ac-icon-btn:hover:not(:disabled) { color: var(--ac-fg); background: var(--ac-bg-alt); }
+.ac-icon-btn:disabled { opacity: 0.35; cursor: default; }
 
 /* One focus treatment, applied to everything focusable. */
 .ac-btn:focus-visible,
@@ -487,3 +490,29 @@ summary:focus-visible,
 .ac-preset-x { opacity: 0; margin-left: -2px; }
 .ac-preset:hover .ac-preset-x,
 .ac-preset:focus-within .ac-preset-x { opacity: 1; }
+/* Folder sequences stay readable in narrow sidebars; prompts are plain text. */
+[hidden] { display: none !important; }
+.ac-composer-settings { border: 0; padding: 0; margin: 0; min-width: 0; }
+.ac-sequence { min-width: 0; }
+.ac-sequence-paths { margin-bottom: 6px; }
+.ac-sequence-paths dd { margin: 3px 0 0; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; overflow-wrap: anywhere; }
+.ac-sequence-files { list-style: none; padding: 0; margin: 10px 0 0; border-top: 1px solid var(--vscode-widget-border, #ddd); }
+.ac-sequence-files li { border-bottom: 1px solid var(--vscode-widget-border, #ddd); }
+.ac-sequence-files summary { padding: 10px 4px; cursor: pointer; overflow-wrap: anywhere; }
+.ac-sequence-files summary .ac-num { margin: 0 10px 0 4px; }
+.ac-sequence-filename { overflow-wrap: anywhere; padding: 0 6px 6px; }
+.ac-sequence-prompt { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; margin: 0 0 10px; padding: 10px; font-size: 12px; line-height: 1.6; background: var(--vscode-textCodeBlock-background, #f5f5f5); border-radius: 4px; }
+.ac-sequence-ignored { max-height: 160px; overflow: auto; overflow-wrap: anywhere; padding-left: 20px; }
+.ac-sequence .ac-banner { overflow-wrap: anywhere; }
+.ac-sequence .ac-banner ul { padding-left: 18px; margin-bottom: 0; }
+
+/* Observable run activity: bounded output, readable in narrow sidebars. */
+.ac-activity { margin-top: 12px; min-width: 0; }
+.ac-activity-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--vscode-descriptionForeground, #888); flex: 0 0 auto; }
+.ac-activity-dot.live { background: var(--vscode-testing-iconPassed, #2f9e73); }
+.ac-activity summary { cursor: pointer; }
+.ac-activity-log { max-height: 240px; overflow: auto; margin-top: 8px; padding: 8px; border: 1px solid var(--vscode-panel-border, #8884); border-radius: 6px; }
+.ac-activity-entry { margin-bottom: 8px; min-width: 0; }
+.ac-activity-entry time { font-size: 10px; opacity: .65; font-variant-numeric: tabular-nums; }
+.ac-activity-entry pre { margin: 2px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 12px; }
+.ac-activity-entry.status pre, .ac-activity-entry.tool pre { opacity: .8; }

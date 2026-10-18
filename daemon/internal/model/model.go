@@ -76,7 +76,7 @@ var transitions = map[RunState][]RunState{
 	StateQueued:              {StateWaitingForSlot, StateWaitingForExternal, StatePreparing, StateCancelRequested, StateCancelled, StateSkipped, StateFailed, StateNeedsAttention},
 	StateWaitingForSlot:      {StatePreparing, StateWaitingForExternal, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
 	StateWaitingForExternal:  {StatePreparing, StateWaitingForSlot, StateQueued, StateCancelRequested, StateCancelled, StateFailed, StateNeedsAttention},
-	StatePreparing:           {StateStarting, StateFailed, StateNeedsAttention, StateCancelRequested, StateBlocked, StatePaused, StateOrphaned},
+	StatePreparing:           {StateRunning, StateStarting, StateFailed, StateNeedsAttention, StateCancelRequested, StateBlocked, StatePaused, StateOrphaned},
 	StateStarting:            {StateRunning, StateFailed, StateNeedsAttention, StateCancelRequested, StateWaitingForQuota, StatePaused, StateOrphaned},
 	StateRunning:             {StateWaitingForQuota, StateVerifying, StateCompleted, StateBlocked, StateNeedsAttention, StateFailed, StateCancelRequested, StateWaitingForProvider, StateIntegrating, StateOrphaned, StatePaused},
 	StateWaitingForProvider:  {StateRunning, StateWaitingForQuota, StateFailed, StateNeedsAttention, StateCancelRequested, StateOrphaned, StatePaused},
@@ -101,6 +101,13 @@ var transitions = map[RunState][]RunState{
 
 // CanTransition validates a state change.
 func CanTransition(from, to RunState) bool {
+	if to == StateQueued {
+		switch from {
+		case StatePreparing, StateStarting, StateRunning, StateWaitingForProvider,
+			StateWaitingForQuota, StateAutoResuming, StateVerifying, StateOrphaned, StateCompleted:
+			return true
+		}
+	}
 	if from == to {
 		return true
 	}
@@ -196,19 +203,25 @@ const (
 
 // Run is a single managed agent run.
 type Run struct {
-	ID                 string     `json:"id"`
-	BatchID            string     `json:"batchId"`
-	RowID              string     `json:"rowId"`
-	CardIndex          int        `json:"cardIndex"`
-	Title              string     `json:"title"`
-	Provider           string     `json:"provider"`
-	Model              string     `json:"model"`
-	Effort             string     `json:"effort"`
-	Permission         string     `json:"permission"` // bypass | plan | default | acceptEdits
-	Staged             bool       `json:"staged"`
-	AttachSecrets      bool       `json:"attachSecrets"`
-	State              RunState   `json:"state"`
-	Stage              Stage      `json:"stage"`
+	ID                  string   `json:"id"`
+	BatchID             string   `json:"batchId"`
+	RowID               string   `json:"rowId"`
+	CardIndex           int      `json:"cardIndex"`
+	Title               string   `json:"title"`
+	Provider            string   `json:"provider"`
+	Model               string   `json:"model"`
+	Effort              string   `json:"effort"`
+	Permission          string   `json:"permission"` // bypass | plan | default | acceptEdits
+	Staged              bool     `json:"staged"`
+	AttachSecrets       bool     `json:"attachSecrets"`
+	State               RunState `json:"state"`
+	Stage               Stage    `json:"stage"`
+	EffectiveEffort     string   `json:"effectiveEffort"`
+	ResolvedModel       string   `json:"resolvedModel,omitempty"`
+	RetryCount          int      `json:"retryCount"`
+	CompletionRetries   int      `json:"completionRetries"`
+	PendingPromptCipher string   `json:"-"` // continuation, encrypted exactly like the original prompt
+
 	PromptCipherStore  string     `json:"-"`
 	PromptPreview      string     `json:"promptPreview"` // redacted first line(s)
 	PromptHash         string     `json:"promptHash"`
@@ -301,22 +314,25 @@ const (
 // ParseResultMarker scans a final assistant message for the AC result marker.
 // Returns outcome "COMPLETE", "BLOCKED" with reason, or "" when absent.
 func ParseResultMarker(msg string) (outcome, reason string) {
-	if strings.Contains(msg, MarkerComplete) {
+	// Only the final line is a completion decision. Examples or a quoted
+	// contract earlier in the response are not proof that work is complete.
+	lines := strings.Split(strings.TrimSpace(msg), "\n")
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if last == MarkerComplete {
 		return "COMPLETE", ""
 	}
-	if i := strings.Index(msg, MarkerBlocked); i >= 0 {
-		rest := msg[i+len(MarkerBlocked):]
-		if j := strings.Index(rest, "</AC_RESULT>"); j >= 0 {
-			return "BLOCKED", strings.TrimSpace(rest[:j])
+	if strings.HasPrefix(last, MarkerBlocked) && strings.HasSuffix(last, "</AC_RESULT>") {
+		reason = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(last, MarkerBlocked), "</AC_RESULT>"))
+		if reason != "" {
+			return "BLOCKED", reason
 		}
-		return "BLOCKED", strings.TrimSpace(rest)
 	}
 	return "", ""
 }
 
 // HasStageMarker reports whether the plan-stage marker is present.
 func HasStageMarker(msg string) bool {
-	return strings.Contains(msg, MarkerStagePlan)
+	return strings.HasSuffix(strings.TrimSpace(msg), MarkerStagePlan)
 }
 
 // ExecutionContract is the fixed wording prepended to managed prompts.

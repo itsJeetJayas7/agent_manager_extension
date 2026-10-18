@@ -91,8 +91,8 @@ func (c *Conductor) advanceBatch(ctx context.Context, b *model.Batch, st *slotSt
 				}
 				firstStarted = true
 			}
-			// If nothing could start due to external busy, mark waiting state on runs.
-			c.markWaitingExternal(rowRuns, st)
+			// Mark work waiting for managed capacity, including legacy external waits.
+			c.markWaitingForSlot(rowRuns, st)
 			// A still-pending row that cannot start blocks this batch here.
 			if row.Status == model.RowPending && !anyStarted && len(rowRuns) > 0 && !rowDone(rowRuns) {
 				return nil
@@ -118,7 +118,13 @@ func (c *Conductor) advanceBatch(ctx context.Context, b *model.Batch, st *slotSt
 					return err
 				}
 			}
-			c.store.UpdateRowStatus(row.ID, model.RowDone)
+			done, err := c.store.CompleteRowIfDone(row.ID)
+			if err != nil {
+				return err
+			}
+			if !done {
+				return nil
+			}
 			c.emitBatch(b.ID)
 			continue // next row
 		}
@@ -127,10 +133,13 @@ func (c *Conductor) advanceBatch(ctx context.Context, b *model.Batch, st *slotSt
 
 	// all rows done
 	if b.Status != model.BatchDone {
-		b.Status = model.BatchDone
-		b.FinishedAt = c.Now()
-		c.store.UpdateBatch(b)
-		c.emitBatch(b.ID)
+		done, err := c.store.CompleteBatchIfDone(b.ID, c.Now())
+		if err != nil {
+			return err
+		}
+		if done {
+			c.emitBatch(b.ID)
+		}
 	}
 	return nil
 }
@@ -143,6 +152,21 @@ func (c *Conductor) dispatchRow(ctx context.Context, b *model.Batch, row *model.
 		if r.State != model.StateQueued && r.State != model.StateWaitingForSlot && r.State != model.StateWaitingForExternal {
 			continue
 		}
+		if r.NextEligibleAt != nil && r.NextEligibleAt.After(st.now) {
+			continue
+		}
+		c.mu.Lock()
+		_, live := c.cancels[r.ID]
+		c.mu.Unlock()
+		if live {
+			continue
+		}
+		if blocked, _, _, _ := c.quotaBlocked(r.Provider, st.now); blocked {
+			continue
+		}
+		if !isParallel && started {
+			break
+		}
 		ok, _ := st.canStart(r.Provider, isParallel)
 		if !ok {
 			continue
@@ -153,12 +177,15 @@ func (c *Conductor) dispatchRow(ctx context.Context, b *model.Batch, row *model.
 		}
 		st.counts[r.Provider]++
 		st.total++
+		if st.batchImplicit {
+			st.queueActive++
+		}
 		started = true
 	}
 	return started, nil
 }
 
-// markWaitingExternal records why queued runs cannot start yet.
+// markWaitingForSlot records why queued runs cannot start yet.
 //
 // It re-reads each run rather than trusting rowRuns. dispatchRow runs first in
 // the same tick and starts runs through the store, so the in-memory slice is
@@ -168,7 +195,7 @@ func (c *Conductor) dispatchRow(ctx context.Context, b *model.Batch, row *model.
 // (correctly) refuses — leaving a spurious "refused: illegal transition
 // STARTING -> QUEUED" in the daemon log and on the user's run timeline every
 // time a waiting run finally got its slot.
-func (c *Conductor) markWaitingExternal(rowRuns []*model.Run, st *slotState) {
+func (c *Conductor) markWaitingForSlot(rowRuns []*model.Run, st *slotState) {
 	for _, stale := range rowRuns {
 		r, err := c.store.GetRun(stale.ID)
 		if err != nil || r == nil {
@@ -185,11 +212,7 @@ func (c *Conductor) markWaitingExternal(rowRuns []*model.Run, st *slotState) {
 			}
 			continue
 		}
-		if len(st.busyExt) > 0 {
-			if model.CanTransition(r.State, model.StateWaitingForExternal) {
-				c.transition(r.ID, model.StateWaitingForExternal, nil, nil)
-			}
-		} else if model.CanTransition(r.State, model.StateWaitingForSlot) {
+		if model.CanTransition(r.State, model.StateWaitingForSlot) {
 			c.transition(r.ID, model.StateWaitingForSlot, nil, nil)
 		}
 	}

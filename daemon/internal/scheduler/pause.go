@@ -104,9 +104,18 @@ func (c *Conductor) loadPause() {
 	if p.Scope == "" {
 		p.Scope = PauseQueueOnly
 	}
+	// External activity no longer pauses dispatch. Retire persisted holds from
+	// older versions without touching a user's explicit pause.
+	legacyExternal := p.Source == PauseSourceExternal
+	if legacyExternal {
+		p = PauseState{Scope: PauseQueueOnly}
+	}
 	c.pauseMu.Lock()
 	c.pause = p
 	c.pauseMu.Unlock()
+	if legacyExternal {
+		c.persistPause(p)
+	}
 }
 
 // honourElapsedPause resumes a pause whose deadline passed while the daemon
@@ -375,9 +384,6 @@ func (c *Conductor) interruptActiveForPause() {
 // resumePausedRuns continues every run parked by an INCLUDE_ACTIVE pause,
 // reusing its native session so no work is thrown away.
 func (c *Conductor) resumePausedRuns() {
-	c.mu.Lock()
-	c.pauseHeld = map[string]bool{}
-	c.mu.Unlock()
 	runs, err := c.store.ListRunsByStates(model.StatePaused)
 	if err != nil {
 		return
@@ -454,9 +460,7 @@ func humanDuration(d time.Duration) string {
 
 // GatesDispatch reports whether this pause stops dispatch outright.
 //
-// An external-agent hold is recorded so the UI has one place to explain "why
-// is nothing running?", but it is enforced per row by canStart, which is more
-// precise: a PARALLEL row may still proceed while a manual session is busy.
+// Legacy external holds never gate dispatch and are discarded on upgrade.
 func (p PauseState) GatesDispatch() bool {
 	return p.Paused && p.Source != PauseSourceExternal
 }
@@ -464,7 +468,8 @@ func (p PauseState) GatesDispatch() bool {
 // updateSystemHolds keeps the pause record in step with conditions the user
 // did not ask for, so the UI never has to say "nothing is running" without a
 // reason. A user pause always wins and is never touched here.
-func (c *Conductor) updateSystemHolds(s Settings, now time.Time, busyExt map[string]*model.ProviderSession) {
+func (c *Conductor) updateSystemHolds(s Settings, now time.Time) {
+	c.ClearSystemPause(PauseSourceExternal)
 	if p := c.PauseState(); p.Paused && p.Source == PauseSourceUser {
 		return
 	}
@@ -479,7 +484,6 @@ func (c *Conductor) updateSystemHolds(s Settings, now time.Time, busyExt map[str
 	}
 	if len(waiting) == 0 {
 		c.ClearSystemPause(PauseSourceQuota)
-		c.ClearSystemPause(PauseSourceExternal)
 		return
 	}
 
@@ -492,7 +496,7 @@ func (c *Conductor) updateSystemHolds(s Settings, now time.Time, busyExt map[str
 	var latest time.Time
 	haveReset := false
 	for p := range providersWaiting {
-		blocked, ne, ht, _ := c.guardian.Blocked(p, now)
+		blocked, ne, ht, _ := c.quotaBlocked(p, now)
 		if !blocked {
 			allBlocked = false
 			break
@@ -515,26 +519,6 @@ func (c *Conductor) updateSystemHolds(s Settings, now time.Time, busyExt map[str
 		return
 	}
 	c.ClearSystemPause(PauseSourceQuota)
-
-	// External agent: FIFO holds the normal queue while a manual session runs.
-	if s.FIFOBlockOnExternal && len(busyExt) > 0 {
-		for p, ext := range busyExt {
-			if ext == nil {
-				continue
-			}
-			c.SetSystemPause(PauseSourceExternal,
-				fmt.Sprintf("%s is active outside Agent Conductor%s", providerTitle(p), extWhere(ext)), nil)
-			return
-		}
-	}
-	c.ClearSystemPause(PauseSourceExternal)
-}
-
-func extWhere(ext *model.ProviderSession) string {
-	if s := short(ext.Cwd); s != "" {
-		return " (" + s + ")"
-	}
-	return ""
 }
 
 // queueWaitingStates are runs that would dispatch if nothing held them.

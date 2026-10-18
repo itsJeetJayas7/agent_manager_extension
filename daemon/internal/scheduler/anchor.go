@@ -24,6 +24,7 @@ func worktreesApplyOptions(b *model.Batch) worktrees.ApplyOptions {
 
 func (c *Conductor) hookEventLoop() {
 	ch := c.hookBus.Subscribe()
+	defer c.hookBus.Unsubscribe(ch)
 	for {
 		select {
 		case <-c.stopCh:
@@ -53,25 +54,74 @@ func (c *Conductor) onHookPayload(p providers.HookPayload) {
 	if sessID == "" {
 		return
 	}
+	// Notify on the transition into an external turn, never on opening a
+	// window, duplicate prompt hooks, tool events in that turn, or reconnects.
+	startedExternal := false
+	if kind == "external" && busyEvents[p.Event] {
+		previous, err := c.store.GetProviderSession(p.Provider, sessID)
+		if err != nil {
+			c.log.Errorf("read external session activity: %v", err)
+		} else {
+			startedExternal = !externalSessionBusy(previous, c.Now())
+		}
+	}
 	ps := &model.ProviderSession{
 		Provider: p.Provider, NativeID: sessID, RunID: runID, Kind: kind,
 		Cwd: p.Cwd, Model: p.Model, LastEvent: p.Event, LastSeenAt: c.Now(),
 	}
+	if _, changesBusy := busyEvents[p.Event]; !changesBusy {
+		ps.LastEvent = "" // refresh liveness without losing the last busy/idle decision
+	}
+	// Claude also emits SessionStart after compaction inside a turn. Preserve
+	// that turn's activity; opening/resuming a session otherwise starts idle.
+	if p.Provider == model.ProviderClaude && p.Event == "SessionStart" && p.Raw["source"] == "compact" {
+		ps.LastEvent = ""
+	}
 	if err := c.store.UpsertProviderSession(ps); err != nil {
 		c.log.Errorf("hook payload persist: %v", err)
+		return
 	}
 	if kind == "external" {
 		c.emit("externalSessionUpdated", p.Provider)
-		// external activity may unblock/block the queue
-		c.Poke()
+		if startedExternal {
+			c.notifyExternalOverlap(p.Provider, sessID)
+		}
 	}
-	// Claude quota notifications -> quota windows (source provider_event)
-	if p.Provider == model.ProviderClaude && p.Event == "Notification" {
+	// Only managed sessions can update Conductor's quota state. External
+	// sessions may use a different account, and generic notifications (even
+	// quota-auto-resume notices) must not turn informational activity into a hold.
+	if kind == "managed" && p.Provider == model.ProviderClaude && p.Event == "Notification" {
 		msg := p.NotificationMessage
 		nt := p.NotificationType
 		if containsAny(strings.ToLower(nt+" "+msg), "rate limit", "limit reached", "usage limit", "quota") {
 			c.observeQuota(model.ProviderClaude, claudeQuotaFromNotification(nt, msg, c.Now()))
 		}
+	}
+}
+
+// ExternalRunOverlap is an advisory for connected VS Code windows. No prompt
+// content is sent and no scheduler state is changed by this notification.
+type ExternalRunOverlap struct {
+	Provider       string `json:"provider"`
+	SessionID      string `json:"sessionId"`
+	ActiveRunCount int    `json:"activeRunCount"`
+	QueuePaused    bool   `json:"queuePaused"`
+}
+
+func (c *Conductor) notifyExternalOverlap(provider, sessionID string) {
+	active, err := c.store.ListRunsByStates(
+		model.StatePreparing, model.StateStarting, model.StateRunning,
+		model.StateWaitingForProvider, model.StateVerifying, model.StateIntegrating,
+		model.StateCancelRequested,
+	)
+	if err != nil {
+		c.log.Errorf("check external run overlap: %v", err)
+		return
+	}
+	if len(active) > 0 {
+		c.emit("externalRunOverlap", ExternalRunOverlap{
+			Provider: provider, SessionID: sessionID, ActiveRunCount: len(active), QueuePaused: c.PauseState().Paused,
+		})
 	}
 }
 
@@ -191,7 +241,7 @@ func (c *Conductor) tryAnchor(ctx context.Context, provider string, s Settings, 
 		return
 	}
 	// weekly exhaustion suppresses five-hour anchors
-	blocked, _, _, _ := c.guardian.Blocked(provider, now)
+	blocked, _, _, _ := c.quotaBlocked(provider, now)
 	if blocked {
 		return
 	}

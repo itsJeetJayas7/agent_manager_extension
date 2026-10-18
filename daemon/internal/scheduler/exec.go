@@ -13,32 +13,23 @@ import (
 // startRun moves a queued run through preparation into execution.
 func (c *Conductor) startRun(ctx context.Context, r *model.Run) error {
 	now := c.Now()
-	// Interactive Claude runs need an explicitly trusted workspace; never
-	// accept trust silently on the user's behalf.
-	if r.Provider == model.ProviderClaude {
-		if claude, ok := c.registry.Get(model.ProviderClaude); ok {
-			if cl, ok := claude.(*providers.Claude); ok {
-				cwd := r.Cwd
-				if r.WorktreePath != "" {
-					cwd = r.WorktreePath
-				}
-				if !cl.IsWorkspaceTrusted(cwd) {
-					if err := c.store.TransitionRun(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
-						x.ErrorCode = "WORKSPACE_UNTRUSTED"
-						x.ErrorMsg = "You have not approved agents working in this folder yet. Claude Code's headless mode skips its own trust dialog, so this is Agent Conductor asking: use Trust Workspace, then Continue the run."
-					}); err != nil {
-						return err
-					}
-					c.emitRun(r.ID)
-					return nil
-				}
-			}
-		}
-	}
+	// Queuing work authorizes this personal installation to use its folder.
 	if err := c.store.TransitionRun(r.ID, model.StatePreparing, &model.RunEvent{Type: model.EventQueued, Timestamp: now}, nil); err != nil {
 		return err
 	}
-	c.launchExecution(r, "", false)
+	fresh, err := c.store.GetRun(r.ID)
+	if err != nil {
+		return err
+	}
+	prompt := ""
+	if fresh.PendingPromptCipher != "" {
+		prompt, err = c.vault.Open(fresh.PendingPromptCipher)
+		if err != nil {
+			c.finishFailure(fresh, "VAULT", "cannot decrypt continuation")
+			return err
+		}
+	}
+	c.launchExecution(fresh, prompt, fresh.ProviderSessionID != "")
 	c.emitRun(r.ID)
 	return nil
 }
@@ -59,11 +50,126 @@ func (c *Conductor) launchExecution(r *model.Run, promptOverride string, isConti
 		return
 	}
 
+	planPhase := r.Staged && r.Stage == model.StagePlan
+	modelID, effort, permission, attachSecrets := c.stageSettings(r)
+
+	var effective string
+	switch {
+	case promptOverride != "":
+		effective = promptOverride
+	default:
+		// A continuation always carries an override, so there is no separate
+		// isContinue branch; the old one was unreachable.
+		var secretBlock string
+		if attachSecrets {
+			block, _ := c.latestSecretBlock()
+			secretBlock = block
+		}
+		effective = model.EffectivePrompt(userPrompt, attachSecrets, secretBlock, planPhase)
+	}
+	if isContinue && attachSecrets && promptOverride != "" && strings.Contains(promptOverride, "implement the original user request") {
+		// staged build continuation: attach secrets block if enabled
+		if block, _ := c.latestSecretBlock(); block != "" {
+			effective = effective + "\n\n[SHARED TESTING / SUDO BLOCK — USER SUPPLIED]\n\n" + block + "\n[END SHARED TESTING / SUDO BLOCK]"
+		}
+	}
+
+	cwd := runCwd(r)
+	dispatchUUID := newDispatchUUID(r.ID, r.Attempt+1)
+	if err := c.store.TransitionRun(r.ID, pickActiveState(r), &model.RunEvent{Type: model.EventTurnStarted, Timestamp: c.Now()}, func(x *model.Run) {
+		x.ResolvedModel = ""
+		x.EffectiveEffort = effort
+		x.DispatchUUID = dispatchUUID
+		x.Attempt = r.Attempt + 1
+		if isContinue {
+			x.ContinuationCount++
+		}
+		x.StartedAt = c.Now()
+		x.MeaningfulProgress = false
+		x.NextEligibleAt = nil
+		x.ErrorCode, x.ErrorMsg = "", ""
+		x.FinishedAt = time.Time{}
+	}); err != nil {
+		// Dispatching against a run whose persisted state does not match is how
+		// runs ended up wedged; refuse instead.
+		c.log.Errorf("dispatch %s: %v", r.ID, err)
+		c.finishFailure(r, "DISPATCH", err.Error())
+		return
+	}
+	c.store.RecordAttemptStart(r.ID, r.Attempt+1, dispatchUUID)
+	runID := r.ID
+	spec := providers.ExecSpec{
+		RunID:      runID,
+		Provider:   r.Provider,
+		Model:      modelID,
+		Effort:     effort,
+		Permission: permission,
+		Cwd:        cwd,
+		Prompt:     effective,
+		SessionID:  r.ProviderSessionID,
+		Continue:   isContinue,
+		Stage:      r.Stage,
+		Title:      r.ProviderTitle,
+		Env:        map[string]string{},
+	}
+	execCtx, cancel := context.WithCancel(context.Background())
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		cancel()
+		return
+	}
+	c.cancels[runID] = cancel
+	c.execWG.Add(1)
+	c.mu.Unlock()
+
+	c.beginActivity(runID)
+	go func() {
+		defer c.execWG.Done()
+		// A terminal event is not proof that the child exited. Wait until
+		// Execute has reaped it before releasing its slot or starting a stage.
+		var terminal *providers.Event
+		err := adapter.Execute(execCtx, spec, func(ev providers.Event) {
+			if ev.Kind == providers.EvTurnCompleted || ev.Kind == providers.EvProcessExited {
+				if terminal == nil {
+					copy := ev
+					terminal = &copy
+				}
+				return
+			}
+			c.onProviderEvent(runID, ev)
+		})
+		c.endActivity(runID)
+		c.mu.Lock()
+		delete(c.cancels, runID)
+		stopped := c.stopped
+		c.mu.Unlock()
+		cancel()
+		if stopped {
+			return
+		} // keep persisted active state for startup recovery
+		if terminal != nil {
+			c.onProviderEvent(runID, *terminal)
+		} else {
+			detail := "provider exited without a terminal event"
+			if err != nil {
+				detail = err.Error()
+			}
+			c.onProviderEvent(runID, providers.Event{Kind: providers.EvProcessExited,
+				Error: &providers.ProviderError{Class: model.ErrProcessCrash, Message: detail}})
+		}
+		c.Poke()
+	}()
+}
+
+// stageSettings resolves the model, effort, permission and secret attachment
+// a run's current stage executes with.
+func (c *Conductor) stageSettings(r *model.Run) (modelID, effort, permission string, attachSecrets bool) {
 	// staged intelligence: PLAN phase settings
 	planPhase := r.Staged && r.Stage == model.StagePlan
-	modelID, effort := r.Model, r.Effort
-	permission := r.Permission
-	attachSecrets := r.AttachSecrets
+	modelID, effort = r.Model, r.Effort
+	permission = r.Permission
+	attachSecrets = r.AttachSecrets
 	if r.Staged {
 		s := c.Settings()
 		if r.Provider == model.ProviderClaude {
@@ -101,81 +207,31 @@ func (c *Conductor) launchExecution(r *model.Run, promptOverride string, isConti
 			}
 		}
 	}
+	return modelID, effort, permission, attachSecrets
+}
 
-	var effective string
-	switch {
-	case promptOverride != "":
-		effective = promptOverride
-	default:
-		// A continuation always carries an override, so there is no separate
-		// isContinue branch; the old one was unreachable.
-		var secretBlock string
-		if attachSecrets {
-			block, _ := c.latestSecretBlock()
-			secretBlock = block
-		}
-		effective = model.EffectivePrompt(userPrompt, attachSecrets, secretBlock, planPhase)
-	}
-	if isContinue && attachSecrets && promptOverride != "" && strings.Contains(promptOverride, "implement the original user request") {
-		// staged build continuation: attach secrets block if enabled
-		if block, _ := c.latestSecretBlock(); block != "" {
-			effective = effective + "\n\n[SHARED TESTING / SUDO BLOCK — USER SUPPLIED]\n\n" + block + "\n[END SHARED TESTING / SUDO BLOCK]"
-		}
-	}
-
-	cwd := r.Cwd
+func runCwd(r *model.Run) string {
 	if r.WorktreePath != "" {
-		cwd = r.WorktreePath
+		return r.WorktreePath
 	}
+	return r.Cwd
+}
 
-	dispatchUUID := newDispatchUUID(r.ID, r.Attempt+1)
-	if err := c.store.TransitionRun(r.ID, pickActiveState(r), &model.RunEvent{Type: model.EventTurnStarted, Timestamp: c.Now()}, func(x *model.Run) {
-		x.DispatchUUID = dispatchUUID
-		x.Attempt = r.Attempt + 1
-		x.StartedAt = c.Now()
-		x.MeaningfulProgress = false
-	}); err != nil {
-		// Dispatching against a run whose persisted state does not match is how
-		// runs ended up wedged; refuse instead.
-		c.log.Errorf("dispatch %s: %v", r.ID, err)
-		c.finishFailure(r, "DISPATCH", err.Error())
-		return
+// ClaudeHostSpec describes how to start a process for a managed Claude
+// session that has none, so a Claude Code tab opening it attaches to a
+// daemon-owned process instead of starting a second, competing one.
+func (c *Conductor) ClaudeHostSpec(sessionID string) (*providers.ExecSpec, bool) {
+	r, err := c.store.GetRunByProviderSession(model.ProviderClaude, sessionID)
+	if err != nil || r == nil {
+		return nil, false
 	}
-	c.store.RecordAttemptStart(r.ID, r.Attempt+1, dispatchUUID)
-	runID := r.ID
-	spec := providers.ExecSpec{
-		RunID:      runID,
-		Provider:   r.Provider,
-		Model:      modelID,
-		Effort:     effort,
-		Permission: permission,
-		Cwd:        cwd,
-		Prompt:     effective,
-		SessionID:  r.ProviderSessionID,
-		Continue:   isContinue,
-		Stage:      r.Stage,
-		Title:      r.ProviderTitle,
-		Env:        map[string]string{},
+	modelID, effort, permission, _ := c.stageSettings(r)
+	if r.ResolvedModel != "" {
+		modelID = r.ResolvedModel
 	}
-	execCtx, cancel := context.WithCancel(context.Background())
-	c.mu.Lock()
-	c.cancels[runID] = cancel
-	c.mu.Unlock()
-
-	go func() {
-		defer func() {
-			c.mu.Lock()
-			delete(c.cancels, runID)
-			c.mu.Unlock()
-			cancel()
-			c.Poke()
-		}()
-		err := adapter.Execute(execCtx, spec, func(ev providers.Event) { c.onProviderEvent(runID, ev) })
-		if err != nil {
-			c.log.Errorf("execute %s: %v", runID, err)
-			c.finishFailure(r, "ADAPTER", err.Error())
-		}
-	}()
+	return &providers.ExecSpec{RunID: r.ID, Provider: r.Provider, Model: modelID, Effort: effort,
+		Permission: permission, Cwd: runCwd(r), SessionID: sessionID, Stage: r.Stage, Title: r.ProviderTitle,
+		Env: map[string]string{}}, true
 }
 
 // pickActiveState is the state a run enters when its turn is dispatched.
@@ -207,9 +263,19 @@ func pickActiveState(r *model.Run) model.RunState {
 
 // onProviderEvent processes one adapter event for a run.
 func (c *Conductor) onProviderEvent(runID string, ev providers.Event) {
+	changed := c.recordActivity(runID, ev)
+	if ev.Kind == providers.EvActivity || ev.Kind == providers.EvProcessStarted || (ev.Kind == providers.EvMessageDelta && !changed) {
+		return
+	}
 	r, err := c.store.GetRun(runID)
 	if err != nil || r == nil {
 		return
+	}
+	if r.State.Terminal() {
+		return
+	}
+	if ev.Model != "" && ev.Model != r.ResolvedModel {
+		c.transition(r.ID, r.State, nil, func(x *model.Run) { x.ResolvedModel = ev.Model })
 	}
 	switch ev.Kind {
 	case providers.EvSessionStarted:
@@ -246,15 +312,11 @@ func (c *Conductor) onProviderEvent(runID string, ev providers.Event) {
 	case providers.EvQuotaUpdate:
 		c.observeQuota(r.Provider, ev.Quota)
 	case providers.EvProcessExited:
-		// mid-turn crash with progress: continuation preferred
-		if r.MeaningfulProgress && r.ProviderSessionID != "" {
-			c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
-				x.ErrorCode = string(model.ErrProcessCrash)
-				x.ErrorMsg = "provider process exited mid-turn; same-session continue available"
-			})
-		} else {
-			c.finishFailure(r, string(model.ErrProcessCrash), "provider process exited mid-turn")
+		ev.Kind, ev.Status = providers.EvTurnCompleted, providers.TurnFailed
+		if ev.Error == nil {
+			ev.Error = &providers.ProviderError{Class: model.ErrProcessCrash, Message: "provider process exited mid-turn"}
 		}
+		c.onTurnCompleted(r, ev)
 	case providers.EvTurnCompleted:
 		c.onTurnCompleted(r, ev)
 	}
@@ -263,6 +325,12 @@ func (c *Conductor) onProviderEvent(runID string, ev providers.Event) {
 
 func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 	attempt := r.Attempt
+	// A late success/failure after a cancellation must never restart the work.
+	if r.State == model.StateCancelRequested {
+		c.transition(r.ID, model.StateCancelled, nil, func(x *model.Run) { x.FinishedAt = c.Now(); x.FinalOutcome = "CANCELLED" })
+		c.Poke()
+		return
+	}
 	c.store.FinishAttempt(r.ID, attempt, ev.SessionID, ev.TurnID, string(ev.Status), ev.Progress)
 	switch ev.Status {
 	case providers.TurnInterrupted:
@@ -279,8 +347,15 @@ func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 				x.ErrorCode = ""
 				x.ErrorMsg = ""
 			})
+			if !c.PauseState().GatesDispatch() {
+				c.queueRecovery(r.ID, c.recoveryPrompt(r), "pause lifted before interrupt completed", nil)
+			}
 		default:
-			c.finishFailure(r, string(model.ErrUserInterrupt), "run interrupted")
+			msg := "run interrupted"
+			if ev.Error != nil && ev.Error.Message != "" {
+				msg = ev.Error.Message
+			}
+			c.finishFailure(r, string(model.ErrUserInterrupt), msg)
 		}
 		return
 	case providers.TurnFailed:
@@ -292,6 +367,9 @@ func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 		msg := "turn failed"
 		if ev.Error != nil {
 			cls, msg = ev.Error.Class, ev.Error.Message
+		}
+		if c.retryTransient(r, cls, msg) {
+			return
 		}
 		c.finishFailure(r, string(cls), msg)
 		return
@@ -315,11 +393,14 @@ func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 			c.emit("runUpdated", r.ID)
 			c.Poke()
 		default:
-			// Agent stopped without the required marker after the completion
-			// gate already gave one continuation: needs human attention.
+			if r.CompletionRetries < c.Settings().MaxCompletionContinuations {
+				c.transition(r.ID, r.State, nil, func(x *model.Run) { x.CompletionRetries++ })
+				c.queueRecovery(r.ID, model.ContinueAfterQuota, "agent stopped before reporting completion", nil)
+				return
+			}
 			c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 				x.ErrorCode = "NO_RESULT_MARKER"
-				x.ErrorMsg = "agent stopped without <AC_RESULT> marker"
+				x.ErrorMsg = "agent stopped without a result marker after the configured automatic continuations"
 				x.FinishedAt = c.Now()
 			})
 			c.Poke()
@@ -331,6 +412,19 @@ func (c *Conductor) onTurnCompleted(r *model.Run, ev providers.Event) {
 // same native session.
 func (c *Conductor) onPlanComplete(r *model.Run, planMsg string) {
 	if !model.HasStageMarker(planMsg) {
+		if outcome, reason := model.ParseResultMarker(planMsg); outcome == "BLOCKED" {
+			c.transition(r.ID, model.StateBlocked, nil, func(x *model.Run) {
+				x.FinalOutcome = "BLOCKED: " + reason
+				x.FinishedAt = c.Now()
+			})
+			c.Poke()
+			return
+		}
+		if r.CompletionRetries < c.Settings().MaxCompletionContinuations {
+			c.transition(r.ID, r.State, nil, func(x *model.Run) { x.CompletionRetries++ })
+			c.queueRecovery(r.ID, "Continue the read-only plan. End with <AC_STAGE>PLAN_READY</AC_STAGE>, or <AC_RESULT>BLOCKED: reason</AC_RESULT> if you cannot proceed.", "plan stopped before reporting readiness", nil)
+			return
+		}
 		c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 			x.ErrorCode = "NO_PLAN_MARKER"
 			x.ErrorMsg = "plan phase ended without <AC_STAGE>PLAN_READY</AC_STAGE> marker"
@@ -342,7 +436,7 @@ func (c *Conductor) onPlanComplete(r *model.Run, planMsg string) {
 	c.transition(r.ID, model.StateRunning, &model.RunEvent{Type: model.EventStageChanged, Timestamp: c.Now()}, func(x *model.Run) {
 		x.Stage = model.StageBuild
 	})
-	c.launchExecution(r, model.BuildStageContinuation, true)
+	c.queueRecovery(r.ID, model.BuildStageContinuation, "plan ready; begin build", nil)
 	c.emitRun(r.ID)
 }
 
@@ -404,26 +498,54 @@ func (c *Conductor) beginVerification(r *model.Run) {
 		c.completeRun(r)
 		return
 	}
-	c.transition(r.ID, model.StateVerifying, &model.RunEvent{Type: model.EventVerificationStarted, Timestamp: c.Now()}, nil)
+	if !c.transition(r.ID, model.StateVerifying, &model.RunEvent{Type: model.EventVerificationStarted, Timestamp: c.Now()}, nil) {
+		return
+	}
+	timeout := time.Duration(s.VerificationTimeoutSec) * time.Second
+	if timeout <= 0 {
+		timeout = defaultVerificationTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		cancel()
+		return
+	}
+	c.cancels[r.ID] = cancel
+	c.execWG.Add(1)
+	c.mu.Unlock()
 	go func() {
+		defer c.execWG.Done()
+		defer cancel()
 		cwd := r.Cwd
 		if r.WorktreePath != "" {
 			cwd = r.WorktreePath
 		}
-		timeout := time.Duration(s.VerificationTimeoutSec) * time.Second
-		if timeout <= 0 {
-			timeout = defaultVerificationTimeout
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
 		c.store.AddRunEvent(r.ID, model.EventVerificationStarted,
 			quoteJSON(fmt.Sprintf("%d command(s), timeout %s", len(s.VerificationCommands), timeout)))
 		ok, summary := c.verifier.Verify(ctx, cwd, s.VerificationCommands)
+		c.mu.Lock()
+		delete(c.cancels, r.ID)
+		stopped := c.stopped
+		c.mu.Unlock()
+		if stopped {
+			return
+		}
 		// Verification output can echo anything the commands printed, so it is
 		// redacted before it is persisted or shown.
 		summary = c.log.Redactor().Redact(summary)
 		r2, _ := c.store.GetRun(r.ID)
 		if r2 == nil {
+			return
+		}
+		if r2.State == model.StateCancelRequested {
+			c.transition(r.ID, model.StateCancelled, nil, func(x *model.Run) { x.FinishedAt = c.Now(); x.FinalOutcome = "CANCELLED" })
+			c.emitRun(r.ID)
+			c.Poke()
+			return
+		}
+		if r2.State != model.StateVerifying {
 			return
 		}
 		c.store.AddRunEvent(r.ID, model.EventVerificationFinished, quoteJSON(strings.TrimSpace(summary)))
@@ -436,7 +558,7 @@ func (c *Conductor) beginVerification(r *model.Run) {
 			fix := "Your verification commands failed. Fix the failures and complete the task again.\n\nVerification output (truncated):\n" +
 				truncate(redactLines(summary), 4000) +
 				"\n\nEnd with the standard Agent Conductor result marker."
-			c.launchExecution(r2, fix, true)
+			c.queueRecovery(r2.ID, fix, "verification failed; repair", nil)
 		} else {
 			c.transition(r.ID, model.StateNeedsAttention, nil, func(x *model.Run) {
 				x.ErrorCode = "VERIFICATION_FAILED"
@@ -459,7 +581,7 @@ func (c *Conductor) completeRun(r *model.Run) {
 		audit := `Audit the completed work read-only. Review the actual diff and test results for missed requirements or regressions.
 If everything is genuinely complete and verified, reply with exactly: <AC_RESULT>COMPLETE</AC_RESULT>
 If you find a real issue, reply with exactly: <AC_RESULT>BLOCKED: precise description of the issue</AC_RESULT>`
-		c.launchExecution(r, audit, true)
+		c.queueRecovery(r.ID, audit, "build verified; begin audit", nil)
 		return
 	}
 	c.transition(r.ID, model.StateCompleted, &model.RunEvent{Type: model.EventRunCompleted, Timestamp: c.Now()}, func(x *model.Run) {
@@ -475,7 +597,7 @@ If you find a real issue, reply with exactly: <AC_RESULT>BLOCKED: precise descri
 func (c *Conductor) finishFailure(r *model.Run, code, msg string) {
 	c.transition(r.ID, model.StateFailed, &model.RunEvent{Type: model.EventRunFailed, Timestamp: c.Now()}, func(x *model.Run) {
 		x.ErrorCode = code
-		x.ErrorMsg = truncate(msg, 500)
+		x.ErrorMsg = truncate(c.log.Redactor().Redact(msg), 500)
 		x.FinishedAt = c.Now()
 	})
 	c.store.AddRunEvent(r.ID, model.EventRunFailed, quoteJSON(code))

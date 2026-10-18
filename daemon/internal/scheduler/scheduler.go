@@ -7,6 +7,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,35 +23,36 @@ import (
 
 // Settings are conductor tunables persisted in the settings table.
 type Settings struct {
-	MaxTotal             int      `json:"maxTotalRuns"`
-	MaxClaude            int      `json:"maxClaudeRuns"`
-	MaxCodex             int      `json:"maxCodexRuns"`
-	AnchorCodexEnabled   bool     `json:"anchorCodexEnabled"`
-	AnchorClaudeEnabled  bool     `json:"anchorClaudeEnabled"`
-	AnchorModelCodex     string   `json:"anchorModelCodex"`
-	AnchorModelClaude    string   `json:"anchorModelClaude"`
-	ClaudeWeeklyResetUTC string   `json:"claudeWeeklyResetUtc"`
-	ClaudePlanModel      string   `json:"claudePlanModel"`
-	ClaudePlanEffort     string   `json:"claudePlanEffort"`
-	ClaudeBuildModel     string   `json:"claudeBuildModel"`
-	ClaudeBuildEffort    string   `json:"claudeBuildEffort"`
-	ClaudeAuditModel     string   `json:"claudeAuditModel"`
-	ClaudeAuditEffort    string   `json:"claudeAuditEffort"`
-	CodexPlanModel       string   `json:"codexPlanModel"`
-	CodexPlanEffort      string   `json:"codexPlanEffort"`
-	CodexBuildModel      string   `json:"codexBuildModel"`
-	CodexBuildEffort     string   `json:"codexBuildEffort"`
-	CodexAuditModel      string   `json:"codexAuditModel"`
-	CodexAuditEffort     string   `json:"codexAuditEffort"`
-	AuditEnabled         bool     `json:"auditEnabled"`
-	MaxAuditCycles       int      `json:"maxAuditCycles"`
-	MaxVerifyFixCycles   int      `json:"maxVerifyFixCycles"`
-	VerificationCommands []string `json:"verificationCommands"`
+	MaxTotal                   int      `json:"maxTotalRuns"`
+	MaxClaude                  int      `json:"maxClaudeRuns"`
+	MaxCodex                   int      `json:"maxCodexRuns"`
+	AnchorCodexEnabled         bool     `json:"anchorCodexEnabled"`
+	AnchorClaudeEnabled        bool     `json:"anchorClaudeEnabled"`
+	AnchorModelCodex           string   `json:"anchorModelCodex"`
+	AnchorModelClaude          string   `json:"anchorModelClaude"`
+	ClaudeWeeklyResetUTC       string   `json:"claudeWeeklyResetUtc"`
+	ClaudePlanModel            string   `json:"claudePlanModel"`
+	ClaudePlanEffort           string   `json:"claudePlanEffort"`
+	ClaudeBuildModel           string   `json:"claudeBuildModel"`
+	ClaudeBuildEffort          string   `json:"claudeBuildEffort"`
+	ClaudeAuditModel           string   `json:"claudeAuditModel"`
+	ClaudeAuditEffort          string   `json:"claudeAuditEffort"`
+	CodexPlanModel             string   `json:"codexPlanModel"`
+	CodexPlanEffort            string   `json:"codexPlanEffort"`
+	CodexBuildModel            string   `json:"codexBuildModel"`
+	CodexBuildEffort           string   `json:"codexBuildEffort"`
+	CodexAuditModel            string   `json:"codexAuditModel"`
+	CodexAuditEffort           string   `json:"codexAuditEffort"`
+	AuditEnabled               bool     `json:"auditEnabled"`
+	MaxAuditCycles             int      `json:"maxAuditCycles"`
+	MaxTransientRetries        int      `json:"maxTransientRetries"`
+	MaxCompletionContinuations int      `json:"maxCompletionContinuations"`
+	MaxVerifyFixCycles         int      `json:"maxVerifyFixCycles"`
+	VerificationCommands       []string `json:"verificationCommands"`
 	// VerificationTimeoutSec bounds one verification pass. The 30-minute
 	// timeout used to be hard-coded with no way to change it.
 	VerificationTimeoutSec int  `json:"verificationTimeoutSec"`
 	ClaudeAPIMode          bool `json:"claudeApiMode"`
-	FIFOBlockOnExternal    bool `json:"fifoBlockOnExternal"`
 	// Quiet hours (§7.4): outside [QuietHoursStart, QuietHoursEnd) the queue is
 	// held with source "schedule", on the same PauseState machinery.
 	QuietHoursEnabled bool   `json:"quietHoursEnabled"`
@@ -64,15 +66,14 @@ func DefaultSettings() Settings {
 	return Settings{
 		MaxTotal: 2, MaxClaude: 2, MaxCodex: 2,
 		AnchorModelCodex: "auto", AnchorModelClaude: "auto",
-		ClaudePlanModel: "opus", ClaudePlanEffort: "high",
-		ClaudeBuildModel: "sonnet", ClaudeBuildEffort: "high",
-		ClaudeAuditModel: "opus", ClaudeAuditEffort: "high",
+		ClaudePlanModel: "claude-opus-5-5", ClaudePlanEffort: "high",
+		ClaudeBuildModel: "claude-sonnet-5-5", ClaudeBuildEffort: "high",
+		ClaudeAuditModel: "claude-opus-5-5", ClaudeAuditEffort: "high",
 		CodexPlanModel: "", CodexPlanEffort: "high",
 		CodexBuildModel: "", CodexBuildEffort: "medium",
 		CodexAuditModel: "", CodexAuditEffort: "high",
-		MaxAuditCycles: 1, MaxVerifyFixCycles: 2,
+		MaxAuditCycles: 1, MaxVerifyFixCycles: 2, MaxTransientRetries: 8, MaxCompletionContinuations: 3,
 		VerificationTimeoutSec: int(defaultVerificationTimeout / time.Second),
-		FIFOBlockOnExternal:    true,
 		QuietHoursStart:        "09:00",
 		QuietHoursEnd:          "18:00",
 	}
@@ -91,6 +92,7 @@ type Verifier interface {
 
 // Conductor is the scheduling engine.
 type Conductor struct {
+	queueMu  sync.Mutex // serializes position allocation with enqueue/import/reorder
 	store    *db.Store
 	vault    *vault.Vault
 	registry *providers.Registry
@@ -100,13 +102,15 @@ type Conductor struct {
 	log      *logging.Logger
 	verifier Verifier
 
-	mu      sync.Mutex
-	wake    chan struct{}
-	stopCh  chan struct{}
-	stopped bool
-	subsMu  sync.Mutex
-	subs    []chan OutEvent
-	cancels map[string]context.CancelFunc
+	execWG   sync.WaitGroup
+	mu       sync.Mutex
+	wake     chan struct{}
+	stopCh   chan struct{}
+	stopped  bool
+	subsMu   sync.Mutex
+	subs     []chan OutEvent
+	cancels  map[string]context.CancelFunc
+	activity activityMonitor
 	// pauseHeld marks runs interrupted by an INCLUDE_ACTIVE pause, so the
 	// resulting TurnInterrupted is parked rather than treated as a failure.
 	pauseHeld map[string]bool
@@ -140,6 +144,7 @@ func New(store *db.Store, vv *vault.Vault, reg *providers.Registry, g *quota.Gua
 	if s := c.loadSettings(); s != nil {
 		c.settings = *s
 	}
+	c.applySettings(c.settings)
 	c.pause = PauseState{Scope: PauseQueueOnly}
 	c.loadPause()
 	return c
@@ -219,12 +224,18 @@ func (c *Conductor) Start(ctx context.Context) {
 // Stop terminates the loop.
 func (c *Conductor) Stop() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.stopped {
+		c.mu.Unlock()
 		return
 	}
 	c.stopped = true
 	close(c.stopCh)
+	for _, cancel := range c.cancels {
+		cancel()
+	}
+	c.mu.Unlock()
+	c.execWG.Wait()
+
 }
 
 // Subscribe registers a UI event listener.
@@ -268,15 +279,35 @@ func (c *Conductor) Settings() Settings {
 
 // UpdateSettings persists and applies new settings.
 func (c *Conductor) UpdateSettings(s Settings) error {
-	c.settingsMu.Lock()
-	c.settings = s
-	c.settingsMu.Unlock()
-	if err := c.store.SetSetting("conductor.settings", s); err != nil {
+	if err := validateSettings(s); err != nil {
 		return err
 	}
+	c.settingsMu.Lock()
+	if err := c.store.SetSetting("conductor.settings", s); err != nil {
+		c.settingsMu.Unlock()
+		return err
+	}
+	c.settings = s
 	c.applySettings(s)
+	c.settingsMu.Unlock()
 	c.emit("settingsUpdated", s)
 	c.Poke()
+	return nil
+}
+
+func validateSettings(s Settings) error {
+	if s.MaxTotal < 1 || s.MaxTotal > 64 || s.MaxClaude < 1 || s.MaxClaude > 64 || s.MaxCodex < 1 || s.MaxCodex > 64 {
+		return fmt.Errorf("concurrency limits must be between 1 and 64")
+	}
+	if s.MaxTransientRetries < 0 || s.MaxTransientRetries > 30 || s.MaxCompletionContinuations < 0 || s.MaxCompletionContinuations > 30 {
+		return fmt.Errorf("automatic recovery limits must be between 0 and 30")
+	}
+	if s.MaxVerifyFixCycles < 0 || s.MaxVerifyFixCycles > 30 || s.MaxAuditCycles < 0 || s.MaxAuditCycles > 30 {
+		return fmt.Errorf("verification and audit cycle limits must be between 0 and 30")
+	}
+	if s.VerificationTimeoutSec < 0 || s.VerificationTimeoutSec > 86400 {
+		return fmt.Errorf("verification timeout must be between 0 and 86400 seconds")
+	}
 	return nil
 }
 
@@ -289,17 +320,21 @@ func (c *Conductor) UpdateSettings(s Settings) error {
 func (c *Conductor) PatchSettings(patch json.RawMessage) (Settings, error) {
 	c.settingsMu.Lock()
 	next := c.settings
-	// Unmarshalling onto a populated struct leaves absent keys untouched.
-	if err := json.Unmarshal(patch, &next); err != nil {
+	err := json.Unmarshal(patch, &next)
+	if err == nil {
+		err = validateSettings(next)
+	}
+	if err == nil {
+		err = c.store.SetSetting("conductor.settings", next)
+	}
+	if err != nil {
+		current := c.settings
 		c.settingsMu.Unlock()
-		return c.settings, err
+		return current, err
 	}
 	c.settings = next
-	c.settingsMu.Unlock()
-	if err := c.store.SetSetting("conductor.settings", next); err != nil {
-		return next, err
-	}
 	c.applySettings(next)
+	c.settingsMu.Unlock()
 	c.emit("settingsUpdated", next)
 	c.Poke()
 	return next, nil
@@ -314,7 +349,7 @@ func (c *Conductor) applySettings(s Settings) {
 }
 
 func (c *Conductor) loadSettings() *Settings {
-	var s Settings
+	s := DefaultSettings()
 	ok, err := c.store.GetSetting("conductor.settings", &s)
 	if err != nil || !ok {
 		return nil
@@ -324,14 +359,22 @@ func (c *Conductor) loadSettings() *Settings {
 
 // ---- external session awareness ----
 
-// busyExternalEvents marks provider sessions as active/idle from hook events.
+// busyEvents tracks turns, not open provider windows. A session can stay open
+// indefinitely without submitting a prompt or doing any work.
 var busyEvents = map[string]bool{
-	"SessionStart":     true,
-	"UserPromptSubmit": true,
-	"Stop":             false,
-	"StopFailure":      false,
-	"Interrupt":        false,
-	"SessionEnd":       false,
+	"SessionStart":       false,
+	"UserPromptSubmit":   true,
+	"PreToolUse":         true,
+	"PostToolUse":        true,
+	"PostToolUseFailure": true,
+	"Stop":               false,
+	"StopFailure":        false,
+	"Interrupt":          false,
+	"SessionEnd":         false,
+}
+
+func externalSessionBusy(s *model.ProviderSession, now time.Time) bool {
+	return s != nil && s.Kind == "external" && busyEvents[s.LastEvent] && now.Sub(s.LastSeenAt) <= 45*time.Minute
 }
 
 // externalBusy reads external (non-managed) active sessions per provider.
@@ -343,15 +386,7 @@ func (c *Conductor) externalBusy() map[string]*model.ProviderSession {
 			continue
 		}
 		for _, s := range sessions {
-			if s.Kind != "external" {
-				continue
-			}
-			busy, ok := busyEvents[s.LastEvent]
-			if !ok || !busy {
-				continue
-			}
-			// conservative staleness: 45 min without an update
-			if c.Now().Sub(s.LastSeenAt) > 45*time.Minute {
+			if !externalSessionBusy(s, c.Now()) {
 				continue
 			}
 			if _, exists := out[p]; !exists {
@@ -406,14 +441,12 @@ func (c *Conductor) nextWakeDelay() time.Duration {
 		}
 		if d := deadline.Sub(now); d > 0 && d < delay {
 			delay = d
-		} else if d <= 0 {
-			delay = 0
 		}
 	}
 	if p := c.PauseState(); p.Paused && p.ResumeAt != nil {
 		consider(*p.ResumeAt)
 	}
-	if waiting, err := c.store.ListRunsByStates(model.StateWaitingForQuota); err == nil {
+	if waiting, err := c.store.ListRunsByStates(model.StateWaitingForQuota, model.StateQueued); err == nil {
 		for _, r := range waiting {
 			if r.NextEligibleAt != nil {
 				consider(*r.NextEligibleAt)

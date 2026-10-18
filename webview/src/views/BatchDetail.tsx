@@ -1,7 +1,8 @@
+import RunActivity from "../components/RunActivity";
 // Batch detail: deterministic analysis, run cards, timeline, report.
 // §7.7 — worktrees.DiffStat existed and was never called from anywhere.
 import { useCallback, useEffect, useState } from "react";
-import { detailBatchId } from "../state/store";
+import { ACTIVE_STATES, detailBatchId } from "../state/store";
 import { rpc, confirm, notify, openClaudeSession, openCodexThread, openWorktree, copyText } from "../api/client";
 import StatusGlyph from "../components/StatusGlyph";
 import { fmtDuration, elapsedSince } from "../components/format";
@@ -151,13 +152,13 @@ function RunCard({ run, events }: { run: any; events: any[] }) {
   const [showTimeline, setShowTimeline] = useState(false);
   const openNative = () =>
     run.provider === "claude"
-      ? openClaudeSession(run.providerSessionId)
+      ? openClaudeSession(run.providerSessionId, run.worktreePath || run.cwd)
       : openCodexThread(run.providerSessionId, run.providerTitle || run.title);
   return (
     <article className="ac-card-edit" aria-label={`Run ${run.title}`}>
       <div className="ac-row between">
         <strong className="ac-trunc ac-grow">{run.title || run.promptPreview}</strong>
-        <StatusGlyph state={run.state} pulse={run.state === "RUNNING"} />
+        <StatusGlyph state={run.state} pulse={false} />
       </div>
       <dl className="ac-kv ac-mt-2">
         <dt>Provider</dt><dd className="ac-cap">{run.provider} · {run.model || "default"} · {run.effort || "default effort"}</dd>
@@ -173,6 +174,7 @@ function RunCard({ run, events }: { run: any; events: any[] }) {
         {run.finalOutcome && <><dt>Outcome</dt><dd>{run.finalOutcome}</dd></>}
         {run.errorMsg && <><dt>Issue</dt><dd>{run.errorMsg}</dd></>}
       </dl>
+      {(run.providerSessionId || ACTIVE_STATES.has(run.state)) && <RunActivity run={run} />}
       <div className="ac-row wrap ac-gap-1 ac-mt-2">
         {run.providerSessionId && (
           <button className="ac-btn ghost ac-btn-sm" onClick={openNative}>

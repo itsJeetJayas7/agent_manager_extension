@@ -89,8 +89,8 @@ export function announceReady(): void {
   vscodeApi.postMessage({ type: "ready" });
 }
 
-export function openClaudeSession(sessionId: string): void {
-  vscodeApi.postMessage({ type: "openClaude", sessionId });
+export function openClaudeSession(sessionId: string, cwd: string): void {
+  vscodeApi.postMessage({ type: "openClaude", sessionId, cwd });
 }
 export function openCodexThread(threadId: string, title: string): void {
   vscodeApi.postMessage({ type: "openCodex", threadId, title });

@@ -46,17 +46,22 @@ export class DaemonClient {
   daemonVersion = "";
 
   constructor(sockPath?: string) {
-    const root = path.join(os.homedir(), ".agent-conductor");
-    this.sockPath = sockPath ?? path.join(root, "run", "conductor.sock");
+    this.sockPath = sockPath ?? DaemonClient.socketPath();
     this.token = "";
   }
 
+  /** The daemon's state root. AC_ROOT selects another daemon, as it does for
+   * the daemon itself (used for isolated test instances). */
+  static root(): string {
+    return process.env.AC_ROOT || path.join(os.homedir(), ".agent-conductor");
+  }
+
   static socketPath(): string {
-    return path.join(os.homedir(), ".agent-conductor", "run", "conductor.sock");
+    return path.join(DaemonClient.root(), "run", "conductor.sock");
   }
 
   static tokenPath(): string {
-    return path.join(os.homedir(), ".agent-conductor", "run", "conductor.token");
+    return path.join(DaemonClient.root(), "run", "conductor.token");
   }
 
   async connect(timeoutMs = 4000): Promise<void> {

@@ -41,6 +41,8 @@ type EnqueueRunInput struct {
 
 // EnqueueRun creates an implicit single-run batch and queues it.
 func (c *Conductor) EnqueueRun(in EnqueueRunInput) (batchID, runID string, err error) {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
 	if strings.TrimSpace(in.Prompt) == "" {
 		return "", "", fmt.Errorf("prompt is required")
 	}
@@ -114,9 +116,10 @@ func stageFor(staged bool) model.Stage {
 
 // BatchSpecInput defines an explicit batch from the planner.
 type BatchSpecInput struct {
-	Title string         `json:"title"`
-	Cwd   string         `json:"cwd"`
-	Rows  []RowSpecInput `json:"rows"`
+	ImportKey string         `json:"importKey,omitempty"`
+	Title     string         `json:"title"`
+	Cwd       string         `json:"cwd"`
+	Rows      []RowSpecInput `json:"rows"`
 }
 
 // RowSpecInput is one row; Parallel rows contain multiple runs.
@@ -139,6 +142,19 @@ type RunSpecInput struct {
 
 // PrepareBatch validates a batch spec (worktree prechecks for parallel).
 func (c *Conductor) PrepareBatch(spec BatchSpecInput) error {
+	if len(spec.Rows) == 0 {
+		return fmt.Errorf("a batch needs at least one row")
+	}
+	if spec.ImportKey != "" {
+		if len(spec.Rows) > 500 {
+			return fmt.Errorf("a prompt sequence supports at most 500 steps")
+		}
+		for _, row := range spec.Rows {
+			if row.Mode != "LINEAR" {
+				return fmt.Errorf("prompt sequence steps must be LINEAR")
+			}
+		}
+	}
 	hasParallel := false
 	for _, r := range spec.Rows {
 		if strings.ToUpper(r.Mode) == "PARALLEL" {
@@ -168,6 +184,22 @@ func (c *Conductor) PrepareBatch(spec BatchSpecInput) error {
 
 // ApplyBatch persists a batch spec and queues it.
 func (c *Conductor) ApplyBatch(spec BatchSpecInput) (batchID string, err error) {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	// A preview carries a stable key. Retrying after a lost response or daemon
+	// restart must return the original sequence, never enqueue it twice.
+	id := newID("b")
+	if spec.ImportKey != "" {
+		if len(spec.ImportKey) > 128 {
+			return "", fmt.Errorf("import key is too long")
+		}
+		id = "b_import_" + model.HashPrompt(spec.ImportKey)
+		if existing, err := c.store.GetBatch(id); err != nil {
+			return "", err
+		} else if existing != nil {
+			return id, nil
+		}
+	}
 	if err := c.PrepareBatch(spec); err != nil {
 		return "", err
 	}
@@ -178,7 +210,7 @@ func (c *Conductor) ApplyBatch(spec BatchSpecInput) (batchID string, err error) 
 	branch, _ := c.wt.Branch(spec.Cwd)
 	commit, _ := c.wt.Commit(spec.Cwd)
 	batch := &model.Batch{
-		ID: newID("b"), Title: title, Status: model.BatchQueued,
+		ID: id, Title: title, Status: model.BatchQueued,
 		BaseCwd: spec.Cwd, BaseBranch: branch, BaseCommit: commit,
 		CreatedAt: c.Now(),
 	}
@@ -225,6 +257,13 @@ func (c *Conductor) ApplyBatch(spec BatchSpecInput) (batchID string, err error) 
 	if err := c.store.CreateBatchAtomic(batch, rows, runs, func(string) (model.RunEventType, string) {
 		return model.EventQueued, quoteJSON("batch applied")
 	}); err != nil {
+		// Concurrent retries may both observe a missing batch. The primary key
+		// and atomic transaction let only one create it.
+		if spec.ImportKey != "" {
+			if existing, lookupErr := c.store.GetBatch(id); lookupErr == nil && existing != nil {
+				return id, nil
+			}
+		}
 		return "", err
 	}
 	c.emitBatch(batch.ID)
@@ -250,7 +289,12 @@ func (c *Conductor) CancelRun(runID string) error {
 	// nothing would ever emit TurnInterrupted to move it out of
 	// CANCEL_REQUESTED — it sat there forever holding a slot, and two cancels
 	// with the default MaxTotal of 2 killed the queue until a daemon restart.
-	if cancel == nil && r.ProviderSessionID == "" && !dispatched(r.State) {
+	if cancel == nil && (!dispatched(r.State) || r.State == model.StatePaused) {
+		// A process kept between turns (or opened in Claude Code) must not
+		// outlive the run it serves.
+		if adapter, ok := c.registry.Get(r.Provider); ok {
+			_ = adapter.Cancel(runID)
+		}
 		if err := c.store.TransitionRun(runID, model.StateCancelled, nil, func(x *model.Run) {
 			x.FinalOutcome = "CANCELLED"
 			x.FinishedAt = c.Now()
@@ -263,16 +307,20 @@ func (c *Conductor) CancelRun(runID string) error {
 		return nil
 	}
 
+	// Persist the intent before the adapter can acknowledge it.
+	if err := c.store.TransitionRun(runID, model.StateCancelRequested, nil, func(x *model.Run) {
+		x.CancelRequestedAt = c.Now()
+	}); err != nil {
+		return err
+	}
 	if adapter, ok := c.registry.Get(r.Provider); ok {
 		adapter.Cancel(runID)
 	}
 	if cancel != nil {
 		cancel()
 	}
-	if err := c.store.TransitionRun(runID, model.StateCancelRequested, nil, func(x *model.Run) {
-		x.CancelRequestedAt = c.Now()
-	}); err != nil {
-		return err
+	if cancel == nil && r.State == model.StateVerifying {
+		c.transition(runID, model.StateCancelled, nil, func(x *model.Run) { x.FinishedAt = c.Now() })
 	}
 	c.emitRun(runID)
 	c.Poke()
@@ -296,12 +344,23 @@ func (c *Conductor) RetryRun(runID string) error {
 	if err != nil || r == nil {
 		return fmt.Errorf("run not found")
 	}
-	c.transition(runID, model.StateQueued, &model.RunEvent{Type: model.EventQueued, Timestamp: c.Now()}, func(x *model.Run) {
+	if r.State.Active() {
+		return fmt.Errorf("run is already active")
+	}
+	if !c.transition(runID, model.StateQueued, &model.RunEvent{Type: model.EventQueued, Timestamp: c.Now()}, func(x *model.Run) {
 		x.Stage = stageFor(r.Staged)
 		x.ErrorCode, x.ErrorMsg = "", ""
 		x.ProviderSessionID = "" // fresh native session on retry
+		x.ResolvedModel, x.PendingPromptCipher = "", ""
+		x.RetryCount, x.CompletionRetries, x.VerifyCycles, x.AuditCycles = 0, 0, 0, 0
+		x.NextEligibleAt = nil
+		x.FinishedAt = time.Time{}
+		x.FinalOutcome = ""
 		x.MeaningfulProgress = false
-	})
+	}) {
+		return fmt.Errorf("cannot retry run in %s", r.State)
+	}
+	c.store.UpdateRowStatus(r.RowID, model.RowRunning)
 	c.reviveBatch(r.BatchID)
 	c.emitRun(runID)
 	c.Poke()
@@ -315,7 +374,7 @@ func (c *Conductor) reviveBatch(batchID string) {
 	if err != nil || b == nil {
 		return
 	}
-	if b.Status == model.BatchAttention {
+	if b.Status == model.BatchAttention || b.Status == model.BatchDone {
 		b.Status = model.BatchRunning
 		c.store.UpdateBatch(b)
 		c.emitBatch(b.ID)
@@ -332,29 +391,13 @@ func (c *Conductor) ContinueRun(runID string, message string) error {
 	if r.ProviderSessionID == "" {
 		return c.RetryRun(runID)
 	}
-	msg := message
-	if msg == "" {
-		msg = model.ContinueAfterQuota
+	if r.State.Active() {
+		return fmt.Errorf("run is already active")
 	}
-	// From COMPLETED the only legal transition is -> RUNNING; asking for
-	// AUTO_RESUMING failed silently and then dispatched anyway against a run
-	// whose persisted state did not match.
-	target := model.StateAutoResuming
-	if !model.CanTransition(r.State, target) {
-		target = model.StateRunning
+	if message == "" {
+		message = model.ContinueAfterQuota
 	}
-	if err := c.store.TransitionRun(runID, target, &model.RunEvent{Type: model.EventAutoResumeStarted, Timestamp: c.Now()}, nil); err != nil {
-		return fmt.Errorf("continue %s: %w", runID, err)
-	}
-	// Re-read: launchExecution derives the active state from the run it is
-	// handed, so it must not see pre-transition state.
-	fresh, err := c.store.GetRun(runID)
-	if err != nil || fresh == nil {
-		return fmt.Errorf("run vanished during continue")
-	}
-	c.launchExecution(fresh, msg, true)
-	c.emitRun(runID)
-	return nil
+	return c.queueContinuation(runID, message, "continuation requested", nil)
 }
 
 // SkipRun marks a run skipped (explicit user action only).
@@ -443,51 +486,14 @@ func (c *Conductor) UpdateRun(runID string, in UpdateRunInput) error {
 // ReorderQueue moves a queued run within FIFO bounds (never ahead of its
 // batch row dependencies).
 func (c *Conductor) ReorderQueue(runID string, beforeRunID string) error {
-	r, err := c.store.GetRun(runID)
-	if err != nil || r == nil {
-		return fmt.Errorf("run not found")
-	}
-	if r.State != model.StateQueued {
-		return fmt.Errorf("only QUEUED runs can be reordered")
-	}
-	// Build ordering; block moving ahead of an earlier row of same batch.
-	if beforeRunID != "" {
-		target, err := c.store.GetRun(beforeRunID)
-		if err != nil || target == nil || target.State != model.StateQueued {
-			return fmt.Errorf("target must be a queued run")
-		}
-		if target.BatchID == r.BatchID && target.SortKey < r.SortKey {
-			// moving earlier within same batch: ensure no row dependency violated
-			rows, _ := c.store.ListRows(r.BatchID)
-			pos := map[string]int{}
-			for _, row := range rows {
-				pos[row.ID] = row.Position
-			}
-			rRow, tRow := pos[r.RowID], pos[target.RowID]
-			if tRow > rRow {
-				return fmt.Errorf("cannot move a run ahead of its batch row dependency")
-			}
-		}
-		// Sparse keys: pick a value strictly between target and its
-		// predecessor, renormalising the queue if the gap is exhausted.
-		key, err := c.store.SortKeyBefore(beforeRunID)
-		if err != nil {
-			return err
-		}
-		r.SortKey = key
-	} else {
-		// Move to the end. This used to assign UnixNano, which happens to
-		// work only because every other key is tiny — the same inversion that
-		// broke Run Next.
-		key, err := c.store.NextSortKey()
-		if err != nil {
-			return err
-		}
-		r.SortKey = key
-	}
-	if err := c.store.UpdateRun(r); err != nil {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	if err := c.store.ReorderQueue(runID, beforeRunID); err != nil {
 		return err
 	}
+	// Reordering can renumber every waiting run. All connected windows must
+	// refresh the complete order, including clients other than the editor.
+	c.emit("queueReordered", map[string]string{"runId": runID})
 	c.Poke()
 	return nil
 }
@@ -781,6 +787,7 @@ func (c *Conductor) UsageSince(window time.Duration) (*UsageSummary, error) {
 	out := &UsageSummary{
 		Since:      cutoff.UTC().Format(time.RFC3339),
 		ByProvider: map[string]int64{},
+		Recent:     []RunUsage{},
 		ByDay:      map[string]int64{},
 		Note:       "Measured wall-clock time only. Agent Conductor does not estimate spend.",
 	}

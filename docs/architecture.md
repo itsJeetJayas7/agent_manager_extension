@@ -57,7 +57,7 @@
 First line: `hello {protocol, auth}`. Then requests
 `{protocol, id, method, params}` → `{id, result}` or `{id, error:{code,message}}`.
 Events pushed after `subscribe`: `snapshot`, `runUpdated`, `batchUpdated`,
-`quotaUpdated`, `externalSessionUpdated`, `settingsUpdated`, `worktreeUpdated`.
+`quotaUpdated`, `externalSessionUpdated`, `externalRunOverlap`, `settingsUpdated`, `worktreeUpdated`.
 
 The webview never opens sockets; routing is always
 webview → extension host → daemon.

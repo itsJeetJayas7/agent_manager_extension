@@ -4,14 +4,19 @@
 package service
 
 import (
+	"bytes"
+	"context"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"text/template"
+	"time"
 )
 
 // InstallResult reports what was installed.
@@ -103,7 +108,9 @@ After=network.target
 
 [Service]
 ExecStart={{.Bin}} serve
-Environment=PATH={{.Path}}
+Environment={{.Path}}
+KillMode=control-group
+TimeoutStopSec=15
 Restart=always
 RestartSec=3
 
@@ -115,13 +122,19 @@ WantedBy=default.target
 		return nil, err
 	}
 	defer f.Close()
-	if err := tpl.Execute(f, map[string]string{"Bin": bin, "Path": i.servicePATH()}); err != nil {
+	if err := tpl.Execute(f, map[string]string{"Bin": systemdQuote(bin), "Path": systemdQuote("PATH=" + i.servicePATH())}); err != nil {
 		return nil, err
 	}
 	res := &InstallResult{Mode: "systemd", UnitPath: unit, BinPath: bin,
-		Commands: []string{"systemctl --user daemon-reload", "systemctl --user enable --now agent-conductor.service"}}
-	exec.Command("systemctl", "--user", "daemon-reload").Run()
-	exec.Command("systemctl", "--user", "enable", "--now", "agent-conductor.service").Run()
+		Commands: []string{"systemctl --user daemon-reload", "systemctl --user enable agent-conductor.service", "systemctl --user restart agent-conductor.service"}}
+	for _, args := range [][]string{{"--user", "daemon-reload"}, {"--user", "enable", "agent-conductor.service"}, {"--user", "restart", "agent-conductor.service"}} {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput()
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("systemctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+	}
 	// Detect lingering honestly; never require or use sudo.
 	if lingerEnabled() {
 		res.LingerNote = "lingering enabled: service survives SSH logout"
@@ -190,7 +203,9 @@ func loginShellPATH() string {
 	if shell == "" {
 		return os.Getenv("PATH")
 	}
-	out, err := exec.Command(shell, "-l", "-c", "printf %s \"$PATH\"").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, shell, "-l", "-c", "printf %s \"$PATH\"").Output()
 	if err != nil || len(out) == 0 {
 		return os.Getenv("PATH")
 	}
@@ -244,7 +259,7 @@ func (i *Installer) installLaunchd(bin string) (*InstallResult, error) {
 	}
 	defer f.Close()
 	if err := tpl.Execute(f, map[string]string{
-		"Bin": bin, "Path": i.servicePATH(), "Home": i.Home, "LogDir": logDir,
+		"Bin": xmlText(bin), "Path": xmlText(i.servicePATH()), "Home": xmlText(i.Home), "LogDir": xmlText(logDir),
 	}); err != nil {
 		return nil, err
 	}
@@ -291,4 +306,11 @@ func Status() string {
 	default:
 		return "unsupported"
 	}
+}
+
+func systemdQuote(s string) string { return strconv.Quote(strings.ReplaceAll(s, "%", "%%")) }
+func xmlText(s string) string {
+	var b bytes.Buffer
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
 }

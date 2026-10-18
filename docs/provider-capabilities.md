@@ -10,6 +10,35 @@ guarantees.
 > reality and this document disagreed, reality won and the code follows
 > reality.
 
+## Verification update, 2026-10-03
+
+Session opening was also checked in an isolated VS Code extension host against
+Claude Code 2.1.288: the contributed command loaded a synthetic saved conversation
+under its expected title, and a second invocation focused the same tab. This
+check used the existing sign-in and did not submit a provider turn. Remote
+workspace routing and new-window handoff replay are covered by extension tests;
+a live Remote SSH window was not available for this check. Live monitoring is
+provided by Conductor's daemon activity endpoint, not an assumed native UI
+attachment to the running CLI process.
+
+Claude Code 2.1.288 and Codex 0.160.0 passed the live daemon integration test.
+Claude reported `claude-opus-5-5` while making a real file edit at `xhigh`,
+then resumed the same native session for another edit. Codex edited the same
+file serially. All five Opus 5.5 effort values are also checked against the
+adapter's generated CLI arguments, including resumed turns; this is not five
+separate paid live runs.
+
+The Claude catalog uses explicit version IDs plus clearly labeled moving
+aliases. Availability is account-dependent. Model-specific effort ladders
+follow the [Claude Code model configuration](https://code.claude.com/docs/en/model-config)
+and [Anthropic effort reference](https://platform.claude.com/docs/en/build-with-claude/effort).
+Opus 5.5 requires CLI 2.1.280+; Sonnet 5.5 requires 2.1.284+.
+`allowed_warning` quota frames no longer imply exhaustion. Run cards record
+provider-reported model IDs instead of treating the requested model as proof.
+
+The sections below preserve the earlier protocol observations. Current test
+coverage and limitations are in [overnight-validation.md](overnight-validation.md).
+
 ## Verification status, 2026-09-20
 
 | Provider | Installed on the verification machine | Surface verified |
@@ -58,10 +87,14 @@ adapter drove the interactive TUI through a PTY, slept 2500ms and pasted the
 prompt as a bracketed-paste escape sequence; that path is now a fallback behind
 a `--help` capability probe.
 
-**Divergence 3 — `--permission-prompts none` is passed on the headless path.**
-Nobody is present to answer a permission prompt in a daemon, so anything that
-would prompt is denied rather than left hanging. Permission *mode* still
-decides everything else.
+**Divergence 3 — `--permission-prompts none` is capability-gated.**
+The adapter passes this optional flag only when the installed CLI advertises
+it in `--help`. It requires Claude Code 2.1.259+; older VPS installations
+support stream-json but reject the flag before starting the turn. Those
+installations omit it and use print mode without a permission host. The
+selected permission mode is preserved for both new and resumed turns.
+See [unattended permission prompts](https://code.claude.com/docs/en/headless#turn-off-permission-prompts-in-unattended-runs)
+for how requests without a permission host are denied.
 
 **Divergence 4 — tool use is visible in the stream.** `MeaningfulProgress`
 (which decides resume-vs-restart after a quota wait) is now derived from
@@ -158,7 +191,8 @@ ignores it. External-Codex detection degrades to `unknown` if it does.
 | CLI `--session-id <uuid>` | Documented | cli reference | Deterministic session ID chosen by daemon; persisted before launch | capture from `SessionStart` hook |
 | CLI `--model`, `--effort` | Documented (`--effort` used by `claude agents` dispatch) | cli reference | Passed through; capability-probed via `claude --help` at setup | omit flag |
 | `-p --output-format stream-json` headless protocol | **Verified** on claude 2.1.278 | observed | **Default execution path.** Structured events: session init, assistant text, tool use, result with stop reason | interactive PTY path, behind a `--help` capability probe |
-| VS Code URI handler `vscode://anthropic.claude-code/open?session=<id>` | Community-documented; **inferred** — attempted at runtime, degrades gracefully | VS Code marketplace docs | "Open in Claude Code" tries URI, verifies extension presence first | open command palette + show session ID |
+| Native session opening | Claude 2.1.288 contributed commands accept the native session ID; activated and capability-checked | Installed extension; [documented workspace-scoped resume](https://code.claude.com/docs/en/vs-code#launch-a-vs-code-tab-from-other-tools) | Current-host command, with a new-window handoff for a different cwd/worktree | Actionable warning and copied resume command; Live activity remains available |
+| Live native view of a running run | **Documented seam:** `claudeCode.claudeProcessWrapper`. **Version-specific:** extension hides `sdk-*` sessions; SDK control protocol; `CLAUDE_CODE_ENTRYPOINT` honored in print mode except `cli`; per-turn `system/init`; `isReplay` echoes with caller uuid | Installed 2.1.288 extension and CLI, live A/B tests ([details](claude-native-live-view.md)) | Daemon-owned stream-input process per run; wrapper relays the tab to it; attach confirmed by the daemon | Tab opens the saved conversation and the user is told it will not update |
 | Five-hour + weekly limits; native quota auto-resume | **Verified structurally exposed** (2026-09-20): `rate_limit_event.unifiedWindows.{five_hour,seven_day}` with `utilization` and `resetsAt` | observed on claude 2.1.278 | Quota windows parsed from the stream; `source: provider_structured`, `confidence: exact` | `StopFailure` + notification text (PTY path), then the user-configured weekly reset override |
 | `ANTHROPIC_API_KEY` in env may switch billing away from subscription | Documented risk pattern | CLI env docs | Stripped from managed subprocess env unless API mode explicitly enabled | — |
 

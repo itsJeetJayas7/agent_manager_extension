@@ -6,6 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 )
 
 // ShellVerifier runs configured commands sequentially in the run's worktree.
@@ -46,9 +49,17 @@ func (ShellVerifier) Verify(ctx context.Context, cwd string, commands []string) 
 	for _, cmdLine := range commands {
 		cmd := exec.CommandContext(ctx, "sh", "-c", cmdLine)
 		cmd.Dir = cwd
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+		cmd.WaitDelay = time.Second
 		cmd.Env = env
 		cmd.Stdin = nil
-		out, err := cmd.CombinedOutput()
+		out := &verificationOutput{}
+		cmd.Stdout, cmd.Stderr = out, out
+		err := cmd.Run()
+		if err != nil && cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 		pass := err == nil
 		if ctx.Err() != nil {
 			sb.WriteString(fmt.Sprintf("$ %s → TIMEOUT\n", cmdLine))
@@ -61,7 +72,7 @@ func (ShellVerifier) Verify(ctx context.Context, cwd string, commands []string) 
 		if !pass {
 			status = "FAIL"
 		}
-		sb.WriteString(fmt.Sprintf("$ %s → %s\n%s\n", cmdLine, status, truncateOut(string(out))))
+		sb.WriteString(fmt.Sprintf("$ %s → %s\n%s\n", cmdLine, status, truncateOut(out.String())))
 	}
 	return okAll, sb.String()
 }
@@ -75,3 +86,26 @@ func truncateOut(s string) string {
 }
 
 func userHomeDir() string { home, _ := os.UserHomeDir(); return home }
+
+// Bound memory while the command runs, not only after it exits.
+type verificationOutput struct {
+	mu   sync.Mutex
+	tail []byte
+}
+
+func (b *verificationOutput) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := len(p)
+	const limit = 8192
+	if n >= limit {
+		b.tail = append(b.tail[:0], p[n-limit:]...)
+	} else {
+		if len(b.tail)+n > limit {
+			b.tail = b.tail[len(b.tail)+n-limit:]
+		}
+		b.tail = append(b.tail, p...)
+	}
+	return n, nil
+}
+func (b *verificationOutput) String() string { b.mu.Lock(); defer b.mu.Unlock(); return string(b.tail) }

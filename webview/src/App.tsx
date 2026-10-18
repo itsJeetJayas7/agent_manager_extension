@@ -14,6 +14,9 @@ export default function App({ mode }: { mode: "sidebar" | "planner" | "detail" }
   const state = useConductor();
   const [tab, setTab] = useState<Tab>("QUEUE");
   const stripRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (state.showPromptImport) setTab("QUEUE");
+  }, [state.showPromptImport]);
 
   if (mode === "planner") {
     return (
@@ -78,7 +81,8 @@ export default function App({ mode }: { mode: "sidebar" | "planner" | "detail" }
         aria-labelledby={`ac-tab-${tab}`}
         tabIndex={-1}
       >
-        {tab === "QUEUE" && <QueueView state={state} />}
+        {/* Keep the reviewed sequence and any pending import alive across tabs. */}
+        <div hidden={tab !== "QUEUE"}><QueueView state={state} /></div>
         {tab === "BATCHES" && <BatchesView state={state} />}
         {tab === "CONTROL" && <ControlView state={state} />}
       </div>

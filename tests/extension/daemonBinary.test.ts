@@ -1,10 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { createRequire } from "module";
 import { resolveDaemonBinaryDetailed, validateDaemonBinary } from "../../src/extension/configuration";
 import { __reset, __config } from "../support/vscode";
+
+vi.mock("fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("fs")>();
+  return { ...actual, existsSync: vi.fn(actual.existsSync) };
+});
 
 const require = createRequire(import.meta.url);
 const { DAEMON_BIN_DIR, DAEMON_BIN_NAME, daemonBinNameFor, goPlatform } =
@@ -25,6 +30,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.mocked(fs.existsSync).mockReset();
   fs.rmSync(tmp, { recursive: true, force: true });
   __reset();
 });
@@ -68,6 +74,8 @@ describe("daemon binary resolution", () => {
   });
 
   it("explains the problem when nothing is usable", () => {
+    // A developer's installed daemon must not turn this absence case green.
+    vi.mocked(fs.existsSync).mockReturnValue(false);
     const res = resolveDaemonBinaryDetailed({ extensionPath: tmp });
     expect(res.path).toBe("");
     expect(res.problem?.code).toBe("no-binary");

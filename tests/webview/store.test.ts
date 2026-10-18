@@ -61,6 +61,29 @@ describe("store", () => {
     expect(result.current.snapshot?.runs.map((r) => r.id)).toContain("new");
   });
 
+  it("keeps live arrivals and changed positions in saved queue order", () => {
+    const { result } = renderHook(() => useConductor());
+    act(() => { dispose = initStore(); });
+    send({ type: "snapshot", snapshot: makeSnapshot({ runs: [makeRun({ id: "a", sortKey: 1024 })] }) });
+    const update = (id: string, sortKey: number) => send({ type: "daemonEvent", event: "runUpdated", payload: makeRun({ id, sortKey }) });
+    update("b", 2048);
+    update("c", 3072);
+    expect(waitingRuns(result.current).map(r => r.id)).toEqual(["a", "b", "c"]);
+    update("urgent", -1024);
+    update("b", 4096);
+    expect(waitingRuns(result.current).map(r => r.id)).toEqual(["urgent", "a", "c", "b"]);
+    // Reconnect with a differently ordered snapshot must show the same stack.
+    send({ type: "snapshot", snapshot: makeSnapshot({ runs: [...result.current.snapshot!.runs].reverse() }) });
+    expect(waitingRuns(result.current).map(r => r.id)).toEqual(["urgent", "a", "c", "b"]);
+  });
+
+  it("refreshes all positions after another window reorders the queue", () => {
+    act(() => { dispose = initStore(); });
+    postMessage.mockReset();
+    send({ type: "daemonEvent", event: "queueReordered", payload: { runId: "b" } });
+    expect(postMessage).toHaveBeenCalledWith({ type: "requestSnapshot" });
+  });
+
   it("falls back to a snapshot when only an id arrives", () => {
     act(() => {
       dispose = initStore();
@@ -139,7 +162,7 @@ describe("selectors", () => {
   it("separates active, waiting and paused runs", () => {
     expect(activeRuns(state).map((r) => r.id)).toEqual(["run"]);
     expect(pausedRuns(state).map((r) => r.id)).toEqual(["held"]);
-    // Quota-blocked runs sort last: they cannot start yet.
+    // Quota waits retain their saved position; their reset hint explains the wait.
     expect(waitingRuns(state).map((r) => r.id)).toEqual(["queued", "quota"]);
   });
 });

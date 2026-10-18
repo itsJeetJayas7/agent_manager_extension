@@ -80,9 +80,15 @@ never gated.
 Dispatch is held — and only dispatch — by `PauseState`. Quota resolution, the
 cancellation watchdog, hook processing and the pause timer all keep running
 while the queue is paused. A hold records its source (`user`, `quota`,
-`external-agent`, `schedule`), so the UI always has one honest answer to "why
+`schedule`), so the UI always has one honest answer to "why
 is nothing running?". A user pause outranks every system hold and is cleared
 only by the user or by its own timer.
+
+External sessions are informational: they never pause dispatch or consume
+managed concurrency slots, including slots on the same provider. Starting an
+external turn during managed work emits `externalRunOverlap` for a VS Code
+notification. Legacy `external-agent` holds clear on startup, and persisted
+`WAITING_FOR_EXTERNAL_AGENT` runs re-enter ordinary dispatch.
 
 ## Quota waits
 

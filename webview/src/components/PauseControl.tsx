@@ -224,6 +224,9 @@ export function PauseBand({
   const until = resumeAtMs(pause);
   const remaining = until === null ? null : Math.max(0, until - now);
   const isUser = pause.source === "user";
+  const indefiniteHint = pause.source === "external-agent"
+    ? "resumes automatically when the external run ends"
+    : "until you resume";
 
   const call = async (method: string, params: any = {}) => {
     setBusy(true);
@@ -245,7 +248,7 @@ export function PauseBand({
       {/* Announced to screen readers when the state changes, not on every tick. */}
       <div className="ac-sr" role="status" aria-live="polite">
         {headline}
-        {remaining === null ? ", until you resume" : `, resuming in ${describeRemaining(remaining)}`}
+        {remaining === null ? `, ${indefiniteHint}` : `, resuming in ${describeRemaining(remaining)}`}
       </div>
 
       <div className="ac-pause-head">
@@ -258,7 +261,7 @@ export function PauseBand({
             · resumes in <span className="ac-countdown">{formatCountdown(remaining)}</span>
           </span>
         )}
-        {remaining === null && <span className="ac-muted ac-small">· until you resume</span>}
+        {remaining === null && <span className="ac-muted ac-small">· {indefiniteHint}</span>}
       </div>
 
       <div className="ac-pause-sub">
@@ -270,7 +273,7 @@ export function PauseBand({
         {pause.scope === "INCLUDE_ACTIVE" ? " · in-progress runs stopped at a safe point" : ""}
       </div>
 
-      <div className="ac-pause-actions">
+      {pause.source !== "external-agent" && <div className="ac-pause-actions">
         {remaining !== null && (
           <>
             <button className="ac-chip" disabled={busy} onClick={() => void call("extendPause", { deltaMs: 15 * 60_000 })}>
@@ -292,7 +295,7 @@ export function PauseBand({
             {availableProvider} still has quota — queue there instead.
           </span>
         )}
-      </div>
+      </div>}
     </div>
   );
 }

@@ -204,41 +204,21 @@ func manualSession(h *harness, provider, id string) {
 	h.conductor.Poke()
 }
 
-func endManualSession(h *harness, provider, id string) {
-	h.store.UpsertProviderSession(&model.ProviderSession{
-		Provider: provider, NativeID: id, Kind: "external", LastEvent: "Stop",
-		LastSeenAt: h.conductor.Now(),
-	})
-	h.conductor.Poke()
-}
-
-func TestManualClaudeBlocksFIFO(t *testing.T) {
+func TestManualClaudeCanRunAlongsideFIFO(t *testing.T) {
 	h := newHarness(t)
 	manualSession(h, model.ProviderClaude, "ext-claude")
-	_, r1, _ := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "queued behind manual", Provider: model.ProviderCodex, Cwd: t.TempDir()})
-	time.Sleep(150 * time.Millisecond)
-	h.conductor.Poke()
-	time.Sleep(100 * time.Millisecond)
-	if st := h.run(r1).State; st != model.StateWaitingForExternal {
-		t.Fatalf("FIFO should wait for external claude, state=%s", st)
-	}
-	endManualSession(h, model.ProviderClaude, "ext-claude")
+	_, r1, _ := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "queued alongside manual", Provider: model.ProviderCodex, Cwd: t.TempDir()})
 	if !h.waitState(r1, 3*time.Second, model.StateCompleted) {
-		t.Fatalf("should start after manual ends; state=%s", h.run(r1).State)
+		t.Fatalf("manual Claude blocked FIFO; state=%s", h.run(r1).State)
 	}
 }
 
-func TestManualCodexBlocksFIFO(t *testing.T) {
+func TestManualCodexCanRunAlongsideFIFO(t *testing.T) {
 	h := newHarness(t)
 	manualSession(h, model.ProviderCodex, "ext-codex")
 	_, r1, _ := h.conductor.EnqueueRun(EnqueueRunInput{Prompt: "queued", Provider: model.ProviderClaude, Cwd: t.TempDir()})
-	time.Sleep(200 * time.Millisecond)
-	if st := h.run(r1).State; st != model.StateWaitingForExternal {
-		t.Fatalf("FIFO should wait for external codex, state=%s", st)
-	}
-	endManualSession(h, model.ProviderCodex, "ext-codex")
 	if !h.waitState(r1, 3*time.Second, model.StateCompleted) {
-		t.Fatalf("should start after manual ends; state=%s", h.run(r1).State)
+		t.Fatalf("manual Codex blocked FIFO; state=%s", h.run(r1).State)
 	}
 }
 
@@ -678,6 +658,7 @@ func TestContinueReusesTheNativeSession(t *testing.T) {
 	}
 
 	h.fakeClaude.SetScripts(nil)
+	h.restart() // continuations now dispatch only through a running scheduler
 	if err := h.conductor.ContinueRun(runID, model.ContinueAfterQuota); err != nil {
 		t.Fatal(err)
 	}
@@ -750,9 +731,9 @@ func TestSecretBlockAttachedAndRedacted(t *testing.T) {
 	}
 }
 
-// ---- external claude blocks claude cards only in parallel ----
+// ---- external work never consumes managed parallel slots ----
 
-func TestExternalBlocksSameProviderOnlyInParallel(t *testing.T) {
+func TestExternalActivityAllowsBothProvidersInParallel(t *testing.T) {
 	h := newHarness(t)
 	repo := initGitRepo(t)
 	manualSession(h, model.ProviderClaude, "ext-1")
@@ -766,32 +747,16 @@ func TestExternalBlocksSameProviderOnlyInParallel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// codex card proceeds even while claude external is busy
+	// Both providers finish without waiting for the external Claude turn.
 	if !h.tickUntil(5*time.Second, func() bool {
 		for _, r := range runsOfRow(h, batchID, 0) {
-			if r.Provider == model.ProviderCodex && r.State == model.StateCompleted {
-				return true
+			if r.State != model.StateCompleted {
+				return false
 			}
 		}
-		return false
+		return true
 	}) {
-		t.Fatalf("codex card blocked by external claude: %+v", runsOfRow(h, batchID, 0))
-	}
-	// claude card stays waiting
-	for _, r := range runsOfRow(h, batchID, 0) {
-		if r.Provider == model.ProviderClaude && (r.State == model.StateRunning || r.State == model.StateCompleted) {
-			t.Fatal("claude card started while external claude busy")
-		}
-	}
-	endManualSession(h, model.ProviderClaude, "ext-1")
-	claudeCard := ""
-	for _, r := range runsOfRow(h, batchID, 0) {
-		if r.Provider == model.ProviderClaude {
-			claudeCard = r.ID
-		}
-	}
-	if !h.waitState(claudeCard, 6*time.Second, model.StateCompleted) {
-		t.Fatalf("claude card should start after external ends: %s", h.run(claudeCard).State)
+		t.Fatalf("parallel cards blocked by external claude: %+v", runsOfRow(h, batchID, 0))
 	}
 }
 

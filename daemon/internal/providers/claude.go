@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +31,16 @@ type Claude struct {
 	apiMode    bool   // advanced opt-in to keep ANTHROPIC_API_KEY
 	effortOK   *bool  // capability cache for --effort
 	streamOK   *bool  // capability cache for the headless stream-json protocol
+	partialOK  *bool  // capability cache for --include-partial-messages
 	running    map[string]*claudeRun
+
+	permissionPromptsOK *bool // capability cache for --permission-prompts
+	streamInputOK       *bool // capability cache for --input-format stream-json
+
+	// live holds the long-lived process of each session (claude_live.go);
+	// liveStart serializes starting one.
+	live      map[string]*liveSession
+	liveStart sync.Mutex
 
 	// deadline bounds one turn. Configurable because "24 hours, hard-coded,
 	// timer never stopped" was neither.
@@ -52,7 +60,6 @@ type claudeRun struct {
 	ptty      *os.File
 	proc      *os.Process
 	exited    chan struct{}
-	closeOnce sync.Once
 }
 
 // NewClaude creates the adapter. socketPath tells the hook bridge (installed
@@ -60,7 +67,7 @@ type claudeRun struct {
 func NewClaude(log *logging.Logger, hooks *HookBus, selfBin, socketPath string) *Claude {
 	return &Claude{
 		hooks: hooks, log: log, selfBin: selfBin, socketPath: socketPath,
-		running: map[string]*claudeRun{}, deadline: defaultTurnDeadline,
+		running: map[string]*claudeRun{}, live: map[string]*liveSession{}, deadline: defaultTurnDeadline,
 	}
 }
 
@@ -171,7 +178,7 @@ func (c *Claude) Capabilities(ctx context.Context) Caps {
 		caps.AuthState = "ok"
 	}
 	caps.Models = c.probeModels(ctx)
-	caps.Notes = append(caps.Notes, "Model IDs are Claude Code aliases resolved by the runtime at launch.")
+	caps.Notes = append(caps.Notes, "Explicit model IDs pin a version; aliases may change. Availability depends on your account. Opus 5.5 needs CLI 2.1.280+; Sonnet 5.5 needs 2.1.284+.")
 	if c.supportsStreamJSON(ctx) {
 		caps.Notes = append(caps.Notes, "Using the headless stream-json protocol.")
 	} else {
@@ -184,47 +191,38 @@ func (c *Claude) Capabilities(ctx context.Context) Caps {
 	return caps
 }
 
-// knownClaudeAliases describes the aliases we can label meaningfully.
-var knownClaudeAliases = map[string]ModelInfo{
-	"fable":  {ID: "fable", Name: "Fable (frontier)", Efforts: []string{"medium", "high", "max"}},
-	"opus":   {ID: "opus", Name: "Opus (planning-class)", Efforts: []string{"high", "max"}},
-	"sonnet": {ID: "sonnet", Name: "Sonnet (execution-class)", Efforts: []string{"low", "medium", "high"}},
-	"haiku":  {ID: "haiku", Name: "Haiku (lightweight)", Efforts: []string{"low", "medium"}},
+// Explicit versions are pinned; aliases are deliberately labeled as moving.
+// Sources: code.claude.com/docs/en/model-config and platform.claude.com/docs/en/models/overview.
+// Account access is checked by the provider on launch, not inferred from --help.
+var claudeModels = []ModelInfo{
+	{ID: "claude-opus-5-5", Name: "Claude Opus 5.5", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "claude-sonnet-5-5", Name: "Claude Sonnet 5.5", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "claude-fable-5-1", Name: "Claude Fable 5.1", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "claude-fable-5", Name: "Claude Fable 5", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "claude-opus-5", Name: "Claude Opus 5", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "claude-sonnet-5", Name: "Claude Sonnet 5", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "claude-opus-4-8", Name: "Claude Opus 4.8", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "claude-opus-4-7", Name: "Claude Opus 4.7", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "claude-opus-4-6", Name: "Claude Opus 4.6", Efforts: []string{"low", "medium", "high", "max"}},
+	{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6", Efforts: []string{"low", "medium", "high", "max"}},
+	{ID: "claude-haiku-4-5-20251001", Name: "Claude Haiku 4.5", Efforts: []string{}},
+	{ID: "opus", Name: "Opus — latest alias (version may change)", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "sonnet", Name: "Sonnet — latest alias (version may change)", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "fable", Name: "Fable — latest alias (version may change)", Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "haiku", Name: "Haiku — latest alias (version may change)", Efforts: []string{}},
 }
 
-// probeModels reads the alias list out of the installed CLI's help text rather
-// than hardcoding it, falling back to the known set. Cached with capabilities.
 func (c *Claude) probeModels(ctx context.Context) []ModelInfo {
-	order := []string{"fable", "opus", "sonnet", "haiku"}
-	found := map[string]bool{}
-	if bin := c.bin(); bin != "" {
-		ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		out, _ := exec.CommandContext(ctx2, bin, "--help").CombinedOutput()
-		// The --model help line quotes the current aliases.
-		for _, m := range claudeAliasPattern.FindAllStringSubmatch(string(out), -1) {
-			alias := strings.ToLower(m[1])
-			if _, known := knownClaudeAliases[alias]; known {
-				found[alias] = true
-			}
-		}
-	}
-	var models []ModelInfo
-	for _, alias := range order {
-		if len(found) > 0 && !found[alias] {
-			continue
-		}
-		models = append(models, knownClaudeAliases[alias])
-	}
-	if len(models) == 0 {
-		for _, alias := range order {
-			models = append(models, knownClaudeAliases[alias])
+	models := make([]ModelInfo, len(claudeModels))
+	for i, m := range claudeModels {
+		models[i] = m
+		models[i].Efforts = append([]string{}, m.Efforts...)
+		if !c.supportsEffort(ctx) {
+			models[i].Efforts = []string{}
 		}
 	}
 	return models
 }
-
-var claudeAliasPattern = regexp.MustCompile(`'([a-z][a-z0-9.-]{2,20})'`)
 
 // managedSettings returns the --settings JSON installing Agent Conductor's
 // namespaced hooks for managed sessions only. The hook bridge learns the
@@ -288,8 +286,7 @@ func claudePermissionMode(p string) string {
 }
 
 // IsWorkspaceTrusted reports whether the folder's trust dialog was accepted
-// (stored in ~/.claude.json). Interactive managed runs require it; the
-// daemon never silently accepts trust on the user's behalf.
+// (stored in ~/.claude.json). Used to prepare the legacy interactive fallback.
 func (c *Claude) IsWorkspaceTrusted(cwd string) bool {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -316,7 +313,7 @@ func (c *Claude) IsWorkspaceTrusted(cwd string) bool {
 }
 
 // TrustWorkspace merges hasTrustDialogAccepted=true for one folder into
-// ~/.claude.json with a backup. Explicit user action only.
+// ~/.claude.json with a backup. This personal installation trusts queued folders.
 func (c *Claude) TrustWorkspace(cwd string) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -373,7 +370,17 @@ func (c *Claude) Execute(ctx context.Context, spec ExecSpec, sink Sink) error {
 	if c.supportsStreamJSON(ctx) {
 		ctx, cancel := context.WithTimeout(ctx, c.turnDeadline())
 		defer cancel()
+		if c.supportsStreamInput(ctx) {
+			return c.executeLive(ctx, spec, sink)
+		}
 		return c.executeHeadless(ctx, spec, sink)
+	}
+	// Legacy interactive runtimes still display their own folder dialog.
+	// The user authorizes all managed working folders in this installation.
+	if !c.IsWorkspaceTrusted(spec.Cwd) {
+		if err := c.TrustWorkspace(spec.Cwd); err != nil {
+			return fmt.Errorf("prepare workspace for legacy Claude: %w", err)
+		}
 	}
 	return c.executePTY(ctx, spec, sink)
 }
@@ -411,14 +418,6 @@ func (c *Claude) executePTY(ctx context.Context, spec ExecSpec, sink Sink) error
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cr := &claudeRun{runID: spec.RunID, sessionID: sessionID, cancel: cancel, exited: make(chan struct{})}
-	c.mu.Lock()
-	c.running[spec.RunID] = cr
-	c.mu.Unlock()
-	defer func() {
-		c.mu.Lock()
-		delete(c.running, spec.RunID)
-		c.mu.Unlock()
-	}()
 
 	hookCh := c.hooks.Subscribe()
 	defer c.hooks.Unsubscribe(hookCh)
@@ -432,7 +431,13 @@ func (c *Claude) executePTY(ctx context.Context, spec ExecSpec, sink Sink) error
 	if c.socketPath != "" {
 		extraEnv["AC_SOCKET"] = c.socketPath
 	}
-	cmd.Env = claudeChildEnv(c.apiMode, extraEnv)
+	if spec.Effort != "" {
+		extraEnv["CLAUDE_CODE_EFFORT_LEVEL"] = spec.Effort
+	}
+	c.mu.Lock()
+	apiMode := c.apiMode
+	c.mu.Unlock()
+	cmd.Env = claudeChildEnv(apiMode, extraEnv)
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -442,6 +447,15 @@ func (c *Claude) executePTY(ctx context.Context, spec ExecSpec, sink Sink) error
 	}
 	cr.ptty = ptmx
 	cr.proc = cmd.Process
+	sink(Event{Kind: EvProcessStarted, RunID: spec.RunID, ProcessID: cmd.Process.Pid, At: time.Now().UTC()})
+	c.mu.Lock()
+	c.running[spec.RunID] = cr
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.running, spec.RunID)
+		c.mu.Unlock()
+	}()
 	defer ptmx.Close()
 	// Reap the child: pty.Start starts the process and nothing waited on it,
 	// so every managed run left a zombie until the daemon exited.
@@ -453,7 +467,10 @@ func (c *Claude) executePTY(ctx context.Context, spec ExecSpec, sink Sink) error
 		}
 		close(waitDone)
 	}()
-	defer func() { <-waitDone }()
+	defer func() {
+		gracefulStop(cmd, waitDone, ptmx)
+		<-waitDone
+	}()
 	// TUIs refuse to render on 0x0 terminals: give the PTY a sane size.
 	pty.Setsize(ptmx, &pty.Winsize{Rows: 40, Cols: 120})
 	var outTail = struct {
@@ -485,7 +502,7 @@ func (c *Claude) executePTY(ctx context.Context, spec ExecSpec, sink Sink) error
 		return string(outTail.tail)
 	}
 
-	sink(Event{Kind: EvSessionStarted, RunID: spec.RunID, SessionID: sessionID, Model: spec.Model, At: time.Now().UTC()})
+	sink(Event{Kind: EvSessionStarted, RunID: spec.RunID, SessionID: sessionID, At: time.Now().UTC()})
 
 	// Submit the prompt: wait for the TUI to come up, then bracketed-paste
 	// the prompt and press enter. One shot; hooks report the actual turn.
@@ -530,16 +547,12 @@ func (c *Claude) executePTY(ctx context.Context, spec ExecSpec, sink Sink) error
 			stopIdle = idleOnStop.C
 		}
 		select {
-		case <-ctx.Done():
-			cmd.Process.Signal(os.Interrupt)
-			time.Sleep(1500 * time.Millisecond)
-			cmd.Process.Kill()
+		case <-runCtx.Done():
 			sink(Event{Kind: EvTurnCompleted, RunID: spec.RunID, SessionID: sessionID, Status: TurnInterrupted})
 			return nil
 		case <-deadline.C:
-			cmd.Process.Kill()
 			sink(Event{Kind: EvTurnCompleted, RunID: spec.RunID, SessionID: sessionID, Status: TurnFailed,
-				Error: &ProviderError{Class: model.ErrUnknown, Message: "execution deadline exceeded"}})
+				Error: &ProviderError{Class: model.ErrNetwork, Message: "execution deadline exceeded"}})
 			return nil
 		case <-cr.exited:
 			// Process gone. If we never saw a Stop, the run died mid-turn.
@@ -673,6 +686,9 @@ func claudeChildEnv(apiMode bool, extra map[string]string) []string {
 		// os.Environ() entries always contain '='; the old code also compared
 		// the whole entry against a bare name, which could never match.
 		name, _, _ := strings.Cut(kv, "=")
+		if _, overridden := extra[name]; overridden {
+			continue
+		}
 		if !apiMode && isBillingRedirect(name) {
 			continue
 		}
@@ -696,40 +712,21 @@ func isBillingRedirect(name string) bool {
 	return false
 }
 
-// Cancel sends a graceful interrupt to the PTY (Ctrl+C), escalating to SIGINT.
+// Cancel asks the owning execution loop to interrupt and reap its process,
+// and ends a process kept between turns of the run.
 func (c *Claude) Cancel(runID string) error {
 	c.mu.Lock()
 	cr := c.running[runID]
 	c.mu.Unlock()
+	ended := c.endLive(runID)
 	if cr == nil {
+		if ended {
+			return nil
+		}
 		return fmt.Errorf("no active claude run %s", runID)
 	}
-	cr.interrupt()
-	// Escalate against THIS run only. Re-looking-up by id after five seconds
-	// could kill a retry that had since registered under the same id.
-	go func() {
-		time.Sleep(5 * time.Second)
-		cr.closeOnce.Do(func() {
-			if cr.ptty != nil {
-				cr.ptty.Close()
-			}
-			if cr.proc != nil {
-				cr.proc.Kill()
-			}
-		})
-	}()
-	return nil
-}
-
-// interrupt asks the run to stop at a safe point.
-func (cr *claudeRun) interrupt() {
 	cr.cancel()
-	if cr.ptty != nil {
-		cr.ptty.Write([]byte("\x03")) // Ctrl+C in the TUI = interrupt turn
-	}
-	if cr.proc != nil {
-		cr.proc.Signal(os.Interrupt)
-	}
+	return nil
 }
 
 // CanResumeSession: `claude --resume <session-id>` reattaches to a session,
@@ -768,12 +765,19 @@ func (c *Claude) ProbeQuota(context.Context) ([]QuotaWindow, error) {
 	return out, nil
 }
 
-// Close cancels all runs.
+// Close cancels all runs and ends every live process.
 func (c *Claude) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	live := make([]*liveSession, 0, len(c.live))
 	for _, cr := range c.running {
-		cr.interrupt()
+		cr.cancel()
+	}
+	for _, ls := range c.live {
+		live = append(live, ls)
+	}
+	c.mu.Unlock()
+	for _, ls := range live {
+		ls.shutdown()
 	}
 	return nil
 }

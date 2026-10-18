@@ -3,6 +3,17 @@
 
 export const PROTOCOL_VERSION = 1;
 
+export interface RunActivityLike {
+  observedAt: string;
+  executionActive: boolean;
+  processId?: number;
+  processAlive?: boolean;
+  lastEventAt?: string;
+  entries: { at: string; kind: string; text: string }[];
+  /** The daemon-owned provider process and the Claude Code tabs attached to it. */
+  live?: { sessionId: string; pid: number; viewers: number; attaches: number; busy: "" | "conductor" | "native" };
+}
+
 export interface RunLike {
   id: string;
   batchId: string;
@@ -14,6 +25,10 @@ export interface RunLike {
   provider: string;
   model: string;
   effort: string;
+  resolvedModel?: string;
+  effectiveEffort?: string;
+  retryCount?: number;
+  completionRetries?: number;
   permission: string;
   staged: boolean;
   attachSecrets: boolean;
@@ -103,6 +118,14 @@ export interface ExternalSessionLike {
   lastSeenAt: string;
 }
 
+/** Live advisory emitted only when an external turn starts during managed work. */
+export interface ExternalRunOverlap {
+  provider: string;
+  sessionId: string;
+  activeRunCount: number;
+  queuePaused: boolean;
+}
+
 export interface SettingsLike {
   maxTotalRuns: number;
   maxClaudeRuns: number;
@@ -127,10 +150,11 @@ export interface SettingsLike {
   auditEnabled: boolean;
   maxAuditCycles: number;
   maxVerifyFixCycles: number;
+  maxTransientRetries?: number;
+  maxCompletionContinuations?: number;
   verificationCommands: string[];
   verificationTimeoutSec: number;
   claudeApiMode: boolean;
-  fifoBlockOnExternal: boolean;
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
@@ -153,7 +177,7 @@ export interface PauseStateLike {
   scope: PauseScope;
   reason: string;
   pausedAt?: string;
-  /** Absolute ISO timestamp; absent means "until I resume". */
+  /** Absolute ISO timestamp; system holds may instead clear when their condition ends. */
   resumeAt?: string;
   /** The human input that produced resumeAt, e.g. "45m", for display only. */
   resumeAfter: string;
@@ -214,7 +238,35 @@ export interface RowSpecInput {
 }
 
 export interface BatchSpecInput {
+  /** Stable key for retrying an import without creating a second batch. */
+  importKey?: string;
   title: string;
   cwd: string;
   rows: RowSpecInput[];
+}
+
+export interface SequenceSettings {
+  provider: string;
+  model: string;
+  effort: string;
+  permission: string;
+  attachSecrets: boolean;
+  staged: boolean;
+}
+
+export interface PromptSequenceFile {
+  name: string;
+  order: number;
+  bytes: number;
+  prompt: string;
+}
+
+export interface PromptSequencePreview {
+  id: string;
+  folder: string;
+  title: string;
+  files: PromptSequenceFile[];
+  ignored: string[];
+  errors: string[];
+  totalBytes: number;
 }

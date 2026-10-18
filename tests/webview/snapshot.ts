@@ -90,7 +90,6 @@ export function makeSnapshot(
       verificationCommands: [],
       verificationTimeoutSec: 1800,
       claudeApiMode: false,
-      fifoBlockOnExternal: true,
       paused: false,
     },
     paused: false,

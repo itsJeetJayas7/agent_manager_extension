@@ -47,6 +47,36 @@ function rpcCalls(method: string) {
 afterEach(cleanup);
 
 describe("QueueView", () => {
+  it.each([
+    ["SessionStart", false], ["UserPromptSubmit", true], ["PreToolUse", true],
+    ["PostToolUse", true], ["PostToolUseFailure", true], ["Stop", false],
+    ["StopFailure", false], ["Interrupt", false], ["SessionEnd", false],
+  ])("shows external activity for %s only when a turn is active", (lastEvent, busy) => {
+    const external = { claude: [{
+      provider: "claude", nativeId: "manual", kind: "external", cwd: "/project",
+      lastEvent, lastSeenAt: new Date().toISOString(),
+    }] };
+    render(<QueueView state={makeState(makeSnapshot({ external }))} />);
+    expect(!!screen.queryByTitle("claude: external agent active · queue continues normally")).toBe(busy);
+    expect(!!screen.queryByTitle("claude: ready")).toBe(!busy);
+  });
+
+  it.each(["managed", "stale"])("does not warn about a %s session", (type) => {
+    const external = { claude: [{
+      provider: "claude", nativeId: "session", kind: type === "managed" ? "managed" : "external",
+      cwd: "/project", lastEvent: "UserPromptSubmit",
+      lastSeenAt: new Date(Date.now() - (type === "stale" ? 46 * 60_000 : 0)).toISOString(),
+    }] };
+    render(<QueueView state={makeState(makeSnapshot({ external }))} />);
+    expect(screen.getByTitle("claude: ready")).toBeTruthy();
+  });
+
+  it("passes the effective worktree to the native Claude opener", () => {
+    render(<QueueView state={makeState(makeSnapshot({ runs: [makeRun({ state: "RUNNING", provider: "claude", providerSessionId: "session-id", cwd: "/base", worktreePath: "/worktree" })] }))} />);
+    fireEvent.click(screen.getByRole("button", { name: "Open in Claude Code" }));
+    expect(postMessage).toHaveBeenCalledWith({ type: "openClaude", sessionId: "session-id", cwd: "/worktree" });
+  });
+
   it("renders the composer and a composed empty state", () => {
     render(<QueueView state={makeState(makeSnapshot())} />);
     expect(screen.getByLabelText("Prompt")).toBeTruthy();
@@ -189,6 +219,14 @@ describe("pause", () => {
     expect(screen.queryByRole("button", { name: "+15m" })).toBeNull();
   });
 
+  it("explains that an external hold resumes automatically", () => {
+    const pause = { ...idlePause, paused: true, source: "external-agent" as const };
+    render(<QueueView state={makeState(makeSnapshot({ pause, paused: true, runs: [makeRun()] }))} />);
+    expect(screen.getAllByText(/resumes automatically when the external run ends/i)).toHaveLength(2);
+    expect(screen.queryByText(/until you resume/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume now" })).toBeNull();
+  });
+
   // §5.4 — a system hold explains itself rather than leaving the user guessing.
   it("explains a system hold in one plain sentence", () => {
     const pause = {
@@ -228,6 +266,40 @@ describe("pause", () => {
 });
 
 describe("queue reordering", () => {
+  it.each([
+    ["Move b up", "b", "a"],
+    ["Move b down", "b", ""],
+    ["Move a down", "a", "c"],
+    ["Move a to the end of the queue", "a", ""],
+  ])("supports the visible %s control", async (label, runId, beforeRunId) => {
+    const runs = ["a", "b", "c"].map((id, i) => makeRun({ id, title: id, sortKey: (i + 1) * 1024 }));
+    render(<QueueView state={makeState(makeSnapshot({ runs: runs.reverse() }))} />);
+    fireEvent.click(screen.getByRole("button", { name: label }));
+    await waitFor(() => expect(rpcCalls("reorderQueue")[0][0].params).toEqual({ runId, beforeRunId }));
+    await waitFor(() => expect(postMessage).toHaveBeenCalledWith({ type: "requestSnapshot" }));
+  });
+
+  it("disables boundary moves and shows rejected moves", async () => {
+    const runs = ["a", "b"].map(id => makeRun({ id, title: id }));
+    render(<QueueView state={makeState(makeSnapshot({ runs }))} />);
+    expect((screen.getByRole("button", { name: "Move a up" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Move b down" }) as HTMLButtonElement).disabled).toBe(true);
+    postMessage.mockImplementation(msg => {
+      if (msg.method === "reorderQueue") setTimeout(() => window.dispatchEvent(new MessageEvent("message", {
+        data: { type: "rpcError", requestId: msg.requestId, error: "cannot move a run across its batch row dependency" },
+      })), 0);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Move b up" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("batch row dependency");
+  });
+
+  it("allows dragging a run to the end of the stack", async () => {
+    const runs = ["a", "b"].map(id => makeRun({ id, title: id }));
+    render(<QueueView state={makeState(makeSnapshot({ runs }))} />);
+    fireEvent.drop(screen.getByText("End of queue"), { dataTransfer: { getData: () => "a" } });
+    await waitFor(() => expect(rpcCalls("reorderQueue")[0][0].params).toEqual({ runId: "a", beforeRunId: "" }));
+  });
+
   // §7.5 — reorderQueue existed in the RPC surface with no UI at all.
   it("moves a run to the front with the row action", async () => {
     const runs = [makeRun({ id: "a" }), makeRun({ id: "b" }), makeRun({ id: "c" })];
@@ -330,5 +402,45 @@ describe("saved setups", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Codex" }));
     await waitFor(() => expect(screen.getByText(/runtime missing/i)).toBeTruthy());
+  });
+});
+
+describe("explicit model and effort selection", () => {
+  function modelSnapshot() {
+    const snap = makeSnapshot();
+    snap.providers.claude.models = [
+      { id: "claude-opus-5-5", name: "Claude Opus 5.5", efforts: ["low", "medium", "high", "xhigh", "max"] },
+      { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", efforts: [] },
+    ];
+    return snap;
+  }
+  it("pins Opus 5.5 and sends every advertised effort unchanged", async () => {
+    render(<QueueView state={makeState(modelSnapshot())} />);
+    const model = screen.getByLabelText("Model") as HTMLSelectElement;
+    expect(model.value).toBe("claude-opus-5-5");
+    const effort = screen.getByLabelText("Effort") as HTMLSelectElement;
+    expect(Array.from(effort.options).map((o) => o.value)).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
+    for (const level of ["low", "medium", "high", "xhigh", "max"]) {
+      fireEvent.change(effort, { target: { value: level } });
+      fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: `task ${level}` } });
+      fireEvent.click(screen.getByRole("button", { name: "Queue run", exact: true }));
+      await waitFor(() => expect(rpcCalls("enqueueRun").at(-1)?.[0].params).toMatchObject({ model: "claude-opus-5-5", effort: level }));
+      await waitFor(() => expect((screen.getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe(""));
+    }
+  });
+  it("clears unsupported effort on a model change", async () => {
+    render(<QueueView state={makeState(modelSnapshot())} />);
+    fireEvent.change(screen.getByLabelText("Effort"), { target: { value: "max" } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "claude-haiku-4-5-20251001" } });
+    await waitFor(() => expect((screen.getByLabelText("Effort") as HTMLSelectElement).value).toBe(""));
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "small task" } });
+    fireEvent.click(screen.getByRole("button", { name: "Queue run", exact: true }));
+    await waitFor(() => expect(rpcCalls("enqueueRun")[0][0].params.effort).toBe(""));
+  });
+  it("shows the actual provider model beside the requested effort", () => {
+    const run = makeRun({ state: "RUNNING", model: "opus", resolvedModel: "claude-opus-5-5", effort: "xhigh" });
+    render(<QueueView state={makeState(makeSnapshot({ runs: [run] }))} />);
+    expect(screen.getByTitle("Requested: opus").textContent).toBe("claude-opus-5-5");
+    expect(screen.getByText("Effort: xhigh")).toBeTruthy();
   });
 });

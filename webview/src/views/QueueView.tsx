@@ -1,11 +1,14 @@
+import RunActivity from "../components/RunActivity";
 // Queue tab: header, pause, active run, composer, the queue itself.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ConductorState } from "../state/store";
-import { activeRuns, waitingRuns, attentionRuns, pausedRuns } from "../state/store";
+import { activeRuns, waitingRuns, attentionRuns, pausedRuns, consumePromptImportRequest } from "../state/store";
+import PromptSequenceImport from "../components/PromptSequenceImport";
 import type { RunLike } from "../../../src/extension/protocol";
 import StatusGlyph from "../components/StatusGlyph";
 import { PauseButton, PauseBand } from "../components/PauseControl";
 import { useNow } from "../components/ticker";
+import { isExternalSessionBusy } from "../state/externalActivity";
 import Onboarding, { useSetupStatus } from "../components/Onboarding";
 import PresetBar, { usePresets, type Preset } from "../components/Presets";
 import { fmtDuration, elapsedSince, fmtRelative } from "../components/format";
@@ -17,13 +20,15 @@ import {
   openWorktree,
   openPlanner,
   vscodeApi,
+  requestSnapshot,
 } from "../api/client";
 
 function ProviderDot({ provider, state }: { provider: string; state: ConductorState }) {
+  const now = useNow();
   const q = state.snapshot?.quota?.[provider];
   const caps = state.snapshot?.providers?.[provider];
   const busyExternal = (state.snapshot?.external?.[provider] ?? []).some(
-    (s) => s.kind === "external" && ["SessionStart", "UserPromptSubmit"].includes(s.lastEvent)
+    (s) => isExternalSessionBusy(s, now)
   );
   let cls = "ok";
   let title = `${provider}: ready`;
@@ -34,8 +39,7 @@ function ProviderDot({ provider, state }: { provider: string; state: ConductorSt
     cls = "warn";
     title = `${provider}: quota exhausted`;
   } else if (busyExternal) {
-    cls = "warn";
-    title = `${provider}: a session is running outside Agent Conductor`;
+    title = `${provider}: external agent active · queue continues normally`;
   }
   return (
     <span className="ac-row ac-gap-1" title={title}>
@@ -59,7 +63,7 @@ interface ComposerPrefs {
 
 const DEFAULT_PREFS: ComposerPrefs = {
   provider: "claude",
-  model: "",
+  model: "claude-opus-5-5",
   effort: "high",
   permission: "bypass",
   staged: false,
@@ -88,21 +92,35 @@ function savePrefs(workspace: string, prefs: ComposerPrefs): void {
   }
 }
 
-function Composer({ state }: { state: ConductorState }) {
+function Composer({ state, focusRequest }: { state: ConductorState; focusRequest: number }) {
   const workspace = state.workspace || "default";
   const [prefs, setPrefs] = useState<ComposerPrefs>(() => loadPrefs(workspace));
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [sequenceMode, setSequenceMode] = useState(false);
+  const [sequenceBusy, setSequenceBusy] = useState(false);
   const hasSecret = !!state.snapshot?.hasSecretBlock;
   const { presets, save: savePreset, remove: removePreset } = usePresets(workspace);
 
   // Re-read when the workspace changes (a new window, a different folder).
   useEffect(() => setPrefs(loadPrefs(workspace)), [workspace]);
+  useEffect(() => {
+    if (focusRequest && !sequenceBusy) {
+      setSequenceMode(false);
+      requestAnimationFrame(() => document.getElementById("ac-prompt")?.focus());
+    }
+  }, [focusRequest]);
+  useEffect(() => {
+    if (state.showPromptImport) {
+      setSequenceMode(true);
+      consumePromptImportRequest();
+    }
+  }, [state.showPromptImport]);
 
   const caps = state.snapshot?.providers?.[prefs.provider];
   const models = useMemo(() => (caps?.models ?? []).filter((m) => !m.hidden), [caps]);
-  const efforts = models.find((m) => m.id === prefs.model)?.efforts ?? ["low", "medium", "high"];
+  const efforts = models.find((m) => m.id === prefs.model)?.efforts ?? [];
 
   const update = useCallback(
     (patch: Partial<ComposerPrefs>) => {
@@ -122,10 +140,14 @@ function Composer({ state }: { state: ConductorState }) {
     }
     if (!models.some((m) => m.id === prefs.model)) {
       const preferred =
-        prefs.provider === "claude" ? models.find((m) => m.id.includes("sonnet")) : undefined;
+        prefs.provider === "claude" ? models.find((m) => m.id === "claude-opus-5-5") : undefined;
       update({ model: (preferred ?? models[0]).id });
     }
   }, [models, prefs.model, prefs.provider, update]);
+
+  useEffect(() => {
+    if (models.length && prefs.effort && !efforts.includes(prefs.effort)) update({ effort: "" });
+  }, [models, efforts, prefs.effort, update]);
 
   useEffect(() => {
     if (!hasSecret && prefs.attachSecrets) {
@@ -134,6 +156,7 @@ function Composer({ state }: { state: ConductorState }) {
   }, [hasSecret, prefs.attachSecrets, update]);
 
   const enqueue = async (runNext: boolean) => {
+    if (busy) return;
     if (!prompt.trim()) {
       setError("Paste a prompt first.");
       return;
@@ -152,7 +175,13 @@ function Composer({ state }: { state: ConductorState }) {
 
   return (
     <section className="ac-section" aria-label="Queue a run">
-      <div className="ac-section-title">Queue a run</div>
+      <div className="ac-row between ac-mb-2">
+        <div className="ac-section-title">{sequenceMode ? "Queue a sequence" : "Queue a run"}</div>
+        <button className="ac-btn ghost ac-btn-sm" disabled={busy || sequenceBusy} onClick={() => setSequenceMode(!sequenceMode)}>
+          {sequenceMode ? "Single prompt" : "Import prompts from folder"}
+        </button>
+      </div>
+      <div hidden={sequenceMode}>
       <label className="ac-sr" htmlFor="ac-prompt">
         Prompt
       </label>
@@ -180,6 +209,8 @@ function Composer({ state }: { state: ConductorState }) {
         <span>{caps?.installed ? caps.version || "installed" : "runtime missing"}</span>
       </div>
 
+      </div>
+      <fieldset className="ac-composer-settings" disabled={sequenceBusy}>
       <div className="ac-row between ac-mt-3">
         <div className="ac-seg" role="group" aria-label="Provider">
           {["claude", "codex"].map((p) => (
@@ -219,9 +250,10 @@ function Composer({ state }: { state: ConductorState }) {
             value={prefs.effort}
             onChange={(e) => update({ effort: e.target.value })}
           >
+            <option value="">{efforts.length ? "Model default" : "Not supported"}</option>
             {efforts.map((f) => (
               <option key={f} value={f}>
-                {f}
+                {f === "xhigh" ? "xhigh — Extra high" : f === "ultracode" ? "Ultracode — xhigh + workflows" : f}
               </option>
             ))}
           </select>
@@ -243,6 +275,8 @@ function Composer({ state }: { state: ConductorState }) {
           </select>
         </div>
       </div>
+
+      {prefs.model && <div className="ac-xs ac-muted ac-mt-1" title="Exact model sent to the provider">{prefs.model}</div>}
 
       <div className="ac-mt-2">
         <label className="ac-check">
@@ -279,8 +313,9 @@ function Composer({ state }: { state: ConductorState }) {
         onSave={(name) => savePreset({ name, ...prefs })}
         onRemove={removePreset}
       />
+      </fieldset>
 
-      <div className="ac-row ac-mt-3">
+      <div className="ac-row ac-mt-3" hidden={sequenceMode}>
         <button className="ac-btn" disabled={busy} onClick={() => void enqueue(false)}>
           Queue run
         </button>
@@ -288,6 +323,7 @@ function Composer({ state }: { state: ConductorState }) {
           Run next
         </button>
       </div>
+      <PromptSequenceImport state={state} settings={prefs} visible={sequenceMode} onBusy={setSequenceBusy} />
     </section>
   );
 }
@@ -311,24 +347,25 @@ function stageLabel(run: RunLike): string | null {
   return "Staged";
 }
 
-function ActiveRun({ run }: { run: RunLike }) {
+function ActiveRun({ run, connected }: { run: RunLike; connected: boolean }) {
   const now = useNow();
   const openLabel = run.provider === "claude" ? "Open in Claude Code" : "Open in Codex";
   const open = () =>
     run.provider === "claude"
-      ? openClaudeSession(run.providerSessionId ?? "")
+      ? openClaudeSession(run.providerSessionId ?? "", run.worktreePath || run.cwd)
       : openCodexThread(run.providerSessionId ?? "", run.providerTitle || run.title);
   const stage = stageLabel(run);
   return (
     <article className="ac-hero" aria-label={`Active run: ${run.title || run.promptPreview}`}>
       <div className="ac-row between top">
         <span className="ac-hero-title ac-grow">{run.title || run.promptPreview}</span>
-        <StatusGlyph state={run.state} pulse={run.state === "RUNNING" || run.state === "WAITING_FOR_PROVIDER"} />
+        <StatusGlyph state={run.state} pulse={false} />
       </div>
       <div className="ac-hero-meta">
         <span className="ac-hero-elapsed ac-num">{fmtDuration(elapsedSince(run.startedAt, now))}</span>
         <span className="ac-cap">{run.provider}</span>
-        {run.model && <span>{run.model}</span>}
+        {(run.resolvedModel || run.model) && <span title={`Requested: ${run.model || "provider default"}`}>{run.resolvedModel || run.model}</span>}
+        <span>Effort: {(run.effectiveEffort ?? run.effort) || "model default"}</span>
         {stage && (
           <span className="ac-stage">
             <b>{stage}</b>
@@ -336,13 +373,7 @@ function ActiveRun({ run }: { run: RunLike }) {
         )}
         {run.continuationCount > 0 && <span>{run.continuationCount} continuation{run.continuationCount === 1 ? "" : "s"}</span>}
       </div>
-      {/* A hairline, not a progress bar: we do not know a percentage and will
-          not invent one. It only signals that work is moving. */}
-      {run.state === "RUNNING" && (
-        <div className="ac-progress" aria-hidden="true">
-          <div className="ac-pulse ac-w-full" />
-        </div>
-      )}
+      <RunActivity run={run} connected={connected} />
       <div className="ac-row ac-gap-1 ac-mt-3">
         {run.providerSessionId && (
           <button className="ac-btn ghost ac-btn-sm" onClick={open}>
@@ -380,6 +411,8 @@ function QueueRow({
   run,
   index,
   isNext,
+  isLast,
+  moving,
   paused,
   onMove,
   dragState,
@@ -387,11 +420,16 @@ function QueueRow({
   run: RunLike;
   index: number;
   isNext: boolean;
+  isLast: boolean;
+  moving: boolean;
   paused: boolean;
   onMove: (runId: string, beforeRunId: string) => void;
   dragState: { dragging: string | null; over: string | null; set: (d: string | null, o: string | null) => void };
 }) {
   const when = () => {
+    if (run.retryCount && run.nextEligibleAt && run.state !== "WAITING_FOR_QUOTA") {
+      return <span title={run.errorMsg}>↻ Retry {run.retryCount} · {fmtRelative(run.nextEligibleAt)}</span>;
+    }
     if (run.state === "WAITING_FOR_QUOTA") {
       return <span title="Resumes automatically when quota returns">◷ {fmtRelative(run.nextEligibleAt)}</span>;
     }
@@ -404,7 +442,7 @@ function QueueRow({
   return (
     <li
       className={`ac-qrow${isNext ? " next" : ""}${paused ? " dimmed" : ""}`}
-      draggable
+      draggable={!moving}
       data-dragging={dragState.dragging === run.id}
       data-dropbefore={dragState.over === run.id && dragState.dragging !== run.id}
       onDragStart={(e) => {
@@ -438,7 +476,7 @@ function QueueRow({
       }}
       aria-label={`Position ${index + 1}: ${run.title || run.promptPreview}, ${run.state}. Alt plus arrow keys to reorder.`}
     >
-      <span className="ac-qrow-index ac-num" aria-hidden="true">
+      <span className="ac-qrow-index ac-num ac-drag" title="Drag to reorder" aria-hidden="true">
         {index + 1}
       </span>
       <span className="ac-qrow-title">
@@ -447,18 +485,32 @@ function QueueRow({
         </span>
         <span className="ac-qrow-sub ac-cap">
           {run.provider}
-          {run.model ? ` · ${run.model}` : ""}
+          {(run.resolvedModel || run.model) ? ` · ${run.resolvedModel || run.model}` : ""}
+          {` · ${(run.effectiveEffort ?? run.effort) || "model default"}`}
         </span>
       </span>
       <span className="ac-qrow-when">{when()}</span>
       <span className="ac-qrow-actions">
         <button
           className="ac-icon-btn"
-          title="Run next"
+          title="Move to first"
+          disabled={moving || isNext}
           aria-label={`Move ${run.title || "run"} to the front of the queue`}
           onClick={() => onMove(run.id, "__front__")}
         >
+          ⤒
+        </button>
+        <button className="ac-icon-btn" title="Move up (Alt+↑)" disabled={moving || isNext}
+          aria-label={`Move ${run.title || "run"} up`} onClick={() => onMove(run.id, "__up__")}>
           ↑
+        </button>
+        <button className="ac-icon-btn" title="Move down (Alt+↓)" disabled={moving || isLast}
+          aria-label={`Move ${run.title || "run"} down`} onClick={() => onMove(run.id, "__down__")}>
+          ↓
+        </button>
+        <button className="ac-icon-btn" title="Move to last" disabled={moving || isLast}
+          aria-label={`Move ${run.title || "run"} to the end of the queue`} onClick={() => onMove(run.id, "__end__")}>
+          ⤓
         </button>
         <button
           className="ac-icon-btn"
@@ -480,6 +532,7 @@ function QueueRow({
 // ---- the view -------------------------------------------------------------
 
 export default function QueueView({ state }: { state: ConductorState }) {
+  const [focusRequest, setFocusRequest] = useState(0);
   const active = activeRuns(state);
   const waiting = waitingRuns(state);
   const attention = attentionRuns(state);
@@ -499,31 +552,43 @@ export default function QueueView({ state }: { state: ConductorState }) {
   dragState.current.dragging = drag.dragging;
   dragState.current.over = drag.over;
 
+  const [moveError, setMoveError] = useState("");
+  const [moving, setMoving] = useState(false);
+  const movePending = useRef(false);
   const move = useCallback(
-    (runId: string, target: string) => {
+    async (runId: string, target: string) => {
+      if (movePending.current) return;
       const order = waiting.map((r) => r.id);
       const from = order.indexOf(runId);
+      if (from < 0) return;
+      let beforeRunId = target;
       if (target === "__front__") {
-        const first = order.find((id) => id !== runId);
-        void rpc("reorderQueue", { runId, beforeRunId: first ?? "" }).catch(() => undefined);
-        return;
+        if (from === 0) return;
+        beforeRunId = order[0];
+      } else if (target === "__up__") {
+        if (from === 0) return;
+        beforeRunId = order[from - 1];
+      } else if (target === "__down__") {
+        if (from === order.length - 1) return;
+        beforeRunId = order[from + 2] ?? "";
+      } else if (target === "__end__") {
+        if (from === order.length - 1) return;
+        beforeRunId = "";
       }
-      if (target === "__up__") {
-        if (from <= 0) {
-          return;
-        }
-        void rpc("reorderQueue", { runId, beforeRunId: order[from - 1] }).catch(() => undefined);
-        return;
+      if (beforeRunId === runId || (beforeRunId && !order.includes(beforeRunId))) return;
+      movePending.current = true;
+      setMoving(true);
+      setMoveError("");
+      try {
+        await rpc("reorderQueue", { runId, beforeRunId });
+        requestSnapshot();
+      } catch (e: any) {
+        setMoveError(String(e?.message ?? e));
+        requestSnapshot();
+      } finally {
+        movePending.current = false;
+        setMoving(false);
       }
-      if (target === "__down__") {
-        if (from < 0 || from >= order.length - 1) {
-          return;
-        }
-        const after = order[from + 2];
-        void rpc("reorderQueue", { runId, beforeRunId: after ?? "" }).catch(() => undefined);
-        return;
-      }
-      void rpc("reorderQueue", { runId, beforeRunId: target }).catch(() => undefined);
     },
     [waiting]
   );
@@ -644,7 +709,7 @@ export default function QueueView({ state }: { state: ConductorState }) {
         )}
         <div className="ac-stack-2">
           {active.map((r) => (
-            <ActiveRun key={r.id} run={r} />
+            <ActiveRun key={r.id} run={r} connected={state.daemonHealthy} />
           ))}
         </div>
         {parked.length > 0 && (
@@ -664,12 +729,14 @@ export default function QueueView({ state }: { state: ConductorState }) {
         )}
       </section>
 
-      <Composer state={state} />
+      <Composer state={state} focusRequest={focusRequest} />
 
       <section aria-label="Queue">
         <div className="ac-section-title ac-list-head">
-          Up next
+          Up next · {waiting.length}
         </div>
+        {waiting.length > 0 && <p className="ac-queue-help ac-xs ac-muted">New runs join the end. Use the arrows or drag to reorder.</p>}
+        {moveError && <div role="alert" className="ac-queue-error">Could not move run: {moveError}</div>}
         {waiting.length === 0 ? (
           <div className="ac-empty">
             <div className="ac-empty-title">The queue is empty.</div>
@@ -683,17 +750,34 @@ export default function QueueView({ state }: { state: ConductorState }) {
                 run={r}
                 index={i}
                 isNext={i === 0}
+                isLast={i === waiting.length - 1}
+                moving={moving}
                 paused={paused}
                 onMove={move}
                 dragState={dragState.current}
               />
             ))}
+            <li className="ac-queue-end" data-dropbefore={drag.over === "__end__"}
+              onDragOver={(e) => {
+                if (!drag.dragging) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                dragState.current.set(drag.dragging, "__end__");
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const source = e.dataTransfer.getData("text/plain") || drag.dragging;
+                dragState.current.set(null, null);
+                if (source) void move(source, "__end__");
+              }}>
+              {drag.dragging ? "Drop here to move to the end" : "End of queue"}
+            </li>
           </ul>
         )}
       </section>
 
       <div className="ac-footer">
-        <button className="ac-btn" onClick={() => document.getElementById("ac-prompt")?.focus()}>
+        <button className="ac-btn" onClick={() => setFocusRequest(value => value + 1)}>
           Queue a run
         </button>
         <button className="ac-btn ghost" onClick={() => openPlanner()}>

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"agent-conductor/internal/claudewrap"
 	"agent-conductor/internal/db"
 	"agent-conductor/internal/logging"
 	"agent-conductor/internal/model"
@@ -68,9 +69,10 @@ type Server struct {
 	clients   map[net.Conn]*clientConn
 	startedAt time.Time
 
-	capsMu    sync.Mutex
-	capsCache map[string]providers.Caps
-	capsAt    time.Time
+	capsRefresh chan struct{}
+	capsMu      sync.Mutex
+	capsCache   map[string]providers.Caps
+	capsAt      time.Time
 
 	// snapCache absorbs bursts: a daemon event can reach several webviews at
 	// once, each of which may ask for a snapshot.
@@ -304,6 +306,9 @@ func (s *Server) handle(conn net.Conn) {
 							if !ok {
 								return
 							}
+							if ev.Type == "queueReordered" {
+								s.invalidateSnapshot()
+							}
 							s.send(out, done, map[string]any{"event": ev.Type, "payload": ev.Payload})
 						}
 					}
@@ -311,6 +316,22 @@ func (s *Server) handle(conn net.Conn) {
 			}
 			s.reply(writeMsg, req.ID, map[string]any{"ok": true}, nil)
 			continue
+		}
+		if req.Method == "attachClaudeSession" {
+			// The connection becomes a relay; it never returns to request mode.
+			writeLine := func(b []byte) error {
+				writerMu.Lock()
+				defer writerMu.Unlock()
+				if _, err := writer.Write(b); err != nil {
+					return err
+				}
+				if err := writer.WriteByte('\n'); err != nil {
+					return err
+				}
+				return writer.Flush()
+			}
+			s.attachClaude(req.ID, req.Params, reader, writeMsg, writeLine, conn)
+			return
 		}
 		result, apiErr := s.dispatch(req.Method, req.Params)
 		if apiErr != nil {
@@ -378,10 +399,13 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 			return nil, e("ENQUEUE", err.Error())
 		}
 		return map[string]any{"batchId": batchID, "runId": runID}, nil
-	case "enqueueBatch":
+	case "enqueueBatch", "enqueuePromptSequence":
 		var spec scheduler.BatchSpecInput
 		if err := json.Unmarshal(params, &spec); err != nil {
 			return nil, e("BAD_PARAMS", err.Error())
+		}
+		if method == "enqueuePromptSequence" && spec.ImportKey == "" {
+			return nil, e("BAD_PARAMS", "a prompt sequence requires an import key")
 		}
 		id, err := s.conductor.ApplyBatch(spec)
 		if err != nil {
@@ -670,6 +694,61 @@ func (s *Server) dispatch(method string, params json.RawMessage) (any, *apiError
 		}
 		json.Unmarshal(params, &in)
 		return s.batchDetail(in.BatchID)
+	case "getRunActivity":
+		var in struct {
+			RunID string `json:"runId"`
+		}
+		if err := json.Unmarshal(params, &in); err != nil {
+			return nil, e("BAD_PARAMS", err.Error())
+		}
+		if r, err := s.store.GetRun(in.RunID); err != nil || r == nil {
+			return nil, e("NOT_FOUND", "run not found")
+		}
+		return s.conductor.RunActivity(in.RunID), nil
+	case "installClaudeWrapper":
+		// The executable Agent Conductor sets as claudeCode.claudeProcessWrapper.
+		path, err := claudewrap.Install(s.paths.Root)
+		if err != nil {
+			return nil, e("WRAPPER", err.Error())
+		}
+		return map[string]any{"path": path}, nil
+	case "prepareClaudeAttach", "releaseClaudeAttach":
+		// Pause a session's process while a Claude Code tab opens, so the
+		// history the tab reads and the live stream it attaches to meet exactly.
+		var in struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(params, &in); err != nil {
+			return nil, e("BAD_PARAMS", err.Error())
+		}
+		a, _ := s.registry.Get(model.ProviderClaude)
+		c, ok := a.(*providers.Claude)
+		if !ok {
+			return map[string]any{"paused": false}, nil
+		}
+		if method == "releaseClaudeAttach" {
+			c.ThawAttach(in.SessionID)
+			return map[string]any{"paused": false}, nil
+		}
+		return map[string]any{"paused": c.FreezeForAttach(in.SessionID, 8*time.Second)}, nil
+	case "claudeSessionLive":
+		// Whether a Claude Code tab is actually attached to the daemon-owned
+		// process of a session. Opening a tab is not evidence of that.
+		var in struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(params, &in); err != nil {
+			return nil, e("BAD_PARAMS", err.Error())
+		}
+		out := map[string]any{"sessionId": in.SessionID, "live": false}
+		if a, ok := s.registry.Get(model.ProviderClaude); ok {
+			if c, ok := a.(*providers.Claude); ok {
+				if st, run, ok := c.LiveStatusForSession(in.SessionID); ok {
+					out["live"], out["status"], out["runId"] = true, st, run
+				}
+			}
+		}
+		return out, nil
 	case "getRunEvents":
 		var in struct {
 			RunID string `json:"runId"`
@@ -856,17 +935,38 @@ func platformName() string {
 // spawn provider subprocesses and must never stall snapshots.
 func (s *Server) capabilities() map[string]providers.Caps {
 	s.capsMu.Lock()
-	fresh := time.Since(s.capsAt) < capsTTL
 	cache := s.capsCache
 	warm := len(cache) > 0
-	s.capsMu.Unlock()
-	if fresh && warm {
+	if warm && time.Since(s.capsAt) < capsTTL {
+		s.capsMu.Unlock()
 		return cache
 	}
-	if !warm {
-		return s.refreshCapabilities()
+	if done := s.capsRefresh; done != nil {
+		s.capsMu.Unlock()
+		if warm {
+			return cache
+		}
+		<-done
+		s.capsMu.Lock()
+		cache = s.capsCache
+		s.capsMu.Unlock()
+		return cache
 	}
-	go s.refreshCapabilities()
+	done := make(chan struct{})
+	s.capsRefresh = done
+	s.capsMu.Unlock()
+	refresh := func() map[string]providers.Caps {
+		result := s.refreshCapabilities()
+		s.capsMu.Lock()
+		s.capsRefresh = nil
+		close(done)
+		s.capsMu.Unlock()
+		return result
+	}
+	if !warm {
+		return refresh()
+	}
+	go refresh()
 	return cache
 }
 
@@ -961,4 +1061,36 @@ func (s *Server) diagnostics() map[string]any {
 	diag["external"] = ext
 	diag["settings"] = s.conductor.Settings()
 	return diag
+}
+
+// attachClaude hands this connection to a managed Claude session. Agent
+// Conductor's claudeCode.claudeProcessWrapper sends this instead of starting
+// `claude --resume` for the Claude Code extension, so the extension's tab
+// talks to the daemon-owned process: one execution, viewed live.
+func (s *Server) attachClaude(id, params json.RawMessage, reader *bufio.Reader, writeMsg func(any), writeLine func([]byte) error, conn net.Conn) {
+	var in struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(params, &in)
+	adapter, _ := s.registry.Get(model.ProviderClaude)
+	claude, ok := adapter.(*providers.Claude)
+	if !ok || in.SessionID == "" {
+		s.reply(writeMsg, id, providers.AttachResult{Reason: "no Claude adapter or session id"}, nil)
+		return
+	}
+	host, managed := s.conductor.ClaudeHostSpec(in.SessionID)
+	if !managed {
+		host = nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ls, res := claude.PrepareNativeAttach(ctx, in.SessionID, host)
+	cancel()
+	s.reply(writeMsg, id, res, nil)
+	if !res.Attached {
+		return
+	}
+	s.log.Infof("claude session %s: Claude Code tab attached (run %s, pid %d)", in.SessionID, res.RunID, res.PID)
+	s.conductor.NativeViewChanged(res.RunID)
+	ls.ServeNative(reader, writeLine, func() { conn.Close() })
+	s.conductor.NativeViewChanged(res.RunID)
 }

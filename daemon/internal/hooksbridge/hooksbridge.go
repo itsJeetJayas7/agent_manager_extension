@@ -46,7 +46,10 @@ func Run(provider string, args ...string) int {
 	// Claude Code merges global settings with --settings, so the same event can
 	// reach the bridge twice. Forwarding both would duplicate every timeline
 	// entry and fire two block decisions.
-	duplicate := alreadySeen(payload)
+	// External awareness is idempotent and uses only the global hook. Claude
+	// may omit turn_id, so deduplicating it can swallow a genuinely new prompt
+	// or stop in the same session within the ten-second window.
+	duplicate := runID != "" && alreadySeen(payload)
 
 	// Forward FIRST. The gate used to `return 0` before forwarding, so the
 	// daemon never learned that the agent had tried to stop: the adapter's

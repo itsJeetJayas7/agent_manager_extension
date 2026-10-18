@@ -212,6 +212,7 @@ async function main() {
   await c.req("pauseQueue", { reason: "stage both runs" });
   const { runId: claudeRun } = await c.req("enqueueRun", {
     prompt: relayPrompt("claude"), provider: "claude", permission: "bypass",
+    model: "claude-opus-5-5", effort: "xhigh",
     cwd: SANDBOX, title: "relay-claude",
   });
   // Claude Code's headless mode skips its own trust dialog, so the daemon
@@ -342,6 +343,21 @@ async function main() {
 
   const bad = settled.filter((r) => r.state !== "COMPLETED");
   assert.equal(bad.length, 0, `runs did not complete: ${bad.map((r) => `${r.id}=${r.state}`).join(", ")}`);
+
+  console.log("9) pinned Opus 5.5 and a real same-session continuation…");
+  const before = settled.find((r) => r.id === claudeRun);
+  assert.equal(before.resolvedModel, "claude-opus-5-5", "provider did not report requested Opus 5.5");
+  await c.req("continueRun", { runId: claudeRun, message: "Append exactly one new numbered line [3] to RELAY.md signed (by claude-resumed). Preserve all existing content. Use only file tools for this tiny edit. End with <AC_RESULT>COMPLETE</AC_RESULT>." });
+  const resumed = await waitFor(async () => {
+    const snap = await c.req("getSnapshot", {});
+    const r = snap.runs.find((r) => r.id === claudeRun);
+    return r && r.attempt > before.attempt && TERMINAL.has(r.state) ? r : null;
+  }, RUN_TIMEOUT_MS, "same-session Claude continuation");
+  assert.equal(resumed.state, "COMPLETED", resumed.errorMsg);
+  assert.equal(resumed.providerSessionId, before.providerSessionId);
+  assert.equal(resumed.resolvedModel, "claude-opus-5-5");
+  assert.equal(signedLines(readRelay(), "claude-resumed").length, 1);
+  console.log("   actual model claude-opus-5-5; continuation retained the native session and edited the file\n");
 
   c.close();
   untrustSandbox();

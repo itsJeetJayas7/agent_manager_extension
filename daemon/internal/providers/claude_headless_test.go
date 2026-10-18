@@ -1,7 +1,10 @@
 package providers
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +29,28 @@ func feed(t *testing.T, lines []string) []Event {
 		c.handleStreamMessage(st, msg)
 	}
 	return events
+}
+
+func TestLegacyPTYCancellationReapsUncooperativeChild(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-claude")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\ntrap '' INT\nsleep 30 &\nwait\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c := NewClaude(logging.NewNop(), NewHookBus(), "/bin/true", "")
+	c.binPath = bin
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	var terminal Event
+	err := c.executePTY(ctx, ExecSpec{RunID: "legacy", Cwd: dir}, func(ev Event) {
+		if ev.Kind == EvTurnCompleted {
+			terminal = ev
+		}
+	})
+	if err != nil || terminal.Status != TurnInterrupted || time.Since(start) > 7*time.Second || len(c.ActiveRuns()) != 0 {
+		t.Fatalf("legacy child did not terminate: err=%v event=%+v duration=%v", err, terminal, time.Since(start))
+	}
 }
 
 func findEvent(events []Event, kind EventKind) (Event, bool) {
@@ -273,5 +298,138 @@ func TestTurnDeadlineIsConfigurable(t *testing.T) {
 	c.SetTurnDeadline(0)
 	if c.turnDeadline() != defaultTurnDeadline {
 		t.Fatal("zero should restore the default")
+	}
+}
+
+func TestQuotaWarningDoesNotExhaustWindow(t *testing.T) {
+	q := quotaFromRateLimitEvent(&claudeRateLimitInfo{Status: "allowed_warning", RateLimitType: "five_hour", ResetsAt: 2000000000, UnifiedWindows: map[string]claudeRateLimitWin{"five_hour": {Utilization: 0.85, ResetsAt: 2000000000}}})
+	if len(q) != 1 || q[0].Exhausted {
+		t.Fatalf("warning incorrectly blocked queue: %+v", q)
+	}
+}
+
+func TestHeadlessUsesErrorsArray(t *testing.T) {
+	events := feed(t, []string{`{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["API Error: 529 overloaded"],"result":""}`})
+	done, _ := findEvent(events, EvTurnCompleted)
+	if done.Error == nil || done.Error.Class != model.ErrProviderOverloaded || !strings.Contains(done.Error.Message, "529") {
+		t.Fatalf("lost structured error detail: %+v", done)
+	}
+}
+
+func TestExplicitClaudeModelsAndEffortMatrix(t *testing.T) {
+	byID := map[string]ModelInfo{}
+	for _, m := range claudeModels {
+		byID[m.ID] = m
+	}
+	opus := byID["claude-opus-5-5"]
+	if opus.Name != "Claude Opus 5.5" || strings.Join(opus.Efforts, ",") != "low,medium,high,xhigh,max" {
+		t.Fatalf("wrong Opus capabilities: %+v", opus)
+	}
+	if len(byID["claude-haiku-4-5-20251001"].Efforts) != 0 {
+		t.Fatal("Haiku has no effort control")
+	}
+	if strings.Contains(strings.Join(byID["claude-opus-4-6"].Efforts, ","), "xhigh") {
+		t.Fatal("unsupported effort must not be advertised")
+	}
+	if !strings.Contains(byID["opus"].Name, "alias") {
+		t.Fatal("moving alias must be labeled")
+	}
+}
+
+func TestHeadlessEOFDoesNotDisableDeadline(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "claude")
+	// Closing stdout is not a process exit: the old cancellation watcher
+	// stopped here and cmd.Wait hung forever on the still-running child.
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexec 1>&-\nsleep 30\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	c := NewClaude(logging.NewNop(), NewHookBus(), "/bin/true", "")
+	c.binPath = bin
+	yes := true
+	c.streamOK = &yes
+	c.effortOK = &yes
+	c.permissionPromptsOK = &yes
+	c.SetTurnDeadline(100 * time.Millisecond)
+	start := time.Now()
+	var terminal Event
+	err := c.Execute(context.Background(), ExecSpec{RunID: "eof", Cwd: t.TempDir(), Prompt: "test"}, func(e Event) {
+		if e.Kind == EvTurnCompleted {
+			terminal = e
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 7*time.Second || terminal.Error == nil || terminal.Error.Class != model.ErrNetwork {
+		t.Fatalf("deadline not enforced: %+v", terminal)
+	}
+	if len(c.ActiveRuns()) != 0 {
+		t.Fatal("process registration leaked")
+	}
+}
+
+func TestHeadlessPassesEveryEffortAndPinnedModelOnResume(t *testing.T) {
+	c := NewClaude(logging.NewNop(), NewHookBus(), "/bin/true", "")
+	yes := true
+	c.effortOK = &yes
+	c.permissionPromptsOK = &yes
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+		args := c.headlessArgs(context.Background(), ExecSpec{Model: "claude-opus-5-5", Effort: effort, SessionID: "same-session"}, "", "{}")
+		joined := strings.Join(args, " ")
+		for _, want := range []string{"--resume same-session", "--model claude-opus-5-5", "--effort " + effort} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("missing %q in %q", want, joined)
+			}
+		}
+	}
+}
+
+func TestHeadlessPartialOutputIsVisibleBeforeCompletionWithoutDuplicates(t *testing.T) {
+	events := feed(t, []string{
+		fxInit,
+		`{"type":"stream_event","event":{"type":"message_start"}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"private reasoning"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"O"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"K"}}}`,
+		fxAsst, fxTool,
+		`{"type":"user","message":{"content":[{"type":"tool_result"}]}}`,
+	})
+	var output string
+	var thinking, result bool
+	for _, ev := range events {
+		if ev.Kind == EvMessageDelta && !strings.HasPrefix(ev.Text, "tool:") {
+			output += ev.Text
+		}
+		if ev.Text == "Thinking" {
+			thinking = true
+		}
+		if ev.Text == "Tool result received" {
+			result = true
+		}
+		if strings.Contains(ev.Text, "private reasoning") {
+			t.Fatal("thinking contents exposed")
+		}
+	}
+	if output != "OK" || !thinking || !result {
+		t.Fatalf("lost/duplicated partial activity: output=%q thinking=%v toolResult=%v", output, thinking, result)
+	}
+}
+
+func TestPartialMessagesCapabilityGated(t *testing.T) {
+	for _, supported := range []bool{false, true} {
+		c := NewClaude(logging.NewNop(), NewHookBus(), "/bin/true", "")
+		c.partialOK = &supported
+		permissionPrompts := false
+		c.permissionPromptsOK = &permissionPrompts
+		args := c.headlessArgs(context.Background(), ExecSpec{}, "s", "")
+		found := false
+		for _, arg := range args {
+			if arg == "--include-partial-messages" {
+				found = true
+			}
+		}
+		if found != supported {
+			t.Fatalf("partial messages unsupported=%v args=%v", !supported, args)
+		}
 	}
 }

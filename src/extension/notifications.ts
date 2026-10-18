@@ -3,7 +3,7 @@
 // Runs continue in the daemon after VS Code closes, so without this the only
 // way to learn an overnight batch failed is to go looking (§7.2).
 import * as vscode from "vscode";
-import type { Snapshot, RunLike } from "./protocol";
+import type { Snapshot, RunLike, ExternalRunOverlap } from "./protocol";
 
 const LAST_SEEN_KEY = "agentConductor.lastSeenRunAt";
 const NOTIFIED_KEY = "agentConductor.notifiedRunIds";
@@ -48,6 +48,34 @@ export function inQuietHours(snapshot: Snapshot | null, now = new Date()): boole
 
 export class Notifier {
   constructor(private memento: vscode.Memento) {}
+
+  /** Live feedback about a manual turn; never pauses anything on its own. */
+  async reportExternalOverlap(payload: unknown): Promise<void> {
+    if (vscode.workspace.getConfiguration("agentConductor").get<boolean>("notifyOnExternalOverlap") === false) {
+      return;
+    }
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+    const event = payload as Partial<ExternalRunOverlap>;
+    const provider = event.provider === "claude" ? "Claude Code" : event.provider === "codex" ? "Codex" : null;
+    const count = event.activeRunCount;
+    if (!provider || typeof count !== "number" || !Number.isSafeInteger(count) || count < 1) {
+      return;
+    }
+    const status = event.queuePaused
+      ? `${count} run${count === 1 ? " is" : "s are"} still active while the queue is paused`
+      : `the queue is running right now (${count} active run${count === 1 ? "" : "s"})`;
+    const actions = event.queuePaused ? ["Show queue"] : ["Show queue", "Pause queue…"];
+    const choice = await vscode.window.showInformationMessage(
+      `Agent Conductor: ${status}. Your external ${provider} run will run alongside it.`, ...actions
+    );
+    if (choice === "Show queue") {
+      await vscode.commands.executeCommand("agent-conductor.open");
+    } else if (choice === "Pause queue…") {
+      await vscode.commands.executeCommand("agent-conductor.pauseQueue");
+    }
+  }
 
   private lastSeen(): number {
     return this.memento.get<number>(LAST_SEEN_KEY, 0);

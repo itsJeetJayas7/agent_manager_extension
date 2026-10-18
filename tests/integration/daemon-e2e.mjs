@@ -100,6 +100,14 @@ async function main() {
   assert(run.providerSessionId);
   console.log("   run COMPLETED with native session", run.providerSessionId.slice(0, 16) + "…");
 
+  const activity = await c.req("getRunActivity", { runId });
+  assert.equal(activity.executionActive, false);
+  assert(activity.observedAt && activity.lastEventAt);
+  assert(activity.entries.some(entry => entry.text === "Session ready"));
+  assert(activity.entries.some(entry => entry.text === "Turn completed"));
+  await assert.rejects(c.req("getRunActivity", { runId: "missing" }), /NOT_FOUND/);
+  console.log("   activity endpoint retains evidence after the worker exits");
+
   console.log("4) secret block: encrypted storage + effective prompt attach…");
   await c.req("updateSecretBlock", { text: "sudo pw: E2E-SECRET-hunter42" });
   const { runId: r2 } = await c.req("enqueueRun", { prompt: "use credentials", provider: "fake", attachSecrets: true, cwd: HOME });
@@ -166,27 +174,65 @@ async function main() {
     console.log("   global hook never gates (no double block decision)");
   }
 
-  console.log("7) external awareness blocks FIFO queue…");
+  console.log("7) external agents run alongside the queue with overlap notifications…");
   {
-    spawnSync(BIN, ["hook", "claude"], {
-      input: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "ext-busy", cwd: "/srv/manual", prompt: "manual work" }),
-      env: { ...process.env, HOME },
-      encoding: "utf8", timeout: 10000,
-    });
-    const { runId: r3 } = await c.req("enqueueRun", { prompt: "should wait", provider: "fake", cwd: HOME });
-    await wait(1200);
-    const s3 = await c.req("getSnapshot", {});
-    const st = s3.runs.find((r) => r.id === r3).state;
-    assert(["QUEUED", "WAITING_FOR_EXTERNAL_AGENT", "WAITING_FOR_SLOT"].includes(st), `state ${st}`);
-    console.log("   queued run waits while external agent busy:", st);
-    // external stop unblocks
-    spawnSync(BIN, ["hook", "claude"], {
-      input: JSON.stringify({ hook_event_name: "Stop", session_id: "ext-busy" }),
-      env: { ...process.env, HOME },
-      encoding: "utf8", timeout: 10000,
-    });
-    await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === r3)?.state === "COMPLETED", 20000, "unblocked run");
-    console.log("   run dispatched after external stop");
+    await c.req("subscribe");
+    await c.req("patchSettings", { fifoBlockOnExternal: true }); // retired clients cannot restore holds
+    const notices = () => c.events.filter((ev) => ev.event === "externalRunOverlap" && ev.payload.sessionId === "ext-busy");
+    const hook = (event, extra = {}) => {
+      const result = spawnSync(BIN, ["hook", "claude"], {
+        input: JSON.stringify({ hook_event_name: event, session_id: "ext-busy", cwd: "/srv/manual", ...extra }),
+        env: { ...process.env, HOME, AGENT_CONDUCTOR_RUN_ID: "" },
+        encoding: "utf8", timeout: 10000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+    };
+    const observed = async (event) => (await c.req("getSnapshot", {})).external.claude
+      .some((s) => s.nativeId === "ext-busy" && s.lastEvent === event);
+    hook("SessionStart", { source: "startup" });
+    await waitFor(() => observed("SessionStart"), 5000, "open session observed");
+    const { runId: idleRun } = await c.req("enqueueRun", { prompt: "open window is idle", provider: "fake", cwd: HOME });
+    await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === idleRun)?.state === "COMPLETED", 10000, "run with idle Claude window");
+    assert.equal((await c.req("getSnapshot", {})).pause.paused, false);
+    console.log("   open Claude window does not hold the queue");
+    assert.equal(notices().length, 0, "opening a session must not notify");
+
+    hook("UserPromptSubmit", { prompt: "manual work first" });
+    await waitFor(() => observed("UserPromptSubmit"), 3000, "external turn observed");
+    const { runId: alongside } = await c.req("enqueueRun", { prompt: "work alongside external", provider: "fake", cwd: HOME });
+    await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === alongside)?.state === "COMPLETED", 10000, "run during external work");
+    assert.equal((await c.req("getSnapshot", {})).pause.paused, false);
+    assert.equal(notices().length, 0, "starting external work with an idle queue must not notify");
+    hook("Stop");
+    await waitFor(() => observed("Stop"), 3000, "first external stop");
+
+    // Two quick turns with no turn_id must both reach the scheduler. The old
+    // ten-second deduplication swallowed the second prompt and second stop.
+    // A short verification keeps managed work active deterministically.
+    await c.req("patchSettings", { verificationCommands: ["sleep 1"] });
+    for (let turn = 0; turn < 2; turn++) {
+      const { runId: r3 } = await c.req("enqueueRun", { prompt: "continue during external work", provider: "fake", cwd: HOME });
+      await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === r3)?.state === "VERIFYING", 5000, "active managed work");
+      hook("SessionStart", { source: "resume" });
+      await waitFor(() => observed("SessionStart"), 3000, "resumed idle session");
+      assert.equal(notices().length, turn, "reopening a session must not notify");
+      hook("UserPromptSubmit", { prompt: "manual work" });
+      await waitFor(() => observed("UserPromptSubmit"), 3000, "external prompt observed");
+      await waitFor(() => notices().length === turn + 1, 3000, "overlap notification on the socket");
+      assert.equal(notices().at(-1).payload.activeRunCount, 1);
+      assert.equal(notices().at(-1).payload.queuePaused, false);
+      hook("UserPromptSubmit", { prompt: "manual work" }); // duplicate delivery
+      hook("SessionStart", { source: "compact" });
+      hook("Notification", { notification_type: "permission_prompt", message: "Permission requested" });
+      assert(await observed("UserPromptSubmit"), "compaction and notifications must preserve activity");
+      await waitFor(async () => (await c.req("getSnapshot", {})).runs.find((r) => r.id === r3)?.state === "COMPLETED", 10000, "managed run continues during overlap");
+      assert.equal(notices().length, turn + 1, "only one advisory per external turn");
+      assert.equal((await c.req("getSnapshot", {})).pause.paused, false);
+      hook("Stop");
+      await waitFor(() => observed("Stop"), 3000, "external stop observed");
+    }
+    await c.req("patchSettings", { verificationCommands: [] });
+    console.log("   external work never blocked dispatch; one live advisory per overlapping turn");
   }
 
   console.log("8) pause with a continuation timer…");
